@@ -1,0 +1,59 @@
+{
+ "actions": [],
+ "creation": "2026-06-01 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "label",
+  "provider",
+  "rule_type",
+  "status",
+  "config"
+ ],
+ "fields": [
+  {
+   "description": "Human-given name. Required by the write APIs, not by the schema: a stored rule may sit unnamed (see patches/v0_0/blank_generated_rule_labels.py) and every doc.save() on its mapping must still work.",
+   "fieldname": "label",
+   "fieldtype": "Data",
+   "label": "Label"
+  },
+  {
+   "description": "Registered provider id (e.g. LMS).",
+   "fieldname": "provider",
+   "fieldtype": "Data",
+   "label": "Provider",
+   "reqd": 1
+  },
+  {
+   "description": "A rule type declared by the provider.",
+   "fieldname": "rule_type",
+   "fieldtype": "Data",
+   "label": "Rule Type",
+   "reqd": 1
+  },
+  {
+   "default": "Active",
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "label": "Status",
+   "options": "Active\nPaused"
+  },
+  {
+   "description": "Provider-specific payload. The engine never reads inside it.",
+   "fieldname": "config",
+   "fieldtype": "JSON",
+   "label": "Config"
+  }
+ ],
+ "istable": 1,
+ "links": [],
+ "modified": "2026-06-01 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Raven Integration",
+ "name": "Raven Membership Rule",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
