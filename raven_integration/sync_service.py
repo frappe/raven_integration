@@ -1,0 +1,340 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+
+import frappe
+
+from raven_integration.exceptions import RavenAPIError, RavenNotInstalledError
+from raven_integration.utils import raven_installed
+
+
+@contextmanager
+def pushing_to_raven():
+	"""Suppress the Raven -> mapping reverse-sync handlers for the duration of a
+	forward push (mapping -> Raven), so this app's own writes to a Raven workspace or
+	channel do not bounce back as a reverse sync. Re-entrant: nested pushes restore
+	the previous state, not an unconditional False."""
+	token = frappe.flags.get("ri_pushing_to_raven")
+	frappe.flags.ri_pushing_to_raven = True
+	try:
+		yield
+	finally:
+		frappe.flags.ri_pushing_to_raven = token
+
+
+def ensure_raven_user(user_id: str) -> None:
+	"""Ensure a Raven User record exists for user_id; silently skips disabled users."""
+	if not raven_installed():
+		return
+	user = frappe.get_doc("User", user_id)
+	if not user.enabled:
+		return
+	if frappe.db.exists("Raven User", {"user": user_id}):
+		return
+	try:
+		frappe.get_doc(
+			{"doctype": "Raven User", "user": user_id,
+			 "full_name": user.full_name or user.first_name or user_id, "type": "User"}
+		).insert(ignore_permissions=True)
+	except (frappe.UniqueValidationError, frappe.DuplicateEntryError):
+		# Raven User.user is unique=1; a concurrent sweep (event + nightly
+		# reconcile) can pass the exists() check above and both insert. The DB
+		# constraint catches the loser — already provisioned, so this is benign.
+		return
+	except (frappe.PermissionError, RavenAPIError) as e:
+		frappe.log_error(
+			title=f"{type(e).__name__}: Raven User auto-provision failed for {user_id}",
+			message=f"{e}\n\n{frappe.get_traceback()}",
+		)
+
+
+def _adopt_existing_member(member_doctype: str, filters: dict) -> None:
+	"""A member row already existed (unique constraint hit) — claim it as rule-managed.
+
+	Without this, a user who joined manually before a rule started matching them
+	would keep added_by_rule=0 and never be removed when the rule stops matching.
+	"""
+	name = frappe.db.exists(member_doctype, filters)
+	if name and not frappe.db.get_value(member_doctype, name, "added_by_rule"):
+		frappe.db.set_value(member_doctype, name, "added_by_rule", 1)
+
+
+def _remove_rule_managed_member(member_doctype: str, filters: dict) -> None:
+	"""Delete the member row only if this app added it; manual rows are left alone."""
+	name = frappe.db.exists(member_doctype, {**filters, "added_by_rule": 1})
+	if name:
+		frappe.delete_doc(member_doctype, name, ignore_permissions=True, force=True)
+
+
+def add_channel_member(channel: str, user: str) -> None:
+	"""Add user to a Raven Channel and its parent workspace, flagging the row as rule-managed.
+
+	ignore_system_message suppresses Raven's per-member "X added Y." post, which
+	would otherwise put one message in the channel for every member of a synced
+	course. Raven honours the flag from v3 onward and ignores it before that, so
+	on older Raven the add still succeeds — just noisily.
+	"""
+	if not raven_installed():
+		return
+	ensure_raven_user(user)
+	workspace = frappe.db.get_value("Raven Channel", channel, "workspace")
+	if workspace:
+		add_workspace_member(workspace, user)
+	try:
+		doc = frappe.get_doc(
+			{"doctype": "Raven Channel Member", "channel_id": channel, "user_id": user, "added_by_rule": 1}
+		)
+		doc.flags.ignore_system_message = True
+		doc.insert(ignore_permissions=True)
+	except (frappe.UniqueValidationError, frappe.DuplicateEntryError):
+		_adopt_existing_member("Raven Channel Member", {"channel_id": channel, "user_id": user})
+
+
+def remove_channel_member(channel: str, user: str) -> None:
+	"""Remove a rule-managed channel member row; leaves manually-added rows untouched."""
+	if not raven_installed():
+		return
+	_remove_rule_managed_member("Raven Channel Member", {"channel_id": channel, "user_id": user})
+
+
+def add_workspace_member(workspace: str, user: str) -> None:
+	"""Add user to a Raven Workspace, flagging the row as rule-managed."""
+	if not raven_installed():
+		return
+	ensure_raven_user(user)
+	try:
+		frappe.get_doc(
+			{"doctype": "Raven Workspace Member", "workspace": workspace, "user": user, "added_by_rule": 1}
+		).insert(ignore_permissions=True)
+	except (frappe.UniqueValidationError, frappe.ValidationError):
+		# Raven raises a bare ValidationError for its own duplicate-member check,
+		# so this catch is broader than the channel one.
+		_adopt_existing_member("Raven Workspace Member", {"workspace": workspace, "user": user})
+
+
+def remove_workspace_member(workspace: str, user: str) -> None:
+	"""Remove a rule-managed workspace member row; leaves manually-added rows untouched."""
+	if not raven_installed():
+		return
+	_remove_rule_managed_member("Raven Workspace Member", {"workspace": workspace, "user": user})
+
+
+def _sync_rule_managed_members(
+	*,
+	mapping_doctype: str,
+	mapping_name: str,
+	link_field: str,
+	no_link_reason: str,
+	expected_members,
+	member_doctype: str,
+	member_link_field: str,
+	member_user_field: str,
+	add,
+	remove,
+	after_synced=None,
+	cache: dict | None = None,
+) -> dict:
+	"""Diff-apply one mapping's rule-managed membership onto its Raven record.
+
+	The channel/workspace scoping asymmetry (a channel can only narrow its parent
+	workspace's population) is deliberately not a parameter — it lives entirely
+	inside the ``expected_members`` callable the caller supplies.
+	"""
+	if not raven_installed():
+		return {"skipped": True, "reason": "raven_not_installed"}
+	if not frappe.db.get_value(mapping_doctype, mapping_name, "enabled"):
+		return {"skipped": True, "reason": "disabled"}
+	from raven_integration.engine import disabled_rule_members, has_active_rules
+
+	mapping = frappe.get_doc(mapping_doctype, mapping_name)
+	if mapping.stale:
+		return {"skipped": True, "reason": "raven_record_deleted"}
+	if not has_active_rules(mapping.member_rules):
+		return {"skipped": True, "reason": "no_active_rules"}
+	expected = expected_members(mapping_name, cache=cache)
+	raven_record = frappe.db.get_value(mapping_doctype, mapping_name, link_field)
+	if not raven_record:
+		return {"skipped": True, "reason": no_link_reason}
+	current_rule_managed = set(frappe.get_all(
+		member_doctype,
+		filters={member_link_field: raven_record, "added_by_rule": 1},
+		pluck=member_user_field,
+	))
+	# Members a disabled rule put here stay put; it just stops granting membership.
+	frozen = current_rule_managed & disabled_rule_members(mapping.member_rules)
+	to_add = expected - current_rule_managed
+	to_remove = current_rule_managed - expected - frozen
+	for u in to_add:
+		add(raven_record, u)
+		if after_synced:
+			after_synced(raven_record, u, "added", "event")
+	for u in to_remove:
+		remove(raven_record, u)
+		if after_synced:
+			after_synced(raven_record, u, "removed", "event")
+	return {"added": len(to_add), "removed": len(to_remove)}
+
+
+def sync_channel_members(channel_name: str, *, cache: dict | None = None) -> dict:
+	"""Diff-apply rule-managed channel membership for the given Raven Channel Mapping."""
+	from raven_integration.engine import expected_channel_members
+
+	return _sync_rule_managed_members(
+		mapping_doctype="Raven Channel Mapping",
+		mapping_name=channel_name,
+		link_field="raven_channel",
+		no_link_reason="no_raven_channel_link",
+		expected_members=expected_channel_members,
+		member_doctype="Raven Channel Member",
+		member_link_field="channel_id",
+		member_user_field="user_id",
+		add=add_channel_member,
+		remove=remove_channel_member,
+		# Channel membership is the event other apps subscribe to; workspace
+		# membership is a side effect of it and fires no hooks.
+		after_synced=_fire_after_synced,
+		cache=cache,
+	)
+
+
+def sync_workspace_members(workspace_name: str, *, cache: dict | None = None) -> dict:
+	"""Diff-apply rule-managed workspace membership for the given Raven Workspace Mapping."""
+	from raven_integration.engine import expected_workspace_members
+
+	return _sync_rule_managed_members(
+		mapping_doctype="Raven Workspace Mapping",
+		mapping_name=workspace_name,
+		link_field="raven_workspace",
+		no_link_reason="no_raven_workspace_link",
+		expected_members=expected_workspace_members,
+		member_doctype="Raven Workspace Member",
+		member_link_field="workspace",
+		member_user_field="user",
+		add=add_workspace_member,
+		remove=remove_workspace_member,
+		cache=cache,
+	)
+
+
+def create_raven_workspace_for(ws_map) -> None:
+	"""Called from RavenWorkspaceMapping.before_insert to create the backing Raven Workspace."""
+	if not raven_installed():
+		raise RavenNotInstalledError("Raven is not installed on this site")
+	try:
+		with pushing_to_raven():
+			rw = _insert_unique_raven_doc(
+				{"doctype": "Raven Workspace", "type": ws_map.workspace_type},
+				"workspace_name", ws_map.workspace_label,
+			)
+	except RavenAPIError:
+		raise
+	except Exception as e:
+		raise RavenAPIError(f"{type(e).__name__}: {e}") from e
+	ws_map.raven_workspace = rw.name
+
+
+def create_raven_channel_for(ch_map) -> None:
+	"""Called from RavenChannelMapping.before_insert to create the backing Raven Channel."""
+	if not raven_installed():
+		raise RavenNotInstalledError("Raven is not installed on this site")
+	parent = frappe.get_doc("Raven Workspace Mapping", ch_map.workspace)
+	if not parent.raven_workspace:
+		raise RavenAPIError(f"Parent workspace {parent.name} has no Raven workspace link")
+	try:
+		with pushing_to_raven():
+			rc = _insert_unique_raven_doc(
+				{"doctype": "Raven Channel", "workspace": parent.raven_workspace,
+				 "type": ch_map.channel_type},
+				"channel_name", ch_map.channel_label,
+			)
+	except RavenAPIError:
+		raise
+	except Exception as e:
+		raise RavenAPIError(f"{type(e).__name__}: {e}") from e
+	ch_map.raven_channel = rc.name
+
+
+def push_workspace_type_to_raven(ws_map) -> None:
+	"""Propagate a workspace-mapping visibility change to its backing Raven Workspace.
+
+	Skipped when Raven is absent, the mapping is stale, or it has no backing Raven
+	workspace — matching the rename helpers. Saved through the doc so Raven's own
+	side effects of a type change run."""
+	if not raven_installed() or ws_map.stale or not ws_map.raven_workspace:
+		return
+	rw = frappe.get_doc("Raven Workspace", ws_map.raven_workspace)
+	if rw.type == ws_map.workspace_type:
+		return
+	rw.type = ws_map.workspace_type
+	with pushing_to_raven():
+		rw.save(ignore_permissions=True)
+
+
+def push_channel_type_to_raven(ch_map) -> None:
+	"""Propagate a channel-mapping visibility change to its backing Raven Channel.
+
+	Skipped when Raven is absent, the mapping is stale, or it has no backing Raven
+	channel."""
+	if not raven_installed() or ch_map.stale or not ch_map.raven_channel:
+		return
+	rc = frappe.get_doc("Raven Channel", ch_map.raven_channel)
+	if rc.type == ch_map.channel_type:
+		return
+	rc.type = ch_map.channel_type
+	with pushing_to_raven():
+		rc.save(ignore_permissions=True)
+
+
+def _insert_unique_raven_doc(props: dict, fieldname: str, label: str, attempts: int = 5):
+	"""Insert a Raven doc whose ``fieldname`` must be unique, retrying with a fresh
+	suffixed name until one is accepted.
+
+	The upfront probe cannot be trusted on its own: Raven slugifies
+	Raven Channel.channel_name in before_validate (strip/lower/spaces to hyphens),
+	so probing the raw label never matches a stored name and the same colliding
+	name would otherwise be re-proposed on every attempt. Each attempted name is
+	therefore skipped on the next pass, which makes progress without this app
+	having to reimplement Raven's normalisation.
+
+	Raven raises a bare ValidationError for its per-workspace duplicate check, not
+	UniqueValidationError, so the collision catch has to be broad. A ValidationError
+	that is not a collision simply fails every attempt and is re-raised."""
+	doctype = props["doctype"]
+	tried: set[str] = set()
+	last_error: Exception | None = None
+	for _ in range(attempts):
+		name = _unique_raven_name(label, doctype, fieldname, skip=tried)
+		tried.add(name)
+		doc = frappe.get_doc({**props, fieldname: name})
+		try:
+			return doc.insert(ignore_permissions=True)
+		except (frappe.UniqueValidationError, frappe.DuplicateEntryError, frappe.ValidationError) as e:
+			last_error = e
+	raise RavenAPIError(
+		f"Could not allocate a unique {fieldname} for {label!r} after {attempts} attempts: {last_error}"
+	) from last_error
+
+
+def _unique_raven_name(label: str, doctype: str, fieldname: str, skip: "set[str] | None" = None) -> str:
+	"""Return label, appending (2), (3), … until it is unique in doctype.fieldname.
+
+	``skip`` holds names already attempted and rejected by Raven this call."""
+	skip = skip or set()
+	base = label
+	n = 1
+	while base in skip or frappe.db.exists(doctype, {fieldname: base}):
+		n += 1
+		base = f"{label} ({n})"
+	return base
+
+
+def _fire_after_synced(channel: str, user: str, action: str, source: str) -> None:
+	"""Invoke every after_raven_member_synced hook, logging failures without re-raising."""
+	for handler in frappe.get_hooks("after_raven_member_synced"):
+		try:
+			frappe.get_attr(handler)(channel=channel, user=user, action=action, source=source)
+		except Exception as e:
+			frappe.log_error(
+				title=f"{type(e).__name__}: after_raven_member_synced handler {handler!r} failed",
+				message=f"{e}\n\n{frappe.get_traceback()}",
+			)
