@@ -1,0 +1,541 @@
+import unittest
+from unittest.mock import patch
+
+import frappe
+from frappe.tests.utils import FrappeTestCase
+
+from raven_integration import registry
+from raven_integration.exceptions import RavenAPIError
+from raven_integration.sync_service import (
+	add_channel_member,
+	add_workspace_member,
+	create_raven_workspace_for,
+	ensure_raven_user,
+	remove_channel_member,
+	remove_workspace_member,
+	sync_channel_members,
+	sync_workspace_members,
+)
+from raven_integration.sync_service import _insert_unique_raven_doc
+
+
+class TestRavenUserAutoProvision(FrappeTestCase):
+	_EMAIL = "raven-prov@example.com"
+
+	def setUp(self):
+		if "raven" not in frappe.get_installed_apps():
+			self.skipTest("Raven not installed")
+		# Purge any leftover from a previous run before inserting.
+		if frappe.db.exists("Raven User", {"user": self._EMAIL}):
+			frappe.db.delete("Raven User", {"user": self._EMAIL})
+		if frappe.db.exists("User", self._EMAIL):
+			frappe.db.delete("User", {"name": self._EMAIL})
+		self.user = frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": self._EMAIL,
+				"first_name": "Prov",
+				"send_welcome_email": 0,
+			}
+		).insert()
+		self.addCleanup(self._cleanup_provision_fixtures)
+
+	def _cleanup_provision_fixtures(self):
+		# Raven User name == user email (autoname: self.name = self.user)
+		frappe.db.delete("Raven User", {"user": self._EMAIL})
+		frappe.db.delete("User", {"name": self._EMAIL})
+
+	def test_creates_raven_user_if_missing(self):
+		ensure_raven_user(self.user.name)
+		self.assertTrue(frappe.db.exists("Raven User", {"user": self.user.name}))
+
+	def test_idempotent_on_existing(self):
+		ensure_raven_user(self.user.name)
+		ensure_raven_user(self.user.name)  # second call must not raise
+		count = frappe.db.count("Raven User", {"user": self.user.name})
+		self.assertEqual(count, 1)
+
+	def test_skips_disabled_user_silently(self):
+		self.user.enabled = 0
+		self.user.save()
+		ensure_raven_user(self.user.name)  # no raise; just skips
+		self.assertFalse(frappe.db.exists("Raven User", {"user": self.user.name}))
+
+
+class TestEnsureRavenUserConcurrency(unittest.TestCase):
+	"""Fully-mocked: no DB, no Raven needed."""
+
+	def test_concurrent_duplicate_insert_is_benign(self):
+		# exists() can return False yet insert() trips the unique constraint when a
+		# parallel sweep provisioned the same user first. That must be swallowed,
+		# not raised and not logged as an error.
+		with (
+			patch("raven_integration.sync_service.raven_installed", return_value=True),
+			patch("raven_integration.sync_service.frappe.db.exists", return_value=False),
+			patch("raven_integration.sync_service.frappe.get_doc") as gd,
+			patch("raven_integration.sync_service.frappe.log_error") as log,
+		):
+			doc = gd.return_value
+			doc.enabled = 1
+			doc.insert.side_effect = frappe.DuplicateEntryError("already exists")
+			ensure_raven_user("racer@example.com")  # must not raise
+		log.assert_not_called()
+
+
+class _RavenFixtureMixin:
+	"""Shared setup/teardown for tests that need a real Raven workspace + channel + user.
+
+	Uses frappe.db.delete (bypasses hooks) for cleanup so Raven's "last admin" and
+	"duplicate member" guards do not interfere with teardown.
+	Uses a per-run hash suffix so fixtures never collide across test invocations.
+	"""
+
+	def _setUp_raven_fixtures(self):
+		if "raven" not in frappe.get_installed_apps():
+			self.skipTest("Raven not installed")
+
+		suffix = frappe.generate_hash(length=6)
+
+		self.user = frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": f"raven-member-{suffix}@example.com",
+				"first_name": "MemberTest",
+				"send_welcome_email": 0,
+			}
+		).insert()
+
+		self.raven_workspace = frappe.get_doc(
+			{
+				"doctype": "Raven Workspace",
+				"workspace_name": f"RI Test WS {suffix}",
+				"type": "Private",
+			}
+		).insert(ignore_permissions=True)
+
+		self.raven_channel = frappe.get_doc(
+			{
+				"doctype": "Raven Channel",
+				"channel_name": f"ri-test-ch-{suffix}",
+				"workspace": self.raven_workspace.name,
+				"type": "Private",
+			}
+		).insert(ignore_permissions=True)
+
+	def _tearDown_raven_fixtures(self):
+		# LIFO with frappe.db.delete to bypass Raven's on_trash hooks.
+		# Channel members → channel → workspace members → workspace → Raven User → User.
+		frappe.db.delete("Raven Channel Member", {"channel_id": self.raven_channel.name})
+		frappe.db.delete("Raven Channel", {"name": self.raven_channel.name})
+		frappe.db.delete("Raven Workspace Member", {"workspace": self.raven_workspace.name})
+		frappe.db.delete("Raven Workspace", {"name": self.raven_workspace.name})
+
+		raven_user = frappe.db.exists("Raven User", {"user": self.user.name})
+		if raven_user:
+			frappe.db.delete("Raven User", {"name": raven_user})
+
+		frappe.db.delete("User", {"name": self.user.name})
+
+
+class TestAddChannelMember(_RavenFixtureMixin, FrappeTestCase):
+	def setUp(self):
+		self._setUp_raven_fixtures()
+
+	def tearDown(self):
+		self._tearDown_raven_fixtures()
+
+	def test_adds_member_with_rule_flag(self):
+		add_channel_member(self.raven_channel.name, self.user.name)
+		name = frappe.db.exists(
+			"Raven Channel Member",
+			{"channel_id": self.raven_channel.name, "user_id": self.user.name},
+		)
+		self.assertIsNotNone(name)
+		self.assertEqual(frappe.db.get_value("Raven Channel Member", name, "added_by_rule"), 1)
+
+	def test_add_also_adds_workspace_member(self):
+		add_channel_member(self.raven_channel.name, self.user.name)
+		self.assertTrue(
+			frappe.db.exists(
+				"Raven Workspace Member",
+				{"workspace": self.raven_workspace.name, "user": self.user.name},
+			)
+		)
+
+	def test_remove_deletes_rule_managed_row(self):
+		add_channel_member(self.raven_channel.name, self.user.name)
+		remove_channel_member(self.raven_channel.name, self.user.name)
+		self.assertFalse(
+			frappe.db.exists(
+				"Raven Channel Member",
+				{"channel_id": self.raven_channel.name, "user_id": self.user.name},
+			)
+		)
+
+	def test_remove_does_not_delete_manually_added_row(self):
+		# Ensure Raven User exists so link validation passes.
+		ensure_raven_user(self.user.name)
+		# Insert a row WITHOUT the rule flag (simulating a manual Raven add).
+		frappe.get_doc(
+			{
+				"doctype": "Raven Channel Member",
+				"channel_id": self.raven_channel.name,
+				"user_id": self.user.name,
+				"added_by_rule": 0,
+			}
+		).insert(ignore_permissions=True)
+		remove_channel_member(self.raven_channel.name, self.user.name)
+		# Row must still exist since added_by_rule=0.
+		self.assertTrue(
+			frappe.db.exists(
+				"Raven Channel Member",
+				{"channel_id": self.raven_channel.name, "user_id": self.user.name},
+			)
+		)
+
+
+class TestConcurrentAdd(_RavenFixtureMixin, FrappeTestCase):
+	def setUp(self):
+		self._setUp_raven_fixtures()
+
+	def tearDown(self):
+		self._tearDown_raven_fixtures()
+
+	def test_two_back_to_back_adds_create_one_row(self):
+		"""UniqueValidationError on the second insert must be caught, not raised."""
+		add_channel_member(self.raven_channel.name, self.user.name)
+		add_channel_member(self.raven_channel.name, self.user.name)  # no-op
+		count = frappe.db.count(
+			"Raven Channel Member",
+			{"channel_id": self.raven_channel.name, "user_id": self.user.name},
+		)
+		self.assertEqual(count, 1)
+
+	def test_two_back_to_back_workspace_adds_create_one_row(self):
+		add_workspace_member(self.raven_workspace.name, self.user.name)
+		add_workspace_member(self.raven_workspace.name, self.user.name)  # no-op
+		count = frappe.db.count(
+			"Raven Workspace Member",
+			{"workspace": self.raven_workspace.name, "user": self.user.name},
+		)
+		self.assertEqual(count, 1)
+
+
+class TestSyncChannelMembers(_RavenFixtureMixin, FrappeTestCase):
+	"""sync_channel_members diff-apply + manual-add protection (provider-agnostic)."""
+
+	def setUp(self):
+		if "raven" not in frappe.get_installed_apps():
+			self.skipTest("Raven not installed")
+
+		self._setUp_raven_fixtures()
+
+		# The fake provider must be resolvable while the fixture's rules are saved
+		# (Raven Membership Rule.validate calls validate_rule_config).
+		self._reg_patch = patch.object(
+			registry, "_provider_paths", lambda: ["raven_integration.tests.fake_provider.get_provider"]
+		)
+		self._reg_patch.start()
+		self.addCleanup(self._reg_patch.stop)
+
+		suffix = frappe.generate_hash(length=6)
+
+		# Raven Workspace Mapping — skip_raven_create; point at fixture workspace.
+		self.ws_map = frappe.new_doc("Raven Workspace Mapping")
+		self.ws_map.workspace_label = f"Sync Test WS {suffix}"
+		self.ws_map.workspace_type = "Private"
+		self.ws_map.flags.skip_raven_create = True
+		self.ws_map.insert()
+		frappe.db.set_value(
+			"Raven Workspace Mapping", self.ws_map.name, "raven_workspace", self.raven_workspace.name
+		)
+
+		# Raven Channel Mapping — skip_raven_create; point at fixture channel.
+		self.ch_map = frappe.new_doc("Raven Channel Mapping")
+		self.ch_map.channel_label = f"Sync Test Ch {suffix}"
+		self.ch_map.workspace = self.ws_map.name
+		self.ch_map.channel_type = "Private"
+		self.ch_map.flags.skip_raven_create = True
+		# An active rule, so the mapping is genuinely rule-managed. Its population is
+		# irrelevant (these tests mock the engine) but its presence is what makes the
+		# sync authoritative — a rule-less mapping is correctly a no-op.
+		self.ch_map.append(
+			"member_rules",
+			{
+				"label": "Always A",
+				"provider": "FAKE",
+				"rule_type": "always-a",
+				"config": "{}",
+				"status": "Active",
+			},
+		)
+		self.ch_map.insert()
+		frappe.db.set_value(
+			"Raven Channel Mapping", self.ch_map.name, "raven_channel", self.raven_channel.name
+		)
+
+	def tearDown(self):
+		if frappe.db.exists("Raven Channel Mapping", self.ch_map.name):
+			frappe.delete_doc("Raven Channel Mapping", self.ch_map.name, force=True, ignore_permissions=True)
+		if frappe.db.exists("Raven Workspace Mapping", self.ws_map.name):
+			frappe.delete_doc("Raven Workspace Mapping", self.ws_map.name, force=True, ignore_permissions=True)
+		self._tearDown_raven_fixtures()
+
+	def _channel_member_exists(self, user: str, rule_flag: int | None = None) -> bool:
+		filters = {"channel_id": self.raven_channel.name, "user_id": user}
+		if rule_flag is not None:
+			filters["added_by_rule"] = rule_flag
+		return bool(frappe.db.exists("Raven Channel Member", filters))
+
+	def test_adds_missing_members(self):
+		"""sync_channel_members adds users returned by the engine with added_by_rule=1."""
+		with patch("raven_integration.engine.expected_channel_members", return_value={self.user.name}):
+			result = sync_channel_members(self.ch_map.name)
+		self.assertNotIn("skipped", result)
+		self.assertEqual(result["added"], 1)
+		self.assertTrue(self._channel_member_exists(self.user.name, rule_flag=1))
+
+	def test_removes_rule_managed_members_no_longer_matching(self):
+		"""Users added by rule who no longer match are removed."""
+		with patch("raven_integration.engine.expected_channel_members", return_value={self.user.name}):
+			sync_channel_members(self.ch_map.name)
+		self.assertTrue(self._channel_member_exists(self.user.name, rule_flag=1))
+
+		with patch("raven_integration.engine.expected_channel_members", return_value=set()):
+			result = sync_channel_members(self.ch_map.name)
+		self.assertNotIn("skipped", result)
+		self.assertEqual(result["removed"], 1)
+		self.assertFalse(self._channel_member_exists(self.user.name))
+
+	def test_does_not_remove_manually_added_members(self):
+		"""Users added directly in Raven (added_by_rule=0) are never removed by sync."""
+		ensure_raven_user(self.user.name)
+		frappe.get_doc(
+			{
+				"doctype": "Raven Channel Member",
+				"channel_id": self.raven_channel.name,
+				"user_id": self.user.name,
+				"added_by_rule": 0,
+			}
+		).insert(ignore_permissions=True)
+
+		with patch("raven_integration.engine.expected_channel_members", return_value=set()):
+			sync_channel_members(self.ch_map.name)
+
+		# The manually-added row must still exist.
+		self.assertTrue(self._channel_member_exists(self.user.name))
+
+	def test_is_idempotent(self):
+		"""Two back-to-back syncs produce identical state (no extra adds or removes)."""
+		with patch("raven_integration.engine.expected_channel_members", return_value={self.user.name}):
+			result1 = sync_channel_members(self.ch_map.name)
+			result2 = sync_channel_members(self.ch_map.name)
+
+		self.assertNotIn("skipped", result1)
+		self.assertEqual(result2["added"], 0)
+		self.assertEqual(result2["removed"], 0)
+
+		count = frappe.db.count(
+			"Raven Channel Member",
+			{"channel_id": self.raven_channel.name, "user_id": self.user.name, "added_by_rule": 1},
+		)
+		self.assertEqual(count, 1)
+
+
+class TestErrorDistinction(unittest.TestCase):
+	"""create_raven_workspace_for wraps inner exceptions as RavenAPIError
+	and preserves the original exception class name in the message."""
+
+	def test_permission_error_raises_raven_api_error_with_class_name(self):
+		"""frappe.PermissionError during insert must surface as RavenAPIError whose
+		message contains 'PermissionError'."""
+		if "raven" not in frappe.get_installed_apps():
+			self.skipTest("Raven not installed")
+
+		ws_map = frappe._dict(
+			workspace_label="Error Test WS",
+			workspace_type="Private",
+			raven_workspace=None,
+		)
+
+		with patch("frappe.get_doc") as mock_get_doc:
+			mock_doc = mock_get_doc.return_value
+			mock_doc.insert.side_effect = frappe.PermissionError("You don't have permission")
+
+			with self.assertRaises(RavenAPIError) as ctx:
+				create_raven_workspace_for(ws_map)
+
+		self.assertIn("PermissionError", str(ctx.exception))
+
+
+class TestNoActiveRulesIsNotAuthoritative(unittest.TestCase):
+	"""Regression: deleting or pausing the last rule must not evict every member.
+
+	Before the fix, a rule-less mapping evaluated to an empty population and the
+	diff treated that as authoritative, so to_remove became every rule-managed
+	member. Reproduced against a real site as {'added': 0, 'removed': 5}.
+	"""
+
+	_MEMBERS = ["a@example.com", "b@example.com", "c@example.com"]
+
+	def _sync_workspace(self, rules):
+		ws = frappe._dict(member_rules=rules)
+		values = {"enabled": 1, "raven_workspace": "RW-1"}
+		with (
+			patch("raven_integration.sync_service.raven_installed", return_value=True),
+			patch("raven_integration.sync_service.frappe.db.get_value", side_effect=lambda dt, n, f: values[f]),
+			patch("raven_integration.sync_service.frappe.get_doc", return_value=ws),
+			patch("raven_integration.sync_service.frappe.get_all", return_value=list(self._MEMBERS)),
+			patch("raven_integration.sync_service.remove_workspace_member") as rm,
+		):
+			result = sync_workspace_members("WSM-1")
+		return result, rm
+
+	def test_zero_rules_removes_nobody(self):
+		result, rm = self._sync_workspace([])
+		rm.assert_not_called()
+		self.assertEqual(result, {"skipped": True, "reason": "no_active_rules"})
+
+	def test_all_rules_paused_removes_nobody(self):
+		paused = [{"provider": "FAKE", "rule_type": "always-a", "config": {}, "status": "Paused"}]
+		result, rm = self._sync_workspace(paused)
+		rm.assert_not_called()
+		self.assertEqual(result, {"skipped": True, "reason": "no_active_rules"})
+
+	def test_active_rule_matching_nobody_still_removes(self):
+		# The guard must not swallow a genuine empty population: an active rule that
+		# legitimately matches nobody is authoritative and evicts.
+		active = [{"provider": "FAKE", "rule_type": "always-none", "config": {}, "status": "Active"}]
+		ws = frappe._dict(member_rules=active)
+		values = {"enabled": 1, "raven_workspace": "RW-1"}
+		with (
+			patch("raven_integration.sync_service.raven_installed", return_value=True),
+			patch("raven_integration.sync_service.frappe.db.get_value", side_effect=lambda dt, n, f: values[f]),
+			patch("raven_integration.sync_service.frappe.get_doc", return_value=ws),
+			patch("raven_integration.sync_service.frappe.get_all", return_value=list(self._MEMBERS)),
+			patch("raven_integration.engine.expected_workspace_members", return_value=set()),
+			patch("raven_integration.sync_service.remove_workspace_member") as rm,
+		):
+			result = sync_workspace_members("WSM-1")
+		self.assertEqual(rm.call_count, len(self._MEMBERS))
+		self.assertEqual(result, {"added": 0, "removed": len(self._MEMBERS)})
+
+
+def _raven_supports_silent_add() -> bool:
+	"""True if the installed Raven honours flags.ignore_system_message.
+
+	Added in Raven v3; earlier versions post one System message per member and
+	silently ignore the flag.
+	"""
+	import inspect
+
+	try:
+		from raven.raven_channel_management.doctype.raven_channel_member.raven_channel_member import (
+			RavenChannelMember,
+		)
+	except ImportError:
+		return False
+	return "ignore_system_message" in inspect.getsource(RavenChannelMember.after_insert)
+
+
+class TestSilentChannelAdd(_RavenFixtureMixin, FrappeTestCase):
+	"""Rule-driven adds must not post Raven's per-member System message.
+
+	Without suppression a first sync of a 500-student course puts 500 "X added Y."
+	messages into that course's channel.
+	"""
+
+	def setUp(self):
+		self._setUp_raven_fixtures()
+
+	def tearDown(self):
+		frappe.db.delete("Raven Message", {"channel_id": self.raven_channel.name})
+		self._tearDown_raven_fixtures()
+
+	def _system_messages(self) -> int:
+		return frappe.db.count(
+			"Raven Message", {"channel_id": self.raven_channel.name, "message_type": "System"}
+		)
+
+	def test_add_posts_no_system_message(self):
+		if not _raven_supports_silent_add():
+			self.skipTest("installed Raven predates flags.ignore_system_message (v3)")
+		before = self._system_messages()
+		add_channel_member(self.raven_channel.name, self.user.name)
+		self.assertEqual(self._system_messages(), before, "rule-driven add must be silent")
+
+	def test_add_creates_the_row_with_rule_flag(self):
+		add_channel_member(self.raven_channel.name, self.user.name)
+		name = frappe.db.exists(
+			"Raven Channel Member",
+			{"channel_id": self.raven_channel.name, "user_id": self.user.name},
+		)
+		self.assertIsNotNone(name)
+		self.assertEqual(frappe.db.get_value("Raven Channel Member", name, "added_by_rule"), 1)
+
+	def test_raven_defaults_still_applied(self):
+		# Suppressing the message must not cost the row Raven's own defaults.
+		add_channel_member(self.raven_channel.name, self.user.name)
+		row = frappe.db.get_value(
+			"Raven Channel Member",
+			{"channel_id": self.raven_channel.name, "user_id": self.user.name},
+			["allow_notifications", "last_visit"],
+			as_dict=True,
+		)
+		self.assertEqual(row.allow_notifications, 1)
+		self.assertIsNotNone(row.last_visit)
+
+	def test_double_add_still_creates_one_row(self):
+		add_channel_member(self.raven_channel.name, self.user.name)
+		add_channel_member(self.raven_channel.name, self.user.name)
+		count = frappe.db.count(
+			"Raven Channel Member",
+			{"channel_id": self.raven_channel.name, "user_id": self.user.name},
+		)
+		self.assertEqual(count, 1)
+
+
+class TestChannelNameCollision(_RavenFixtureMixin, FrappeTestCase):
+	"""Two channels created from the same label must both insert.
+
+	Raven slugifies Raven Channel.channel_name in before_validate, so probing the
+	raw label never matches a stored name: the same colliding name was proposed on
+	all 5 attempts and Raven's per-workspace duplicate check threw. It threw a bare
+	ValidationError, which the retry loop did not even catch.
+	"""
+
+	def setUp(self):
+		self._setUp_raven_fixtures()
+		self._created = []
+
+	def tearDown(self):
+		for name in self._created:
+			frappe.db.delete("Raven Channel Member", {"channel_id": name})
+			frappe.db.delete("Raven Channel", {"name": name})
+		self._tearDown_raven_fixtures()
+
+	def _make(self, label):
+		ch_map = frappe._dict(workspace=None, channel_label=label, channel_type="Private")
+		doc = _insert_unique_raven_doc(
+			{"doctype": "Raven Channel", "workspace": self.raven_workspace.name, "type": "Private"},
+			"channel_name",
+			label,
+		)
+		self._created.append(doc.name)
+		return doc
+
+	def test_same_label_twice_gets_suffixed(self):
+		label = f"Collide {frappe.generate_hash(length=5)}"
+		first = self._make(label)
+		second = self._make(label)
+		self.assertNotEqual(first.name, second.name)
+		# Raven slugified both; the second must have been bumped, not rejected.
+		self.assertNotEqual(first.channel_name, second.channel_name)
+
+	def test_probe_alone_would_not_have_caught_it(self):
+		# Guards the reasoning: the raw label genuinely does not match what Raven
+		# stores, so the upfront exists() probe cannot be the only defence.
+		label = f"Probe Miss {frappe.generate_hash(length=5)}"
+		created = self._make(label)
+		self.assertNotEqual(created.channel_name, label)
+		self.assertFalse(frappe.db.exists("Raven Channel", {"channel_name": label}))
