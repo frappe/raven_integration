@@ -18,7 +18,7 @@ build-backend = "flit_core.buildapi"
 # Frappe apps this app is compatible with. Mirrors `required_apps` in hooks.py.
 [tool.bench.frappe-dependencies]
 frappe = ">=15.0.0,<=17.0.0-dev"
-raven = ">=2.0.0,<3.0.0"
+raven = ">=2.0.0,<4.0.0"
 
 # These dependencies are only installed when developer mode is enabled
 [tool.bench.dev-dependencies]
