@@ -133,9 +133,7 @@ def _get_rule_type(provider_decl: dict, provider: str, rule_type: str) -> dict:
 	Takes the already-resolved declaration rather than the provider name so a
 	caller that needs both does not reload every app's providers twice.
 	"""
-	decl = next(
-		(rt for rt in provider_decl.get("rule_types", []) if rt["type"] == rule_type), None
-	)
+	decl = next((rt for rt in provider_decl.get("rule_types", []) if rt["type"] == rule_type), None)
 	if decl is None:
 		frappe.throw(_("Provider {0} has no rule type {1}").format(provider, rule_type))
 	return decl

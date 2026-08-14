@@ -36,9 +36,7 @@ def detect_dangling_links() -> dict:
 	# never drift from the primary signal.
 	for raven_doctype, (mapping_doctype, link_field) in events._RAVEN_BACKED_MAPPINGS.items():
 		noun = raven_doctype.removeprefix("Raven ").lower()
-		for mapping in frappe.get_all(
-			mapping_doctype, filters={"stale": 0}, fields=["name", link_field]
-		):
+		for mapping in frappe.get_all(mapping_doctype, filters={"stale": 0}, fields=["name", link_field]):
 			link = mapping.get(link_field)
 			if not link or frappe.db.exists(raven_doctype, link):
 				continue
