@@ -187,8 +187,10 @@ def _rule_node(value: Any, path: "list[int]", require_label: bool, depth: int, b
 def _rule_tree(value: Any, require_label: bool = True) -> dict:
 	"""Validate a whole condition-tree payload, returning the cleaned tree.
 
-	``None`` and a missing tree both read as "no conditions" — the shape a channel
-	that has never been given a rule arrives in.
+	``None`` reads as "no conditions" — the shape a channel that has never been given
+	a rule is created with. An endpoint where a missing tree means "do not touch the
+	stored one" (update_channel) decides that before calling: the two are different
+	answers and only the caller knows which it meant.
 	"""
 	if value is None:
 		return {"conjunctions": [], "conditions": []}
@@ -512,8 +514,10 @@ def _update_mapping(
 	"""Shared body of update_workspace / update_channel. Returns the (possibly new)
 	docname, which changes when the label changes.
 
-	``rule_tree`` is channel-only. A workspace update touches no rules, so it also
-	skips the resync: nothing it can change moves a member.
+	``rule_tree`` is channel-only, and ``None`` means "leave the stored conditions
+	alone" — an empty group is a tree like any other, and does clear them. A workspace
+	update passes no tree at all, so it also skips the resync: nothing it can change
+	moves a member.
 
 	``rename_raven`` carries a changed label to the backing Raven record, the same
 	propagation `_relabel_mapping` does for the single-field endpoints. Without it
@@ -1016,12 +1020,17 @@ def update_channel(
 	rules: "dict | None" = None,
 ) -> str:
 	"""Update a Raven Channel Mapping. Returns the docname, which changes when the
-	label changes (the docname is derived from the label)."""
+	label changes (the docname is derived from the label).
+
+	Omitting ``rules`` leaves the channel's conditions exactly as they are; an empty
+	group is how a caller says "remove every condition". The two have to be different
+	answers: a caller renaming a channel sends no tree, and reading that as the empty
+	tree deletes every condition it has and evicts everyone those conditions added."""
 	_require_manager()
 	name = _str(name, "name")
 	label = _str(label, "label")
 	type_ = _choice(type, "type", _VALID_CH_TYPES, _("Invalid channel type"))
-	rule_tree = _rule_tree(rules)
+	rule_tree = _rule_tree(rules) if rules is not None else None
 	return _update_mapping(
 		"Raven Channel Mapping",
 		name,

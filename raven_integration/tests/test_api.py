@@ -1162,6 +1162,111 @@ class TestPreviewRuleValidatesConfig(FrappeTestCase):
 		self.assertEqual(result["matched_user_count"], 1)
 
 
+_FAKE = ["raven_integration.tests.fake_provider.get_provider"]
+
+
+def _leaf(label, rule_type="always-ab", config=None):
+	return {
+		"label": label,
+		"provider": "FAKE",
+		"rule_type": rule_type,
+		"status": "Active",
+		"config": config if config is not None else {},
+	}
+
+
+class TestUpdateChannelRules(FrappeTestCase):
+	"""update_channel carries the whole settings form, so what it does with a
+	`rules` the caller did not send decides whether a rename can delete a channel's
+	conditions."""
+
+	def setUp(self):
+		self.tree = {
+			"conjunctions": ["or"],
+			"conditions": [_leaf("First Rule"), _leaf("Second Rule", config={"tag": "b"})],
+		}
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			ws = frappe.new_doc("Raven Workspace Mapping")
+			ws.workspace_label = f"Upd Rules WS {frappe.generate_hash(length=6)}"
+			ws.workspace_type = "Private"
+			ws.flags.skip_raven_create = True
+			ws.insert()
+			ch = frappe.new_doc("Raven Channel Mapping")
+			ch.channel_label = f"Upd Rules CH {frappe.generate_hash(length=6)}"
+			ch.workspace = ws.name
+			ch.channel_type = "Private"
+			ch.flags.skip_raven_create = True
+			ch.member_rules_json = frappe.as_json(self.tree)
+			ch.insert()
+		self.workspace = ws.name
+		self.channel = ch.name
+		self.addCleanup(
+			lambda: frappe.delete_doc(
+				"Raven Workspace Mapping", self.workspace, force=True, ignore_missing=True
+			)
+		)
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Channel Mapping", self.channel, force=True, ignore_missing=True)
+		)
+
+	def _stored(self):
+		return frappe.parse_json(
+			frappe.db.get_value("Raven Channel Mapping", self.channel, "member_rules_json")
+		)
+
+	def test_a_rename_that_sends_no_rules_keeps_the_conditions(self):
+		"""Omitting `rules` means "I am not editing the conditions". Writing an empty
+		tree for it deletes every condition on the channel and evicts the members they
+		granted, for a caller that only changed the name."""
+		from raven_integration.api import update_channel
+
+		label = frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_label")
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			self.channel = update_channel(name=self.channel, label=f"{label} Renamed", type="Public")
+
+		self.assertEqual(self._stored(), self.tree)
+		self.assertEqual(frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_type"), "Public")
+
+	def test_a_save_that_sends_no_rules_does_not_schedule_a_resync(self):
+		"""No condition changed, so nothing can have moved a member. Resyncing anyway
+		is what turns the silent tree wipe into an eviction."""
+		from raven_integration import api
+
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			with patch.object(api, "_schedule_resync") as scheduled:
+				label = frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_label")
+				api.update_channel(name=self.channel, label=label, type="Public")
+		scheduled.assert_not_called()
+
+	def test_an_explicitly_empty_tree_still_clears_the_conditions(self):
+		"""The other half of the contract: "delete every condition" is a thing the UI
+		must still be able to say, and it says it by sending an empty group."""
+		from raven_integration import api
+
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			with patch.object(api, "_schedule_resync") as scheduled:
+				label = frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_label")
+				api.update_channel(
+					name=self.channel,
+					label=label,
+					type="Private",
+					rules={"conjunctions": [], "conditions": []},
+				)
+		self.assertEqual(self._stored(), {"conjunctions": [], "conditions": []})
+		scheduled.assert_called_once()
+
+	def test_new_conditions_replace_the_stored_ones(self):
+		from raven_integration import api
+
+		replacement = {"conjunctions": [], "conditions": [_leaf("Only Rule")]}
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			with patch.object(api, "_schedule_resync") as scheduled:
+				label = frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_label")
+				api.update_channel(name=self.channel, label=label, type="Private", rules=replacement)
+		self.assertEqual([c["label"] for c in self._stored()["conditions"]], ["Only Rule"])
+		scheduled.assert_called_once()
+
+
 class TestLabelPropagatesToRaven(FrappeTestCase):
 	"""set_workspace_label / set_channel_label must propagate the rename to the
 	backing Raven records, not only the mapping. Needs a real Raven workspace +
