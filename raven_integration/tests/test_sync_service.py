@@ -590,3 +590,296 @@ class TestChannelNameCollision(_RavenFixtureMixin, FrappeTestCase):
 		created = self._make(label)
 		self.assertNotEqual(created.channel_name, label)
 		self.assertFalse(frappe.db.exists("Raven Channel", {"channel_name": label}))
+
+
+class _ManagedPairMixin:
+	"""Real Raven records behind real mappings, plus users to put in them.
+
+	Everything is created the way the app creates it — the mapping inserts make
+	Raven build the workspace, the channel and the owner's admin rows — so the
+	hooks Raven fires on the way out are the ones a site would fire.
+	"""
+
+	def _setUp_managed(self):
+		if "raven" not in frappe.get_installed_apps():
+			self.skipTest("Raven not installed")
+
+		self.suffix = frappe.generate_hash(length=6)
+		self.addCleanup(self._tearDown_managed)
+
+		self.ws_map = frappe.new_doc("Raven Workspace Mapping")
+		self.ws_map.workspace_label = f"Evict WS {self.suffix}"
+		self.ws_map.workspace_type = "Private"
+		self.ws_map.insert()
+		self.raven_workspace = self.ws_map.raven_workspace
+
+		self.ch_map = frappe.new_doc("Raven Channel Mapping")
+		self.ch_map.channel_label = f"evict-ch-{self.suffix}"
+		self.ch_map.workspace = self.ws_map.name
+		self.ch_map.channel_type = "Private"
+		self.ch_map.insert()
+		self.raven_channel = self.ch_map.raven_channel
+
+	def _tearDown_managed(self):
+		like = ("like", f"%{self.suffix}%")
+		frappe.db.delete("Raven Channel Mapping", {"name": like})
+		frappe.db.delete("Raven Workspace Mapping", {"name": like})
+		for channel in frappe.get_all("Raven Channel", filters={"name": like}, pluck="name"):
+			frappe.db.delete("Raven Channel Member", {"channel_id": channel})
+			frappe.db.delete("Raven Message", {"channel_id": channel})
+		frappe.db.delete("Raven Channel", {"name": like})
+		for workspace in frappe.get_all("Raven Workspace", filters={"name": like}, pluck="name"):
+			frappe.db.delete("Raven Workspace Member", {"workspace": workspace})
+		frappe.db.delete("Raven Workspace", {"name": like})
+
+	def _unmanaged_channel(self, tag: str) -> str:
+		"""A Raven channel in the same workspace that this app never mapped."""
+		return (
+			frappe.get_doc(
+				{
+					"doctype": "Raven Channel",
+					"channel_name": f"unmanaged-{tag}-{self.suffix}",
+					"workspace": self.raven_workspace,
+					"type": "Private",
+				}
+			)
+			.insert(ignore_permissions=True)
+			.name
+		)
+
+	def _user(self, tag: str) -> str:
+		user = frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": f"ri-{tag}-{self.suffix}@example.com",
+				"first_name": f"Evict {tag}",
+				"send_welcome_email": 0,
+			}
+		).insert()
+		self.addCleanup(lambda: frappe.db.delete("User", {"name": user.name}))
+		ensure_raven_user(user.name)
+		self.addCleanup(lambda: frappe.db.delete("Raven User", {"user": user.name}))
+		return user.name
+
+	def _channel_row(self, user: str, *, by_rule: bool, channel: str | None = None) -> str:
+		return (
+			frappe.get_doc(
+				{
+					"doctype": "Raven Channel Member",
+					"channel_id": channel or self.raven_channel,
+					"user_id": user,
+					"added_by_rule": 1 if by_rule else 0,
+				}
+			)
+			.insert(ignore_permissions=True)
+			.name
+		)
+
+	def _workspace_row(self, user: str, *, by_rule: bool) -> str:
+		return (
+			frappe.get_doc(
+				{
+					"doctype": "Raven Workspace Member",
+					"workspace": self.raven_workspace,
+					"user": user,
+					"added_by_rule": 1 if by_rule else 0,
+				}
+			)
+			.insert(ignore_permissions=True)
+			.name
+		)
+
+	def _has_channel_row(self, user: str, channel: str | None = None) -> bool:
+		return bool(
+			frappe.db.exists(
+				"Raven Channel Member", {"channel_id": channel or self.raven_channel, "user_id": user}
+			)
+		)
+
+	def _has_workspace_row(self, user: str) -> bool:
+		return bool(
+			frappe.db.exists("Raven Workspace Member", {"workspace": self.raven_workspace, "user": user})
+		)
+
+
+class TestWithdrawalLeavesHumanChannelRowsAlone(_ManagedPairMixin, FrappeTestCase):
+	"""Deleting a workspace mapping must not reach into channels it never managed.
+
+	Raven Workspace Member.on_trash runs delete_channel_members_for_user, which
+	deletes every channel row the user holds anywhere in the workspace with no
+	regard for who put it there. So withdrawing a workspace row is only safe once
+	the user has no channel rows left to lose.
+	"""
+
+	def setUp(self):
+		self._setUp_managed()
+
+	def test_a_hand_added_row_in_an_unmanaged_channel_survives(self):
+		bob = self._user("cascade")
+		other = self._unmanaged_channel("keep")
+		self._channel_row(bob, by_rule=True)
+		self._channel_row(bob, by_rule=False, channel=other)
+		self._workspace_row(bob, by_rule=True)
+
+		frappe.delete_doc("Raven Workspace Mapping", self.ws_map.name)
+
+		self.assertTrue(
+			self._has_channel_row(bob, other),
+			"a channel row a human added is not this app's to remove, at any remove",
+		)
+
+	def test_a_member_a_channel_still_holds_keeps_the_workspace_row(self):
+		"""Workspace membership is derived: one channel left is enough to stay."""
+		bob = self._user("derived")
+		other = self._unmanaged_channel("derived")
+		self._channel_row(bob, by_rule=True)
+		self._channel_row(bob, by_rule=False, channel=other)
+		self._workspace_row(bob, by_rule=True)
+
+		frappe.delete_doc("Raven Workspace Mapping", self.ws_map.name)
+
+		self.assertTrue(self._has_workspace_row(bob))
+
+	def test_the_rows_its_rules_granted_still_go(self):
+		"""The contrast: nothing above weakens the withdrawal itself."""
+		bob = self._user("withdrawn")
+		self._channel_row(bob, by_rule=True)
+		self._workspace_row(bob, by_rule=True)
+
+		frappe.delete_doc("Raven Workspace Mapping", self.ws_map.name)
+
+		self.assertFalse(self._has_channel_row(bob))
+		self.assertFalse(self._has_workspace_row(bob))
+
+
+class TestWithdrawalCannotOrphanTheWorkspaceAdmin(_ManagedPairMixin, FrappeTestCase):
+	"""Raven refuses to delete a workspace member row that leaves no admin behind.
+
+	It throws from on_trash, which takes down the whole delete the user actually
+	asked for — the mapping, its channel mappings and its rules — with an error
+	that names none of them.
+	"""
+
+	def setUp(self):
+		self._setUp_managed()
+
+	def _make_sole_admin(self, user: str) -> None:
+		"""Hand the app's own row the workspace's only admin flag.
+
+		A human promoting a rule-added member in Raven does exactly this; going
+		through db.set_value keeps Raven's own validate out of the fixture.
+		"""
+		frappe.db.set_value(
+			"Raven Workspace Member", {"workspace": self.raven_workspace, "user": user}, "is_admin", 1
+		)
+		for row in frappe.get_all(
+			"Raven Workspace Member",
+			filters={"workspace": self.raven_workspace, "user": ("!=", user)},
+			pluck="name",
+		):
+			frappe.db.set_value("Raven Workspace Member", row, "is_admin", 0)
+
+	def test_the_mapping_delete_survives_a_rule_managed_last_admin(self):
+		admin = self._user("last-admin")
+		self._channel_row(admin, by_rule=True)
+		self._workspace_row(admin, by_rule=True)
+		self._make_sole_admin(admin)
+
+		frappe.delete_doc("Raven Workspace Mapping", self.ws_map.name)
+
+		self.assertFalse(frappe.db.exists("Raven Workspace Mapping", self.ws_map.name))
+
+	def test_the_last_admin_keeps_the_row_the_withdrawal_could_not_take(self):
+		admin = self._user("kept-admin")
+		self._channel_row(admin, by_rule=True)
+		self._workspace_row(admin, by_rule=True)
+		self._make_sole_admin(admin)
+
+		frappe.delete_doc("Raven Workspace Mapping", self.ws_map.name)
+
+		self.assertTrue(
+			self._has_workspace_row(admin),
+			"Raven keeps its last admin; the withdrawal has to leave that row where it is",
+		)
+
+
+class TestWithdrawalLeavesTheChannelOpen(_ManagedPairMixin, FrappeTestCase):
+	"""Raven archives a private channel whose last member leaves.
+
+	That reads a human walking out of a conversation. A mapping delete empties the
+	channel without anyone leaving it, and the channel is the one thing the delete
+	promises to leave standing.
+	"""
+
+	def setUp(self):
+		self._setUp_managed()
+		# The manager who created the channel has since left it, so every row left
+		# in it is one the app's rules put there.
+		frappe.db.delete("Raven Channel Member", {"channel_id": self.raven_channel})
+
+	def _populate(self, count: int = 2) -> list[str]:
+		users = []
+		for i in range(count):
+			user = self._user(f"open{i}")
+			self._channel_row(user, by_rule=True)
+			self._workspace_row(user, by_rule=True)
+			users.append(user)
+		return users
+
+	def _is_archived(self) -> int:
+		return frappe.db.get_value("Raven Channel", self.raven_channel, "is_archived")
+
+	def test_deleting_the_channel_mapping_does_not_archive_the_channel(self):
+		self._populate()
+
+		frappe.delete_doc("Raven Channel Mapping", self.ch_map.name)
+
+		self.assertEqual(self._is_archived(), 0, "the Raven channel is meant to survive its mapping")
+
+	def test_deleting_the_workspace_mapping_does_not_archive_the_channel(self):
+		self._populate()
+
+		frappe.delete_doc("Raven Workspace Mapping", self.ws_map.name)
+
+		self.assertEqual(self._is_archived(), 0)
+
+	def test_a_channel_a_human_had_already_archived_stays_archived(self):
+		self._populate()
+		frappe.db.set_value("Raven Channel", self.raven_channel, "is_archived", 1)
+
+		frappe.delete_doc("Raven Channel Mapping", self.ch_map.name)
+
+		self.assertEqual(self._is_archived(), 1, "un-archiving is not this app's decision either")
+
+	def test_the_withdrawal_still_empties_the_channel(self):
+		"""The contrast: keeping the channel open is not keeping its members."""
+		users = self._populate()
+
+		frappe.delete_doc("Raven Channel Mapping", self.ch_map.name)
+
+		for user in users:
+			self.assertFalse(self._has_channel_row(user))
+
+	def test_raven_posts_a_removal_message_for_every_withdrawn_member(self):
+		"""Pins Raven 2.x's per-member System message on the withdrawal path.
+
+		RavenChannelMember.after_delete posts "X removed Y." for each row and reads
+		no suppression flag — `flags.ignore_system_message` appears nowhere in the
+		installed Raven, so this app cannot ask for silence the way add_channel_member
+		does. A 500-student course therefore ends its mapping with 500 messages in the
+		channel. Pins current behaviour: once the installed Raven honours the flag,
+		set it on the delete and invert this to assertEqual(after, before).
+		"""
+		if _raven_supports_silent_add():
+			self.skipTest("installed Raven honours flags.ignore_system_message")
+		users = self._populate()
+		before = frappe.db.count(
+			"Raven Message", {"channel_id": self.raven_channel, "message_type": "System"}
+		)
+
+		frappe.delete_doc("Raven Channel Mapping", self.ch_map.name)
+
+		self.assertEqual(
+			frappe.db.count("Raven Message", {"channel_id": self.raven_channel, "message_type": "System"}),
+			before + len(users),
+		)

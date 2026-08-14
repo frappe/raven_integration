@@ -67,13 +67,61 @@ def _remove_rule_managed_member(member_doctype: str, filters: dict) -> None:
 	"""Delete the member row only if this app added it; manual rows are left alone."""
 	name = frappe.db.exists(member_doctype, {**filters, "added_by_rule": 1})
 	if name:
-		frappe.delete_doc(member_doctype, name, ignore_permissions=True, force=True)
+		_delete_member_rows(member_doctype, [name])
+
+
+def _would_leave_the_workspace_without_an_admin(name: str) -> bool:
+	"""Mirrors RavenWorkspaceMember.check_last_admin, which throws in this case.
+
+	It counts admins *other than* the row being deleted, so a workspace whose only
+	admin row is this one — or which has no admin at all — refuses the delete. That
+	throw comes out of on_trash and takes the whole transaction with it, including
+	the mapping delete that a user actually asked for.
+	"""
+	row = frappe.db.get_value("Raven Workspace Member", name, ["workspace"], as_dict=True)
+	if not row:
+		return False
+	return not frappe.db.count(
+		"Raven Workspace Member",
+		{"workspace": row.workspace, "is_admin": 1, "name": ("!=", name)},
+	)
+
+
+@contextmanager
+def _keeping_channels_unarchived(channels: "list[str]"):
+	"""Put back the archive flag Raven sets when the last member of a channel goes.
+
+	RavenChannelMember.after_delete archives a Private channel it has just emptied,
+	which reads the last human walking out of a conversation. A withdrawal empties
+	it without anyone leaving, and the channel is the one thing the withdrawal
+	promises to leave standing. A channel somebody had already archived stays that
+	way — un-archiving is not this app's decision either.
+	"""
+	open_before = [c for c in channels if not frappe.db.get_value("Raven Channel", c, "is_archived")]
+	try:
+		yield
+	finally:
+		for channel in open_before:
+			if frappe.db.get_value("Raven Channel", channel, "is_archived"):
+				frappe.db.set_value("Raven Channel", channel, "is_archived", 0)
 
 
 def _delete_member_rows(member_doctype: str, names: "list[str]") -> int:
-	"""Delete the named member rows. Returns how many went."""
-	for name in names:
-		frappe.delete_doc(member_doctype, name, ignore_permissions=True, force=True)
+	"""Delete the named member rows. Returns how many went.
+
+	Raven's own hooks run, as they must, but two of them are written for a person
+	leaving rather than a withdrawal: a workspace row that would leave no admin
+	behind aborts the delete, and the last channel member archives a private
+	channel. Skip the first, undo the second.
+	"""
+	if member_doctype == "Raven Workspace Member":
+		names = [n for n in names if not _would_leave_the_workspace_without_an_admin(n)]
+		channels = []
+	else:
+		channels = list({frappe.db.get_value(member_doctype, name, "channel_id") for name in names} - {None})
+	with _keeping_channels_unarchived(channels):
+		for name in names:
+			frappe.delete_doc(member_doctype, name, ignore_permissions=True, force=True)
 	return len(names)
 
 
@@ -129,20 +177,25 @@ def evict_rule_managed_members(raven_workspace: "str | None", raven_channels: "l
 	site able to explain or undo it.
 
 	This is not a Raven delete and does not become one: the workspace, the
-	channels and every message in them are untouched, and so is anyone a human
-	added. Only the rows this app inserted itself are withdrawn.
+	channels and their history are untouched, and so is anyone a human added. Only
+	the rows this app inserted itself are withdrawn. (Raven does write one "X was
+	removed by Y." system message per row on the way — see add_channel_member for
+	why this app cannot ask it not to.)
 
-	Workspace membership is derived from channel membership, so both halves go
-	together — a workspace row this app added exists only because one of these
-	channel rows did, and nothing is left managing the workspace afterwards.
+	Workspace membership is derived from channel membership, so the workspace half
+	follows the channel half rather than repeating it: whoever has just lost their
+	last channel loses their workspace row too. Withdrawing more than that is not
+	only wrong on this app's own rule, it is destructive — Raven answers a deleted
+	workspace row by deleting every channel row that user holds anywhere in the
+	workspace, including the ones a human added.
 	"""
 	if not raven_installed():
 		return {"channel_members": 0, "workspace_members": 0}
 	channels = [c for c in raven_channels if c]
 	return {
 		"channel_members": _delete_rule_managed_rows("Raven Channel Member", "channel_id", channels),
-		"workspace_members": _delete_rule_managed_rows(
-			"Raven Workspace Member", "workspace", [raven_workspace] if raven_workspace else []
+		"workspace_members": (
+			_drop_workspace_members_without_a_channel(raven_workspace) if raven_workspace else 0
 		),
 	}
 

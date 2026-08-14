@@ -42,8 +42,8 @@ class RavenWorkspaceMapping(Document):
 		evict_rule_managed_members(self.raven_workspace, [c.raven_channel for c in channels])
 		# Each cascaded delete evicts its own channel too. By now there is nothing
 		# left for it to find, so it is a no-op rather than a second withdrawal —
-		# but doing the whole workspace in one pass first is what makes the
-		# workspace's own member rows go unconditionally, which a per-channel
-		# eviction, deriving them from the channels, would not do.
+		# but doing the whole workspace in one pass first is what lets the workspace
+		# rows be decided once, against every channel at its final state, instead of
+		# once per channel as the cascade empties them one at a time.
 		for channel in channels:
 			frappe.delete_doc("Raven Channel Mapping", channel.name)
