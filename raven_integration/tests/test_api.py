@@ -1267,6 +1267,83 @@ class TestUpdateChannelRules(FrappeTestCase):
 		scheduled.assert_called_once()
 
 
+class TestSerializeTreeForUI(FrappeTestCase):
+	"""What the rules panel is handed has to be a tree it can send straight back:
+	one joiner per gap between conditions, which is what the save path enforces."""
+
+	def setUp(self):
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			ws = frappe.new_doc("Raven Workspace Mapping")
+			ws.workspace_label = f"Serialize WS {frappe.generate_hash(length=6)}"
+			ws.workspace_type = "Private"
+			ws.flags.skip_raven_create = True
+			ws.insert()
+			ch = frappe.new_doc("Raven Channel Mapping")
+			ch.channel_label = f"Serialize CH {frappe.generate_hash(length=6)}"
+			ch.workspace = ws.name
+			ch.channel_type = "Private"
+			ch.flags.skip_raven_create = True
+			ch.member_rules_json = frappe.as_json(
+				{
+					"conjunctions": ["or"],
+					"conditions": [_leaf("First Rule"), _leaf("Second", config={"t": 1})],
+				}
+			)
+			ch.insert()
+		self.workspace = ws.name
+		self.channel = ch.name
+		self.addCleanup(
+			lambda: frappe.delete_doc(
+				"Raven Workspace Mapping", self.workspace, force=True, ignore_missing=True
+			)
+		)
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Channel Mapping", self.channel, force=True, ignore_missing=True)
+		)
+
+	def _store(self, tree):
+		# db.set_value, not the doctype: this is a payload validation would reject,
+		# which is the point — it is what a hand-edited JSON field can leave behind.
+		frappe.db.set_value("Raven Channel Mapping", self.channel, "member_rules_json", frappe.as_json(tree))
+
+	def test_a_broken_child_takes_its_joiner_with_it(self):
+		from raven_integration.api import _serialize_tree_for_ui
+
+		self._store(
+			{
+				"conjunctions": ["or", "and"],
+				"conditions": [_leaf("Keep"), None, _leaf("Keep Too", config={"t": 2})],
+			}
+		)
+		served = _serialize_tree_for_ui(
+			frappe.db.get_value("Raven Channel Mapping", self.channel, "member_rules_json")
+		)
+		self.assertEqual([c["label"] for c in served["conditions"]], ["Keep", "Keep Too"])
+		self.assertEqual(len(served["conjunctions"]), len(served["conditions"]) - 1)
+
+	def test_what_the_panel_is_served_can_be_saved_back(self):
+		"""The consequence of a joiner count that does not match: the panel posts the
+		tree back untouched and the save is refused with "Reload the page and try again",
+		which reloading cannot fix."""
+		from raven_integration.api import get_channel, update_channel
+
+		self._store(
+			{
+				"conjunctions": ["or", "and"],
+				"conditions": [_leaf("Keep"), None, _leaf("Keep Too", config={"t": 2})],
+			}
+		)
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			served = get_channel(self.channel)["rules"]
+			label = frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_label")
+			update_channel(name=self.channel, label=label, type="Private", rules=served)
+
+		stored = frappe.parse_json(
+			frappe.db.get_value("Raven Channel Mapping", self.channel, "member_rules_json")
+		)
+		self.assertEqual([c["label"] for c in stored["conditions"]], ["Keep", "Keep Too"])
+
+
 class TestLabelPropagatesToRaven(FrappeTestCase):
 	"""set_workspace_label / set_channel_label must propagate the rename to the
 	backing Raven records, not only the mapping. Needs a real Raven workspace +
@@ -1373,6 +1450,8 @@ class TestLabelPropagatesToRaven(FrappeTestCase):
 		# The mapping's raven_channel Link stays valid.
 		self.assertEqual(
 			frappe.db.get_value("Raven Channel Mapping", self.ch_map, "raven_channel"), self.raven_ch
+		)
+
 	def test_update_workspace_rename_propagates_to_raven(self):
 		"""The settings page commits the workspace's name and visibility through
 		update_workspace, so a rename travelling that path must reach Raven exactly as

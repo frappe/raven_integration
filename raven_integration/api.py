@@ -5,7 +5,7 @@ from frappe import _
 from frappe.query_builder.functions import Count
 from frappe.utils import escape_html
 
-from raven_integration.engine import MAX_TREE_DEPTH, MAX_TREE_NODES, is_group
+from raven_integration.engine import CONJUNCTION_OR, MAX_TREE_DEPTH, MAX_TREE_NODES, is_group
 from raven_integration.utils import raven_installed
 
 _VALID_WS_TYPES = {"Public", "Private"}
@@ -630,10 +630,24 @@ def _serialize_tree_for_ui(tree) -> dict:
 	def walk(node: dict) -> dict:
 		if not _is_group_node(node):
 			return _serialize_rule_for_ui(node)
-		return {
-			"conjunctions": list(node.get("conjunctions") or []),
-			"conditions": [walk(child) for child in node.get("conditions") or [] if isinstance(child, dict)],
-		}
+		stored = node.get("conditions") or []
+		joiners = list(node.get("conjunctions") or [])
+		conditions: list[dict] = []
+		conjunctions: list[str] = []
+		for index, child in enumerate(stored):
+			# A child that is not a rule or a group cannot be drawn, and dropping it
+			# has to drop the gap it stood in too — the panel sends back what it was
+			# served, and the save path rejects a group with a joiner per condition
+			# instead of a joiner per gap.
+			if not isinstance(child, dict):
+				continue
+			if conditions:
+				# A gap the stored tree does not name reads as "or" here because that
+				# is how the engine folds it — the panel is shown what is evaluated.
+				joiner = joiners[index - 1] if index - 1 < len(joiners) else CONJUNCTION_OR
+				conjunctions.append(joiner)
+			conditions.append(walk(child))
+		return {"conjunctions": conjunctions, "conditions": conditions}
 
 	return walk(parse_tree(tree) or {"conjunctions": [], "conditions": []})
 
