@@ -100,7 +100,9 @@ on the workspace). Deletion stops there: of Raven's own records the app deletes 
 and its channels are left intact, unmanaged but whole, with their history and their hand-added
 members. Deleting a single channel mapping withdraws that channel's `added_by_rule` members the same
 way; the workspace mapping stays, so its membership stays derived — only someone whose last channel
-in the workspace this was loses their workspace row with it.
+in the workspace this was loses their workspace row with it. The withdrawal is not silent: Raven
+writes one "X was removed by Y." system message per membership row it deletes, and honours no flag
+that would suppress it, so a withdrawal shows up in the channels it touches.
 
 ## Stale mappings
 

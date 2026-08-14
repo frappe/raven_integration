@@ -885,9 +885,11 @@ def delete_workspace(name: str) -> None:
 	membership their rules had granted.
 
 	Of Raven's own records it deletes none: the backing Raven Workspace, its
-	channels and their conversations are left intact and simply become unmanaged,
-	as are the members a human added there. Deleting the workspace itself is
-	Raven's decision to make, not ours.
+	channels and their history are left intact and simply become unmanaged, as are
+	the members a human added there. Deleting the workspace itself is Raven's
+	decision to make, not ours. Raven does post one "X was removed by Y." system
+	message per withdrawn member on the way out — it honours no suppression flag, so
+	the withdrawal is visible in the channels it touches.
 	"""
 	_require_manager()
 	name = _str(name, "name")
@@ -1079,8 +1081,10 @@ def update_channel(
 def delete_channel(name: str) -> None:
 	"""Delete the Raven Channel Mapping and the membership its rules had granted.
 
-	The backing Raven Channel and its messages are left intact and simply become
-	unmanaged, as are the members a human added there.
+	The backing Raven Channel and its history are left intact and simply become
+	unmanaged, as are the members a human added there. Raven does post one "X was
+	removed by Y." system message per withdrawn member on the way out — it honours no
+	suppression flag, so the withdrawal is visible in the channel.
 	"""
 	_require_manager()
 	name = _str(name, "name")
