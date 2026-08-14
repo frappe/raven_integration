@@ -1260,6 +1260,78 @@ class TestLabelPropagatesToRaven(FrappeTestCase):
 			frappe.db.get_value("Raven Channel Mapping", self.ch_map, "raven_channel"), self.raven_ch
 		)
 
+	def test_update_channel_rename_propagates_to_raven(self):
+		"""The settings page commits name, visibility and conditions through
+		update_channel, so a rename travelling that path must reach Raven exactly
+		as set_channel_label does. It did not: _update_mapping renamed only the
+		mapping, and the two names diverged with nothing to say so."""
+		from raven_integration.api import update_channel
+
+		new_label = f"RI Upd Ch Renamed {self._suffix}"
+		self.ch_map = update_channel(
+			name=self.ch_map, label=new_label, type="Public", rules=[]
+		)
+
+		self.assertEqual(self.ch_map, f"RCM-{new_label}")
+		self.assertEqual(
+			frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name"),
+			new_label.strip().lower().replace(" ", "-"),
+		)
+		# Everything else the one call carries landed too, and the link is intact.
+		self.assertEqual(
+			frappe.db.get_value("Raven Channel Mapping", self.ch_map, "channel_type"), "Public"
+		)
+		self.assertEqual(
+			frappe.db.get_value("Raven Channel Mapping", self.ch_map, "raven_channel"), self.raven_ch
+		)
+
+	def test_update_channel_without_a_rename_leaves_the_raven_name_alone(self):
+		"""Only a *changed* label is propagated. Re-saving the same name must leave
+		the Raven channel_name exactly as it was, slug and all."""
+		from raven_integration.api import update_channel
+
+		stored = frappe.db.get_value("Raven Channel Mapping", self.ch_map, "channel_label")
+		before = frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name")
+		self.ch_map = update_channel(name=self.ch_map, label=stored, type="Public", rules=[])
+		self.assertEqual(
+			frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name"), before
+		)
+
+	def test_update_channel_failed_rename_rolls_the_raven_write_back(self):
+		"""The Raven write happens before the mapping rename, so a mapping-side
+		failure has to undo it. Raven itself will not raise here — its duplicate
+		guard only runs on insert — so the collision is forced where it really
+		lives: two mappings cannot share a docname."""
+		from raven_integration.api import update_channel
+
+		taken = frappe.new_doc("Raven Channel Mapping")
+		taken.channel_label = f"RI Taken {self._suffix}"
+		taken.workspace = self.ws_map
+		taken.channel_type = "Private"
+		taken.flags.skip_raven_create = True
+		taken.insert()
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Channel Mapping", taken.name, force=True, ignore_missing=True)
+		)
+
+		before_name = frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name")
+		before_type = frappe.db.get_value("Raven Channel Mapping", self.ch_map, "channel_type")
+
+		with self.assertRaises(frappe.ValidationError):
+			update_channel(
+				name=self.ch_map, label=f"RI Taken {self._suffix}", type="Public", rules=[]
+			)
+
+		# Nothing half-applied: the Raven name, the mapping and its visibility all
+		# stand where they were.
+		self.assertEqual(
+			frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name"), before_name
+		)
+		self.assertTrue(frappe.db.exists("Raven Channel Mapping", self.ch_map))
+		self.assertEqual(
+			frappe.db.get_value("Raven Channel Mapping", self.ch_map, "channel_type"), before_type
+		)
+
 	def test_stale_mapping_skips_raven_rename(self):
 		from raven_integration.api import set_workspace_label
 

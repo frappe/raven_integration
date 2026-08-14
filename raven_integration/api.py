@@ -375,23 +375,49 @@ def _update_mapping(
 	fields: dict,
 	rule_rows: "list[dict] | None" = None,
 	combinator: "str | None" = None,
+	rename_raven=None,
+	savepoint: str = "update_mapping",
 ) -> str:
 	"""Shared body of update_workspace / update_channel. Returns the (possibly new)
 	docname, which changes when the label changes.
 
 	``rule_rows`` is channel-only. A workspace update touches no rules, so it also
-	skips the resync: nothing it can change moves a member."""
+	skips the resync: nothing it can change moves a member.
+
+	``rename_raven`` carries a changed label to the backing Raven record, the same
+	propagation `_relabel_mapping` does for the single-field endpoints. Without it
+	a label written through this path renames only the mapping, and the Raven side
+	keeps the old name forever — the two silently diverge. It shares one savepoint
+	with the mapping write so neither side is ever left half-renamed."""
 	doc = frappe.get_doc(doctype, name)
-	doc.update(fields)
-	if rule_rows is not None:
-		doc.rule_combinator = combinator
-		doc.member_rules = []
-		for r in rule_rows:
-			doc.append("member_rules", r)
-	doc.save()
+	stored_label = doc.get(_MAPPING_LABEL_FIELDS[doctype])
+	# Only an actual change is propagated: re-saving an unchanged name would touch
+	# the Raven record on every save, and Raven validates uniqueness on write.
+	propagate = rename_raven is not None and label != stored_label
+
+	if propagate:
+		frappe.db.savepoint(savepoint)
+	try:
+		doc.update(fields)
+		if rule_rows is not None:
+			doc.rule_combinator = combinator
+			doc.member_rules = []
+			for r in rule_rows:
+				doc.append("member_rules", r)
+		doc.save()
+		if propagate:
+			rename_raven(name, label)
+		new_name = _set_mapping_label(doctype, name, label)
+	except Exception:
+		if propagate:
+			frappe.db.rollback(save_point=savepoint)
+		raise
+
+	# After the write lands, never before: a rolled-back save must not leave a
+	# resync queued against rules that were not stored.
 	if rule_rows is not None:
 		_schedule_resync()
-	return _set_mapping_label(doctype, name, label)
+	return new_name
 
 
 def _set_mapping_enabled(doctype: str, name: str, enabled: bool) -> dict:
@@ -867,6 +893,11 @@ def update_channel(
 		{"channel_type": type_},
 		rule_rows=rule_rows,
 		combinator=combinator_,
+		# The settings page commits name, visibility and conditions through this one
+		# call, so it is now the path a rename travels — it has to reach Raven the
+		# same way set_channel_label does.
+		rename_raven=_rename_raven_channel,
+		savepoint="update_channel",
 	)
 
 
