@@ -1846,6 +1846,62 @@ class TestLinkExisting(FrappeTestCase):
 		row = next(w for w in list_workspaces() if w["raven_workspace"] == self.raven_ws)
 		self.assertIsNone(row["channel_count"])
 
+	def test_list_workspaces_order_survives_an_edit(self):
+		"""Row order must not depend on `modified`. The UI reloads this list after every
+		inline edit, so a row that jumps to the top on being edited drags every row
+		below it up one — and a click on a row's Enabled switch then reads as having
+		toggled its neighbour."""
+		from raven_integration.api import list_workspaces, set_workspace_enabled
+
+		names = []
+		for i in range(3):
+			ws = frappe.new_doc("Raven Workspace Mapping")
+			ws.workspace_label = f"RI Order WS {i} {self._suffix}"
+			ws.workspace_type = "Private"
+			ws.flags.skip_raven_create = True
+			ws.insert()
+			self._track("Raven Workspace Mapping", ws.name)
+			names.append(ws.name)
+
+		def order():
+			return [row["name"] for row in list_workspaces() if row["name"] in names]
+
+		before = order()
+		# The oldest of the three, so it sits last under any newest-first order and has
+		# the furthest to jump.
+		set_workspace_enabled(name=names[0], enabled=False)
+		self.assertEqual(order(), before, "editing a row must not move it in the list")
+
+	def test_list_channels_order_survives_an_edit(self):
+		"""The channel table reloads on every inline edit too, so it needs the same
+		stable order as the workspace list."""
+		from raven_integration.api import list_channels, set_channel_enabled
+
+		ws = frappe.new_doc("Raven Workspace Mapping")
+		ws.workspace_label = f"RI Order CH WS {self._suffix}"
+		ws.workspace_type = "Private"
+		ws.flags.skip_raven_create = True
+		ws.insert()
+		self._track("Raven Workspace Mapping", ws.name)
+
+		names = []
+		for i in range(3):
+			ch = frappe.new_doc("Raven Channel Mapping")
+			ch.workspace = ws.name
+			ch.channel_label = f"ri-order-{i}-{self._suffix}"
+			ch.channel_type = "Private"
+			ch.flags.skip_raven_create = True
+			ch.insert()
+			self._track("Raven Channel Mapping", ch.name)
+			names.append(ch.name)
+
+		def order():
+			return [row["name"] for row in list_channels(workspace=ws.name) if row["name"] in names]
+
+		before = order()
+		set_channel_enabled(name=names[0], enabled=False)
+		self.assertEqual(order(), before, "editing a row must not move it in the list")
+
 	def test_list_workspaces_managed_rows_come_first(self):
 		"""Managed rows precede every unmanaged row."""
 		from raven_integration.api import list_workspaces

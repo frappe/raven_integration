@@ -693,8 +693,8 @@ def _channel_counts(workspaces: list[str]) -> dict[str, int]:
 
 @frappe.whitelist()
 def list_workspaces() -> list[dict]:
-	"""Every Raven workspace the UI can show: managed mappings first (current order),
-	then unmanaged Raven workspaces re-projected into the same row shape."""
+	"""Every Raven workspace the UI can show: managed mappings newest first, then
+	unmanaged Raven workspaces re-projected into the same row shape."""
 	_require_manager()
 	managed = frappe.get_all(
 		"Raven Workspace Mapping",
@@ -706,7 +706,12 @@ def list_workspaces() -> list[dict]:
 			"enabled",
 			"stale",
 		],
-		order_by="modified desc",
+		# By creation, never `modified`: the UI reloads this list after every inline
+		# edit, so ordering by `modified` sends the edited row to the top and shifts
+		# every row under the pointer. Toggling one row's switch then reads as having
+		# toggled its neighbour. Creation still puts a freshly created row first,
+		# which is where the create flow expects to find and select it.
+		order_by="creation desc",
 	)
 	counts = _channel_counts([row["name"] for row in managed])
 	for row in managed:
@@ -905,8 +910,8 @@ def set_workspace_label(name: str, label: str) -> dict:
 
 @frappe.whitelist()
 def list_channels(workspace: str) -> list[dict]:
-	"""Every channel in ``workspace`` the UI can show: managed channel mappings first
-	(current order), then unmanaged Raven channels in the backing workspace."""
+	"""Every channel in ``workspace`` the UI can show: managed channel mappings newest
+	first, then unmanaged Raven channels in the backing workspace."""
 	_require_manager()
 	workspace = _str(workspace, "workspace")
 	managed = frappe.get_all(
@@ -920,7 +925,8 @@ def list_channels(workspace: str) -> list[dict]:
 			"enabled",
 			"stale",
 		],
-		order_by="modified desc",
+		# Stable across edits, for the reason spelled out in list_workspaces.
+		order_by="creation desc",
 	)
 	for row in managed:
 		row["mapped"] = True
