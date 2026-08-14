@@ -251,37 +251,38 @@ def _evaluate_node(node, path: list, *, strict: bool) -> "set[str] | None":
 def _evaluate_group(group: dict, path: list, *, strict: bool) -> "set[str] | None":
 	"""Fold a group's children by its conjunctions, or None if none survive.
 
-	``conjunctions[i]`` joins child ``i`` to child ``i + 1``, so a child that turns
-	out absent takes its own leading gap with it and the rest still line up.
-
 	The fold applies classic precedence — ``and`` binds tighter than ``or`` — so a
 	level mixing the two means what it reads like: ``A and B or C and D`` is
 	``(A and B) or (C and D)``, not a left-to-right fold. Frappe Learning's editor
 	writes one conjunction per group, so a mixed level only ever arrives through
 	this API.
+
+	The and-runs are marked out from the *stored* conjunctions, before anything is
+	dropped, and an absent child then leaves its run rather than shifting the gaps
+	behind it. That is the whole point: in ``A or B and C`` with B absent, letting C
+	inherit B's gap would answer ``A and C`` — narrower than A alone. Skipping a rule
+	may leave the population as it was or widen it, never shrink it, which is the
+	promise ``pausable`` and the lenient read path both rest on.
 	"""
 	conditions = group.get("conditions") or []
 	conjunctions = group.get("conjunctions") or []
-	surviving: list[tuple[str, set[str]]] = []
+	or_terms: list[set[str]] = []
+	run: "set[str] | None" = None
 	for index, child in enumerate(conditions):
+		# The gap before this child; the first child starts the first run and has none.
+		joiner = conjunctions[index - 1] if 0 < index <= len(conjunctions) else CONJUNCTION_OR
+		if index and joiner != CONJUNCTION_AND:
+			if run is not None:
+				or_terms.append(run)
+			run = None
 		value = _evaluate_node(child, [*path, index], strict=strict)
 		if value is None:
 			continue
-		# The gap before this child; the first survivor starts the fold and has none.
-		joiner = conjunctions[index - 1] if 0 < index <= len(conjunctions) else CONJUNCTION_OR
-		surviving.append((joiner, value))
-	if not surviving:
+		run = value if run is None else run & value
+	if run is not None:
+		or_terms.append(run)
+	if not or_terms:
 		return None
-
-	or_terms: list[set[str]] = []
-	run: set[str] = surviving[0][1]
-	for joiner, value in surviving[1:]:
-		if joiner == CONJUNCTION_AND:
-			run = run & value
-		else:
-			or_terms.append(run)
-			run = value
-	or_terms.append(run)
 	return set().union(*or_terms)
 
 

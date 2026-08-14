@@ -139,8 +139,9 @@ class TestEngineRuleCombination(FrappeTestCase):
 		self.assertEqual(engine.evaluate_rules(tree), {"a@example.com", "b@example.com"})
 
 	def test_an_absent_child_keeps_the_remaining_gaps_lined_up(self):
-		# The paused rule drops out and takes its own leading gap with it, so the
-		# survivors still read the right conjunctions rather than sliding out of step.
+		# (always-ab and paused) or always-a. The paused rule leaves the and-run it
+		# sits in; the run is still there, and the or after it still joins what is
+		# left rather than sliding onto the survivors.
 		tree = {
 			"conjunctions": ["and", "or"],
 			"conditions": [
@@ -152,8 +153,8 @@ class TestEngineRuleCombination(FrappeTestCase):
 		self.assertEqual(engine.evaluate_rules(tree), {"a@example.com", "b@example.com"})
 
 	def test_a_mixed_fold_still_binds_and_tighter_after_a_child_drops_out(self):
-		# The paused rule sits between the two and-runs and takes conjunctions[1]
-		# with it, leaving and/or/and across the survivors. Precedence answers
+		# The paused rule is an or-run of its own between the two and-runs, so it
+		# empties out and the two runs on either side are unioned. Precedence answers
 		# {a, b}; folding left to right would intersect first and answer {a}.
 		tree = {
 			"conjunctions": ["and", "or", "or", "and"],
@@ -166,6 +167,28 @@ class TestEngineRuleCombination(FrappeTestCase):
 			],
 		}
 		self.assertEqual(engine.evaluate_rules(tree), {"a@example.com", "b@example.com"})
+
+	def test_a_skipped_rule_does_not_make_its_siblings_narrow_each_other(self):
+		# always-ab or (broken and always-a), with the provider unable to evaluate the
+		# middle rule on the lenient path. Skipping a rule may only ever leave the
+		# population as it was or larger — here the and-run it sat in shrinks to
+		# always-a, and the or still unions that with always-ab.
+		tree = {
+			"conjunctions": ["or", "and"],
+			"conditions": [_rule("always-ab"), _rule("no-such-rule-type"), _rule("always-a")],
+		}
+		with patch("raven_integration.engine.frappe.log_error"):
+			self.assertEqual(engine.evaluate_rules(tree, strict=False), {"a@example.com", "b@example.com"})
+
+	def test_a_skipped_first_rule_leaves_its_or_intact(self):
+		# (broken and always-a) or always-ab — the mirror image, where the dropped
+		# child starts the group instead of sitting between two survivors.
+		tree = {
+			"conjunctions": ["and", "or"],
+			"conditions": [_rule("no-such-rule-type"), _rule("always-a"), _rule("always-ab")],
+		}
+		with patch("raven_integration.engine.frappe.log_error"):
+			self.assertEqual(engine.evaluate_rules(tree, strict=False), {"a@example.com", "b@example.com"})
 
 	def test_an_empty_group_does_not_narrow_its_parent(self):
 		# A group with nothing in it is absent, not "matches nobody": intersecting
