@@ -851,7 +851,18 @@ def update_workspace(name: str, label: str, type: str) -> str:
 	name = _str(name, "name")
 	label = _str(label, "label")
 	type_ = _choice(type, "type", _VALID_WS_TYPES, _("Invalid workspace type"))
-	return _update_mapping("Raven Workspace Mapping", name, label, {"workspace_type": type_})
+	return _update_mapping(
+		"Raven Workspace Mapping",
+		name,
+		label,
+		{"workspace_type": type_},
+		# The settings page commits name and visibility through this one call, so it
+		# is a path a rename travels — and a Raven Workspace's docname *is* its
+		# display name, with nothing syncing it back. Without this the two names part
+		# company permanently, exactly as they did on the channel side.
+		rename_raven=_rename_raven_workspace,
+		savepoint="update_workspace",
+	)
 
 
 @frappe.whitelist()

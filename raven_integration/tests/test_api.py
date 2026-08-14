@@ -1373,6 +1373,55 @@ class TestLabelPropagatesToRaven(FrappeTestCase):
 		# The mapping's raven_channel Link stays valid.
 		self.assertEqual(
 			frappe.db.get_value("Raven Channel Mapping", self.ch_map, "raven_channel"), self.raven_ch
+	def test_update_workspace_rename_propagates_to_raven(self):
+		"""The settings page commits the workspace's name and visibility through
+		update_workspace, so a rename travelling that path must reach Raven exactly as
+		set_workspace_label does. A Raven Workspace's docname IS its display name and
+		nothing reverse-syncs, so a rename that stops at the mapping leaves the two
+		names apart for good."""
+		from raven_integration.api import update_workspace
+
+		new_label = f"RI Upd WS Renamed {self._suffix}"
+		self._raven_ws_names.add(new_label)
+		self.ws_map = update_workspace(name=self.ws_map, label=new_label, type="Public")
+
+		self.assertTrue(frappe.db.exists("Raven Workspace", new_label))
+		self.assertFalse(frappe.db.exists("Raven Workspace", self.raven_ws))
+		# The mapping's raven_workspace Link followed the rename (rename_doc cascade).
+		self.assertEqual(
+			frappe.db.get_value("Raven Workspace Mapping", self.ws_map, "raven_workspace"), new_label
+		)
+		self.raven_ws = new_label
+
+	def test_update_workspace_without_a_rename_leaves_the_raven_name_alone(self):
+		from raven_integration.api import update_workspace
+
+		stored = frappe.db.get_value("Raven Workspace Mapping", self.ws_map, "workspace_label")
+		self.ws_map = update_workspace(name=self.ws_map, label=stored, type="Private")
+		self.assertTrue(frappe.db.exists("Raven Workspace", self.raven_ws))
+
+	def test_update_workspace_failed_rename_rolls_the_raven_write_back(self):
+		"""The Raven rename lands before the mapping's, so a mapping-side failure has
+		to undo it: two mappings cannot share a docname."""
+		from raven_integration.api import update_workspace
+
+		taken = frappe.new_doc("Raven Workspace Mapping")
+		taken.workspace_label = f"RI WS Taken {self._suffix}"
+		taken.workspace_type = "Private"
+		taken.flags.skip_raven_create = True
+		taken.insert()
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Workspace Mapping", taken.name, force=True, ignore_missing=True)
+		)
+		self._raven_ws_names.add(f"RI WS Taken {self._suffix}")
+
+		with self.assertRaises(frappe.ValidationError):
+			update_workspace(name=self.ws_map, label=f"RI WS Taken {self._suffix}", type="Private")
+
+		# Nothing half-renamed: the Raven Workspace still stands under its own name.
+		self.assertTrue(frappe.db.exists("Raven Workspace", self.raven_ws))
+		self.assertEqual(
+			frappe.db.get_value("Raven Workspace Mapping", self.ws_map, "raven_workspace"), self.raven_ws
 		)
 
 	def test_update_channel_rename_propagates_to_raven(self):
