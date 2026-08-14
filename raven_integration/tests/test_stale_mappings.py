@@ -43,15 +43,19 @@ class _StaleFixtureMixin:
 		self.ch_map.workspace = self.ws_map.name
 		self.ch_map.channel_type = "Private"
 		if with_rule:
-			self.ch_map.append(
-				"member_rules",
+			self.ch_map.member_rules_json = frappe.as_json(
 				{
-					"label": "Always A",
-					"provider": "FAKE",
-					"rule_type": "always-a",
-					"config": "{}",
-					"status": "Active",
-				},
+					"conjunctions": [],
+					"conditions": [
+						{
+							"label": "Always A",
+							"provider": "FAKE",
+							"rule_type": "always-a",
+							"config": {},
+							"status": "Active",
+						}
+					],
+				}
 			)
 		self.ch_map.insert()
 
@@ -193,10 +197,10 @@ class TestRecreate(_StaleFixtureMixin, FrappeTestCase):
 		with patch("raven_integration.api.frappe.enqueue"):
 			recreate_channel(self.ch_map.name)
 
-		rules = frappe.get_doc("Raven Channel Mapping", self.ch_map.name).member_rules
-		self.assertEqual(len(rules), 1)
-		self.assertEqual(rules[0].rule_type, "always-a")
-		self.assertEqual(rules[0].status, "Active")
+		tree = frappe.parse_json(frappe.get_doc("Raven Channel Mapping", self.ch_map.name).member_rules_json)
+		self.assertEqual(len(tree["conditions"]), 1)
+		self.assertEqual(tree["conditions"][0]["rule_type"], "always-a")
+		self.assertEqual(tree["conditions"][0]["status"], "Active")
 
 	def test_recreate_channel_resumes_syncing(self):
 		from raven_integration.api import recreate_channel
@@ -264,9 +268,7 @@ class TestRecreate(_StaleFixtureMixin, FrappeTestCase):
 			new_workspace = recreate_workspace(self.ws_map.name)
 			new_channel = recreate_channel(self.ch_map.name)
 
-		self.assertEqual(
-			frappe.db.get_value("Raven Channel", new_channel, "workspace"), new_workspace
-		)
+		self.assertEqual(frappe.db.get_value("Raven Channel", new_channel, "workspace"), new_workspace)
 		self.assertEqual(self._stale("Raven Channel Mapping", self.ch_map.name), 0)
 
 	def test_recreate_channel_rejects_a_healthy_mapping(self):

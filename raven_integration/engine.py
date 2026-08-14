@@ -10,8 +10,14 @@ from raven_integration.registry import evaluate as registry_evaluate
 from raven_integration.registry import validate_rule_config
 from raven_integration.utils import raven_installed
 
-RULE_COMBINATOR_OR = "Any (OR)"
-RULE_COMBINATOR_AND = "All (AND)"
+CONJUNCTION_AND = "and"
+CONJUNCTION_OR = "or"
+
+# How deep a stored tree may nest, and how many nodes it may hold. Mirrors the
+# frontend component's default maxDepth. Enforced on the write path; the read path
+# evaluates whatever is stored, so a tree that predates a lowered cap still works.
+MAX_TREE_DEPTH = 4
+MAX_TREE_NODES = 200
 
 
 def _normalize_rule(rule) -> dict:
@@ -48,40 +54,133 @@ def _rule_identity(rule: dict) -> tuple:
 	)
 
 
-def validate_unique_member_rules(rules: list) -> None:
-	"""Throw if any two member rules are identical (same provider/rule_type/config)."""
+def is_group(node) -> bool:
+	"""True if ``node`` is a group rather than a leaf.
+
+	Structural, with no discriminator field to keep in sync: a group is anything
+	carrying both a conjunction list and a condition list. Same test the frontend
+	component applies, so a tree means the same thing on both sides.
+	"""
+	return isinstance(node, dict) and "conditions" in node and "conjunctions" in node
+
+
+def parse_tree(value) -> "dict | None":
+	"""Read a stored ``member_rules_json`` into a root group, or None if there is none.
+
+	Accepts the parsed dict as readily as the string the DB holds. Anything that is
+	not a group — null, an empty string, a legacy list, a corrupted payload — reads
+	as "no rules", which is what an empty mapping has always meant. Callers are
+	read paths that must not raise on stored data; the write path validates instead.
+	"""
+	if isinstance(value, str):
+		try:
+			value = json.loads(value) if value.strip() else None
+		except (ValueError, TypeError):
+			return None
+	return value if is_group(value) else None
+
+
+def iter_leaves(tree, _path: "list[int] | None" = None):
+	"""Yield ``(path, leaf)`` for every leaf of ``tree``, depth first.
+
+	The path is the child indices from the root, which is how a leaf is addressed
+	now that rules have no docnames.
+	"""
+	if not is_group(tree):
+		return
+	path = _path or []
+	for index, node in enumerate(tree.get("conditions") or []):
+		if is_group(node):
+			yield from iter_leaves(node, [*path, index])
+		elif isinstance(node, dict):
+			yield [*path, index], node
+
+
+def validate_unique_member_rules(tree) -> None:
+	"""Throw if any two *sibling* rules are identical (same provider/rule_type/config).
+
+	Siblings, not the whole mapping: two identical rules in one group say nothing
+	the group does not already say, but the same rule inside two different groups is
+	meaningful — ``A and (A or B)`` is a narrowing, not a mistake — and the flat
+	model had no way to express it, so the old check could afford to be global.
+	"""
+	if not is_group(tree):
+		return
 	seen: set[tuple] = set()
-	for r in rules:
-		identity = _rule_identity(_normalize_rule(r))
+	for node in tree.get("conditions") or []:
+		if is_group(node):
+			validate_unique_member_rules(node)
+			continue
+		identity = _rule_identity(_normalize_rule(node))
 		if identity in seen:
 			frappe.throw(
 				_(
-					"Duplicate membership rule: a rule with the same type and settings already exists on this record."
+					"Duplicate membership rule: a rule with the same type and settings already exists in this group."
 				),
 				title=_("Duplicate Rule"),
 			)
 		seen.add(identity)
 
 
-def validate_member_rules(rules: list) -> None:
-	"""Validate each rule's config against its provider, then reject duplicates."""
-	for rule in rules:
-		validate_rule_config(rule.provider, rule.rule_type, rule.config)
-	validate_unique_member_rules(rules)
+def validate_member_rules(tree) -> None:
+	"""Validate every leaf's config, reject sibling duplicates, hold the pause rule."""
+	for path, leaf in iter_leaves(tree):
+		# The registry returns early on an empty provider or rule type, because a
+		# child row's own reqd fields used to catch that. A leaf of a JSON tree has no
+		# such check behind it, so an unfinished condition would save silently and
+		# then match nobody for reasons nothing on the page explains.
+		if not leaf.get("provider") or not leaf.get("rule_type"):
+			frappe.throw(
+				title=_("Unfinished condition"),
+				msg=_("A condition has no type chosen yet. Finish it or remove it, then save again."),
+			)
+		validate_rule_config(leaf.get("provider"), leaf.get("rule_type"), leaf.get("config"))
+		if _is_paused(leaf) and not pausable(tree, path):
+			frappe.throw(
+				title=_("A paused condition sits under “and”"),
+				msg=_(
+					"Pausing freezes who a condition already added instead of dropping it, which "
+					"only holds while the condition <i>adds</i> people. Under <b>and</b> it narrows "
+					"its group instead, so pausing it would add people. Resume it, remove it, or "
+					"join its group with <b>or</b>."
+				),
+			)
+	validate_unique_member_rules(tree)
 
 
-def has_active_rules(rules: list) -> bool:
-	"""True if any rule row is not Paused.
+def pausable(tree, path: list) -> bool:
+	"""True if the leaf at ``path`` may be paused.
+
+	Pausing freezes a rule's contribution instead of dropping it, which only reads
+	as "adds nobody new" while the rule *adds* people. Under ``and`` a rule narrows,
+	so dropping it would grow the population — hence pausing is offered only where
+	every group between the leaf and the root joins its children with ``or``.
+	"""
+	node = tree
+	for index in path:
+		if not is_group(node):
+			return False
+		if CONJUNCTION_AND in (node.get("conjunctions") or []):
+			return False
+		conditions = node.get("conditions") or []
+		if index >= len(conditions):
+			return False
+		node = conditions[index]
+	return not is_group(node)
+
+
+def has_active_rules(tree) -> bool:
+	"""True if any leaf of the tree is not Paused.
 
 	Distinguishes "no opinion" (no active rules) from "matches nobody" (active
 	rules that evaluate to an empty population). Only the second is authoritative:
 	treating the first as authoritative would make deleting or pausing the last
 	rule evict every rule-managed member of the mapping.
 	"""
-	return any(not _is_paused(_normalize_rule(r)) for r in rules)
+	return any(not _is_paused(leaf) for _path, leaf in iter_leaves(parse_tree(tree)))
 
 
-def disabled_rule_members(rules: list, *, strict: bool = True) -> set[str]:
+def disabled_rule_members(tree, *, strict: bool = True) -> set[str]:
 	"""Population of the Paused rules (the UI calls them Disabled).
 
 	Disabling a rule stops it granting membership to anyone new, but must not evict
@@ -90,26 +189,26 @@ def disabled_rule_members(rules: list, *, strict: bool = True) -> set[str]:
 	"adds nobody new": a person who only newly matches a disabled rule isn't in
 	``current``, so they are never added.
 
-	Always a union, even under All (AND): a disabled rule is a frozen contribution,
-	not a filter. Disable is only offered on Any (OR) mappings for that reason —
-	under AND a rule narrows the population, so dropping it would *add* people.
+	Always a union, whatever conjunction joins them: a disabled rule is a frozen
+	contribution, not a filter. Pausing is only offered where every group above the
+	leaf joins with ``or`` for that reason — under ``and`` a rule narrows the
+	population, so dropping it would *add* people. See ``pausable``.
 	"""
 	out: set[str] = set()
-	for r in rules:
-		rd = _normalize_rule(r)
-		if not _is_paused(rd):
+	for path, leaf in iter_leaves(parse_tree(tree)):
+		if not _is_paused(leaf):
 			continue
 		try:
-			out |= _evaluate_one(rd)
+			out |= _evaluate_one(leaf)
 		except (ProviderDataError, frappe.ValidationError):
 			if strict:
 				raise
 			frappe.log_error(
 				title="Raven Integration: skipped disabled rule the provider could not evaluate",
 				message=(
-					f"Disabled rule {rd.get('name')!r} on {rd.get('parenttype')} "
-					f"{rd.get('parent')!r} could not be evaluated; its members are "
-					f"not frozen and may be removed by the next sync."
+					f"Disabled rule at path {path} (provider={leaf.get('provider')!r}, "
+					f"rule_type={leaf.get('rule_type')!r}) could not be evaluated; its "
+					f"members are not frozen and may be removed by the next sync."
 				),
 			)
 	return out
@@ -120,43 +219,87 @@ def _evaluate_one(rule: dict) -> set[str]:
 	return registry_evaluate(rule.get("provider"), rule.get("rule_type"), _parse_config(rule))
 
 
-def evaluate_rules(rules: list, *, strict: bool = True, combinator: str = RULE_COMBINATOR_OR) -> set[str]:
-	"""Combine per-rule populations across every active rule.
+def _evaluate_node(node, path: list, *, strict: bool) -> "set[str] | None":
+	"""One node's population, or None when the node contributes nothing at all.
 
-	When strict is False, a rule the provider cannot evaluate is logged and
-	skipped instead of raising (read/display path); the sync path keeps the
-	default strict=True so unexpected data fails loud.
+	Absent is not the same as empty. A paused leaf, a leaf the provider could not
+	evaluate on the lenient path, and a group with no surviving children are all
+	*absent*: they drop out of their parent's fold entirely, so an ``and`` beside
+	them does not intersect the population down to nobody. A rule that evaluates
+	honestly to no users is empty, and does narrow an ``and``.
 	"""
-	sets: list[set[str]] = []
-	for r in rules:
-		rd = _normalize_rule(r)
-		if _is_paused(rd):
+	if is_group(node):
+		return _evaluate_group(node, path, strict=strict)
+	if not isinstance(node, dict) or _is_paused(node):
+		return None
+	try:
+		return _evaluate_one(node)
+	except (ProviderDataError, frappe.ValidationError):
+		if strict:
+			raise
+		frappe.log_error(
+			title="Raven Integration: skipped rule the provider could not evaluate",
+			message=(
+				f"Rule at path {path} (provider={node.get('provider')!r}, "
+				f"rule_type={node.get('rule_type')!r}) could not be evaluated; "
+				f"skipped in read-path evaluation."
+			),
+		)
+		return None
+
+
+def _evaluate_group(group: dict, path: list, *, strict: bool) -> "set[str] | None":
+	"""Fold a group's children by its conjunctions, or None if none survive.
+
+	``conjunctions[i]`` joins child ``i`` to child ``i + 1``, so a child that turns
+	out absent takes its own leading gap with it and the rest still line up.
+
+	The fold applies classic precedence — ``and`` binds tighter than ``or`` — so a
+	level mixing the two means what it reads like: ``A and B or C and D`` is
+	``(A and B) or (C and D)``, not a left-to-right fold. Frappe Learning's editor
+	writes one conjunction per group, so a mixed level only ever arrives through
+	this API.
+	"""
+	conditions = group.get("conditions") or []
+	conjunctions = group.get("conjunctions") or []
+	surviving: list[tuple[str, set[str]]] = []
+	for index, child in enumerate(conditions):
+		value = _evaluate_node(child, [*path, index], strict=strict)
+		if value is None:
 			continue
-		try:
-			sets.append(_evaluate_one(rd))
-		except (ProviderDataError, frappe.ValidationError):
-			if strict:
-				raise
-			frappe.log_error(
-				title="Raven Integration: skipped rule the provider could not evaluate",
-				message=(
-					f"Rule {rd.get('name')!r} on {rd.get('parenttype')} "
-					f"{rd.get('parent')!r} (provider={rd.get('provider')!r}, "
-					f"rule_type={rd.get('rule_type')!r}) could not be evaluated; "
-					f"skipped in read-path evaluation."
-				),
-			)
-	if not sets:
-		return set()
-	if combinator == RULE_COMBINATOR_AND:
-		return set.intersection(*sets)
-	return set.union(*sets)
+		# The gap before this child; the first survivor starts the fold and has none.
+		joiner = conjunctions[index - 1] if 0 < index <= len(conjunctions) else CONJUNCTION_OR
+		surviving.append((joiner, value))
+	if not surviving:
+		return None
+
+	or_terms: list[set[str]] = []
+	run: set[str] = surviving[0][1]
+	for joiner, value in surviving[1:]:
+		if joiner == CONJUNCTION_AND:
+			run = run & value
+		else:
+			or_terms.append(run)
+			run = value
+	or_terms.append(run)
+	return set().union(*or_terms)
+
+
+def evaluate_rules(tree, *, strict: bool = True) -> set[str]:
+	"""Population of a whole condition tree.
+
+	When strict is False, a rule the provider cannot evaluate is logged and skipped
+	instead of raising (read/display path); the sync path keeps the default
+	strict=True so unexpected data fails loud.
+	"""
+	result = _evaluate_node(parse_tree(tree), [], strict=strict)
+	return result if result is not None else set()
 
 
 def expected_channel_members(
 	channel_name: str, *, strict: bool = True, cache: dict | None = None
 ) -> set[str]:
-	"""Channel members = its own rules, combined by its combinator.
+	"""Channel members = the population of its own condition tree.
 
 	Nothing narrows this. A channel does not sit inside a population the workspace
 	defines — it *is* where membership is defined, and the workspace's own membership
@@ -165,11 +308,7 @@ def expected_channel_members(
 	are evaluated once per sweep already.
 	"""
 	channel = frappe.get_doc("Raven Channel Mapping", channel_name)
-	return evaluate_rules(
-		channel.member_rules,
-		strict=strict,
-		combinator=channel.rule_combinator or RULE_COMBINATOR_OR,
-	)
+	return evaluate_rules(channel.member_rules_json, strict=strict)
 
 
 def expected_workspace_members(workspace_name: str, *, cache: dict | None = None) -> set[str]:

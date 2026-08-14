@@ -217,16 +217,47 @@ installed, nobody calls it. Only top-level imports need the guard.
 You write the provider; the admin writes the **rules** through the consuming app's UI. You should
 understand the semantics so your rule types compose sensibly.
 
-### Combinators — OR vs AND
+### Conditions — a tree of and / or
 
-Each mapping has a `rule_combinator`:
+A channel holds a **condition tree** in `member_rules_json`, not a flat list. A group joins its
+children with `and` or `or`; a child is either a rule or another group:
 
-- **`Any (OR)`** (default) → the member set is the **union** of every active rule's population.
-- **`All (AND)`** → the **intersection**. A user must match *every* active rule.
+```json
+{"conjunctions": ["and"],
+ "conditions": [
+   {"provider": "lms", "rule_type": "enrolled_in_course", "status": "Active", "config": {}},
+   {"conjunctions": ["or"], "conditions": [ ... ]}
+ ]}
+```
 
-So "Enrolled in course X" **OR** "Is staff" is two rules under OR; "Enrolled in course X" **AND**
-"Has paid" is two rules under AND. Design rule types as independent predicates and let the admin
-combine them — don't build one mega rule type with every filter baked in.
+- **`or`** → the **union** of its children's populations.
+- **`and`** → the **intersection**. A user must match every child.
+
+`conjunctions[i]` joins `conditions[i]` to `conditions[i + 1]`, so a group always holds exactly one
+fewer conjunction than it has conditions. Frappe Learning's settings UI writes one conjunction per
+group, so a group coming through that UI is wholly `and` or wholly `or` — but a mixed level can
+still arrive through this app's API (a provider composing the tree programmatically, say), and the
+fold handles it with classic precedence: `and` binds tighter than `or`, so it reads the way the
+expression looks, not left to right.
+
+```
+conjunctions: [and, or, and]
+conditions:   [A,   B,  C,  D]
+=> (A and B) or (C and D)
+
+conjunctions: [or, and]
+conditions:   [A,  B,   C]
+=> A or (B and C)        # not (A or B) and C
+```
+
+So "Enrolled in course X" **or** "Is staff" is two rules under `or`, and
+"Enrolled in course X **and** (Is staff **or** Is an evaluator)" is a nested group. Design rule
+types as independent predicates and let the admin compose them — don't build one mega rule type
+with every filter baked in.
+
+A **Paused** rule is absent from its group rather than evaluating to nobody, and the people it
+already added are frozen rather than evicted. That only reads as "adds nobody new" while the rule
+*adds* people, so pausing is offered only where every group above the rule joins with `or`.
 
 ### Channels narrow their workspace
 
@@ -376,7 +407,7 @@ Before you report the integration done, verify every box:
 | `frappe.get_all(dt)` with no filter when a scope is empty | Returns the whole site → mass-adds everyone. Return `set()`. |
 | Adding `raven_integration` to `required_apps` | Makes the integration mandatory; it must be optional. |
 | Un-guarded `from raven_integration...` import at module top | Breaks your app on sites without the integration. |
-| Baking OR/AND into one rule type | Let the admin combine independent rule types via the combinator. |
+| Baking OR/AND into one rule type | Let the admin compose independent rule types in the condition tree. |
 | Writing/enqueuing inside `evaluate` | It runs on every sweep and must stay a pure read. |
 | Raw SQL in the provider | Use `frappe.qb` / `frappe.get_all` — this project forbids raw SQL. |
 

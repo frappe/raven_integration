@@ -156,7 +156,7 @@ def _sync_rule_managed_members(
 	mapping = frappe.get_doc(mapping_doctype, mapping_name)
 	if mapping.stale:
 		return {"skipped": True, "reason": "raven_record_deleted"}
-	if rule_gated and not has_active_rules(mapping.member_rules):
+	if rule_gated and not has_active_rules(mapping.member_rules_json):
 		return {"skipped": True, "reason": "no_active_rules"}
 	expected = expected_members(mapping_name, cache=cache)
 	raven_record = frappe.db.get_value(mapping_doctype, mapping_name, link_field)
@@ -170,7 +170,7 @@ def _sync_rule_managed_members(
 		)
 	)
 	# Members a disabled rule put here stay put; it just stops granting membership.
-	frozen = current_rule_managed & disabled_rule_members(mapping.member_rules) if rule_gated else set()
+	frozen = current_rule_managed & disabled_rule_members(mapping.member_rules_json) if rule_gated else set()
 	to_add = expected - current_rule_managed
 	to_remove = current_rule_managed - expected - frozen
 	for u in to_add:

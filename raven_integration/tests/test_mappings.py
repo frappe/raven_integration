@@ -14,6 +14,7 @@ class TestRavenWorkspaceMapping(FrappeTestCase):
 		meta = frappe.get_meta("Raven Workspace Mapping")
 		f = {df.fieldname: df for df in meta.fields}
 		self.assertNotIn("member_rules", f)
+		self.assertNotIn("member_rules_json", f)
 		self.assertNotIn("rule_combinator", f)
 
 
@@ -22,8 +23,11 @@ class TestRavenChannelMapping(FrappeTestCase):
 		meta = frappe.get_meta("Raven Channel Mapping")
 		f = {df.fieldname: df for df in meta.fields}
 		self.assertEqual(f["workspace"].options, "Raven Workspace Mapping")
-		self.assertIn("member_rules", f)
-		self.assertEqual(f["member_rules"].options, "Raven Membership Rule")
+		# Conditions nest, so they are one JSON tree rather than a child table.
+		self.assertIn("member_rules_json", f)
+		self.assertEqual(f["member_rules_json"].fieldtype, "JSON")
+		self.assertNotIn("member_rules", f)
+		self.assertNotIn("rule_combinator", f)
 
 
 class TestWorkspaceDeleteCascade(FrappeTestCase):
@@ -121,22 +125,30 @@ class TestDuplicateRuleGuard(FrappeTestCase):
 	def test_identical_rules_rejected(self):
 		ch = self._channel("Dup Rule Channel")
 		# Same selection criteria twice (labels differ, but that is cosmetic).
-		ch.append("member_rules", self._rule("First"))
-		ch.append("member_rules", self._rule("Second"))
+		ch.member_rules_json = frappe.as_json(
+			{"conjunctions": ["or"], "conditions": [self._rule("First"), self._rule("Second")]}
+		)
 		with patch.object(registry, "_provider_paths", lambda: _FAKE):
 			with self.assertRaises(frappe.ValidationError):
 				ch.insert()
 
 	def test_distinct_rules_allowed(self):
 		ch = self._channel("Distinct Rule Channel")
-		ch.append("member_rules", self._rule("A", rule_type="always-a"))
-		ch.append("member_rules", self._rule("B", rule_type="always-ab"))
+		ch.member_rules_json = frappe.as_json(
+			{
+				"conjunctions": ["or"],
+				"conditions": [
+					self._rule("A", rule_type="always-a"),
+					self._rule("B", rule_type="always-ab"),
+				],
+			}
+		)
 		with patch.object(registry, "_provider_paths", lambda: _FAKE):
 			ch.insert()
 		self.addCleanup(
 			lambda: frappe.delete_doc("Raven Channel Mapping", ch.name, force=True, ignore_missing=True)
 		)
-		self.assertEqual(len(ch.member_rules), 2)
+		self.assertEqual(len(frappe.parse_json(ch.member_rules_json)["conditions"]), 2)
 
 
 class TestRavenDeleteNotBlocked(FrappeTestCase):

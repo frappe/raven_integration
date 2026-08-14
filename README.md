@@ -77,8 +77,8 @@ frappe.call("raven_integration.api.enable_integration")
 
 | Doctype | Kind | Purpose |
 |---|---|---|
-| **Raven Workspace Mapping** | Document | A managed Raven workspace. `workspace_label`, `workspace_type` (Public/Private), `rule_combinator`, `enabled`, `stale` (read-only), `member_rules` (child table), and a read-only `raven_workspace` link to the Raven workspace it created. Named `RWM-{workspace_label}`. |
-| **Raven Channel Mapping** | Document | A managed channel inside a mapped workspace. `channel_label`, `workspace` (link to the workspace mapping), `channel_type` (Public/Private/Open), `rule_combinator`, `enabled`, `stale` (read-only), `member_rules`, and a read-only `raven_channel` link. Named `RCM-{channel_label}`. |
+| **Raven Workspace Mapping** | Document | A managed Raven workspace. `workspace_label`, `workspace_type` (Public/Private), `enabled`, `stale` (read-only), and a read-only `raven_workspace` link to the Raven workspace it created. Named `RWM-{workspace_label}`. |
+| **Raven Channel Mapping** | Document | A managed channel inside a mapped workspace. `channel_label`, `workspace` (link to the workspace mapping), `channel_type` (Public/Private/Open), `enabled`, `stale` (read-only), `member_rules_json` (the condition tree), and a read-only `raven_channel` link. Named `RCM-{channel_label}`. |
 | **Raven Membership Rule** | Child table | One rule row: `label`, `provider`, `rule_type`, `status` (Active/Paused), and `config` (JSON, opaque to this app — only the provider interprets it). |
 | **Raven Membership Settings** | Single | One `enabled` switch that gates the whole integration. |
 
@@ -112,7 +112,7 @@ Two ways out, both offered as a "Take action" control in the consuming UI:
 
 | Action | Endpoint | Effect |
 |---|---|---|
-| **Recreate** | `recreate_workspace(name)` / `recreate_channel(name)` | Creates a fresh Raven workspace/channel from the mapping's stored label, repoints the `raven_workspace` / `raven_channel` link at it, and clears `stale`. The configured rules survive and resume syncing. Returns the new Raven record's name. |
+| **Recreate** | `recreate_workspace(name)` / `recreate_channel(name)` | Creates a fresh Raven workspace/channel from the mapping's stored label, repoints the `raven_workspace` / `raven_channel` link at it, and clears `stale`. The configured conditions survive and resume syncing. Returns the new Raven record's name. |
 | **Delete the mapping** | `delete_workspace(name)` / `delete_channel(name)` | Removes the mapping and its rules. There is no Raven-side record left to delete. |
 
 Recreating gives you a new, empty Raven workspace/channel — the messages and history that lived in
@@ -297,17 +297,18 @@ Manager role.
 | `is_setup` | Whether Raven and this app are installed, and whether sync is enabled. |
 | `enable_integration` | Turn sync on and queue the first full reconcile. |
 | `list_providers` | Registered providers and their rule types, for the rule-builder UI. |
-| `list_workspaces` / `get_workspace` | List and detail (incl. member count, `stale`, and rule rows). |
+| `list_workspaces` / `get_workspace` | List and detail (incl. member count and `stale`). A workspace holds no conditions. |
 | `create_workspace` / `update_workspace` / `delete_workspace` | CRUD. `delete_workspace` removes the mapping and its child channel mappings; the Raven workspace is never deleted. |
 | `recreate_workspace` | For a stale mapping: create a fresh Raven workspace from the stored label, repoint the link, clear `stale`. Returns the new Raven workspace name. |
-| `set_workspace_enabled` / `set_workspace_type` / `set_workspace_label` / `set_workspace_combinator` | Inline edits. Enabling re-syncs in the background. |
-| `list_channels` / `get_channel` | List and detail, incl. `stale`. |
-| `create_channel` / `update_channel` / `delete_channel` | CRUD. `delete_channel` removes the mapping only; the Raven channel is never deleted. |
+| `set_workspace_enabled` / `set_workspace_type` / `set_workspace_label` | Inline edits. Enabling re-syncs in the background. |
+| `list_channels` / `get_channel` | List and detail, incl. `stale`. `get_channel` serves the condition tree as `rules`, each leaf annotated with the `matches` label its provider declares. |
+| `create_channel` / `update_channel` / `delete_channel` | CRUD; `rules` is the condition tree. `delete_channel` removes the mapping only; the Raven channel is never deleted. |
 | `recreate_channel` | For a stale mapping: create a fresh Raven channel from the stored label, repoint the link, clear `stale`. Returns the new Raven channel name. |
-| `set_channel_enabled` / `set_channel_type` / `set_channel_label` / `set_channel_combinator` | Inline edits. |
+| `set_channel_enabled` / `set_channel_type` / `set_channel_label` | Inline edits. |
+| `set_channel_rule_status` | Pause/resume one condition, addressed by its `path` (child indices from the root). Refuses to pause a condition with an `and` anywhere above it. |
 | `reconcile_now` | Force one mapping to re-sync now. |
 | `preview_rule` | How many users a single (unsaved) rule matches, plus 5 sample names. |
-| `compute_rule_diff` | How many members a proposed rule set would add/remove, plus up to 10 sample names of those removed. |
+| `compute_rule_diff` | How many members a proposed condition tree would add/remove, plus up to 10 sample names of those removed. Omit `new_rules` to preview the tree as saved. |
 
 `create_workspace` and `create_channel` auto-name (`Workspace N` / `Channel N`) when no label is
 given, so a UI can add a row in one click.

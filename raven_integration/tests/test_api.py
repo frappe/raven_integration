@@ -165,7 +165,7 @@ class TestWorkspaceAPI(FrappeTestCase):
 		from raven_integration.api import create_workspace
 
 		with self.assertRaises(TypeError):
-			create_workspace(label="Bad", type="Private", rules=[])
+			create_workspace(label="Bad", type="Private", rules=None)
 		with self.assertRaises(TypeError):
 			create_workspace(label="Bad", type="Private", combinator="All (AND)")
 
@@ -179,6 +179,8 @@ class TestWorkspaceAPI(FrappeTestCase):
 		self.addCleanup(lambda: frappe.delete_doc("Raven Workspace Mapping", name, force=True))
 		detail = get_workspace(name)
 		self.assertNotIn("member_rules", detail)
+		self.assertNotIn("member_rules_json", detail)
+		self.assertNotIn("rules", detail)
 		self.assertNotIn("rule_combinator", detail)
 
 	def test_update_workspace_rejects_unknown_name(self):
@@ -290,7 +292,7 @@ class TestChannelAPI(FrappeTestCase):
 		from raven_integration.api import create_channel
 
 		with self.assertRaises((frappe.ValidationError, frappe.exceptions.FrappeTypeError)):
-			create_channel(workspace=self.workspace, label=42, type="Private", rules=[])
+			create_channel(workspace=self.workspace, label=42, type="Private", rules=None)
 
 	def test_create_channel_rejects_invalid_type(self):
 		from raven_integration.api import create_channel
@@ -300,7 +302,7 @@ class TestChannelAPI(FrappeTestCase):
 				workspace=self.workspace,
 				label="Test Ch",
 				type="weird",
-				rules=[],
+				rules=None,
 			)
 
 	def test_create_channel_rejects_unknown_workspace(self):
@@ -311,7 +313,7 @@ class TestChannelAPI(FrappeTestCase):
 				workspace="RWM-does-not-exist",
 				label="Test Ch",
 				type="Private",
-				rules=[],
+				rules=None,
 			)
 
 	def test_create_channel_persists_and_returns_name(self):
@@ -328,7 +330,7 @@ class TestChannelAPI(FrappeTestCase):
 				workspace=ws_name,
 				label="API Test Channel",
 				type="Private",
-				rules=[],
+				rules=None,
 			)
 		self.assertTrue(name.startswith("RCM-"))
 		self.addCleanup(lambda: frappe.delete_doc("Raven Channel Mapping", name, force=True))
@@ -517,17 +519,20 @@ class TestComputeRuleDiff(FrappeTestCase):
 			ch.channel_label = "Rule Diff Test CH"
 			ch.workspace = ws.name
 			ch.channel_type = "Private"
-			ch.rule_combinator = "Any (OR)"
 			ch.flags.skip_raven_create = True
-			ch.append(
-				"member_rules",
+			ch.member_rules_json = frappe.as_json(
 				{
-					"label": "Rule 1",
-					"provider": "FAKE",
-					"rule_type": "always-ab",
-					"status": "Active",
-					"config": "{}",
-				},
+					"conjunctions": [],
+					"conditions": [
+						{
+							"label": "Rule 1",
+							"provider": "FAKE",
+							"rule_type": "always-ab",
+							"status": "Active",
+							"config": {},
+						}
+					],
+				}
 			)
 			ch.insert()
 		self.workspace_name = ws.name
@@ -554,7 +559,7 @@ class TestComputeRuleDiff(FrappeTestCase):
 			result = compute_rule_diff(
 				target_doctype="Raven Channel Mapping",
 				name=self.channel_name,
-				new_rules=[],
+				new_rules={"conjunctions": [], "conditions": []},
 			)
 		self.assertEqual(result, {"added": 0, "removed": 0, "removed_users": []})
 
@@ -574,13 +579,18 @@ class TestComputeRuleDiff(FrappeTestCase):
 			result = compute_rule_diff(
 				target_doctype="Raven Channel Mapping",
 				name=self.channel_name,
-				new_rules=[{"provider": "FAKE", "rule_type": "always-b", "config": {}, "status": "Active"}],
+				new_rules={
+					"conjunctions": [],
+					"conditions": [
+						{"provider": "FAKE", "rule_type": "always-b", "config": {}, "status": "Active"}
+					],
+				},
 			)
 		self.assertEqual(result["removed"], 0)
 		self.assertEqual(result["removed_users"], [])
 
-	def test_defaults_to_saved_rules_so_a_combinator_switch_can_be_previewed(self):
-		"""Omitting new_rules previews a combinator change on its own."""
+	def test_defaults_to_the_saved_tree_when_none_is_proposed(self):
+		"""Omitting new_rules previews the channel exactly as it stands."""
 		from raven_integration.api import compute_rule_diff
 
 		with patch.object(
@@ -591,20 +601,36 @@ class TestComputeRuleDiff(FrappeTestCase):
 			result = compute_rule_diff(
 				target_doctype="Raven Channel Mapping",
 				name=self.channel_name,
-				combinator="All (AND)",
 			)
 		for key in ("added", "removed", "removed_users"):
 			self.assertIn(key, result)
 
-	def test_rejects_an_invalid_combinator(self):
+	def test_rejects_an_invalid_conjunction(self):
 		from raven_integration.api import compute_rule_diff
 
 		with self.assertRaises(frappe.ValidationError):
 			compute_rule_diff(
 				target_doctype="Raven Channel Mapping",
 				name=self.channel_name,
-				combinator="Sometimes (MAYBE)",
+				new_rules={"conjunctions": ["maybe"], "conditions": []},
 			)
+
+	def test_rejects_a_group_whose_joiners_do_not_match_its_conditions(self):
+		from raven_integration.api import compute_rule_diff
+
+		with self.assertRaises(frappe.ValidationError) as cm:
+			compute_rule_diff(
+				target_doctype="Raven Channel Mapping",
+				name=self.channel_name,
+				new_rules={
+					"conjunctions": [],
+					"conditions": [
+						{"provider": "FAKE", "rule_type": "always-a", "config": {}, "status": "Active"},
+						{"provider": "FAKE", "rule_type": "always-ab", "config": {}, "status": "Active"},
+					],
+				},
+			)
+		self.assertIn("joiners", str(cm.exception))
 
 	def test_removed_users_capped_at_ten(self):
 		from raven_integration.api import compute_rule_diff
@@ -617,7 +643,7 @@ class TestComputeRuleDiff(FrappeTestCase):
 			result = compute_rule_diff(
 				target_doctype="Raven Channel Mapping",
 				name=self.channel_name,
-				new_rules=[],
+				new_rules={"conjunctions": [], "conditions": []},
 			)
 		self.assertLessEqual(len(result["removed_users"]), 10)
 
@@ -628,7 +654,7 @@ class TestComputeRuleDiff(FrappeTestCase):
 			compute_rule_diff(
 				target_doctype="LMS Batch",
 				name=self.channel_name,
-				new_rules=[],
+				new_rules=None,
 			)
 
 	def test_requires_system_manager(self):
@@ -640,7 +666,7 @@ class TestComputeRuleDiff(FrappeTestCase):
 				compute_rule_diff(
 					target_doctype="Raven Channel Mapping",
 					name=self.channel_name,
-					new_rules=[],
+					new_rules=None,
 				)
 		finally:
 			frappe.set_user("Administrator")
@@ -781,16 +807,6 @@ class TestMappingTypeChange(FrappeTestCase):
 		self.assertEqual(
 			frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_type"),
 			"Open",
-		)
-
-	def test_set_channel_combinator_changes_field(self):
-		from raven_integration.api import set_channel_combinator
-
-		result = set_channel_combinator(name=self.channel, combinator="All (AND)")
-		self.assertEqual(result["combinator"], "All (AND)")
-		self.assertEqual(
-			frappe.db.get_value("Raven Channel Mapping", self.channel, "rule_combinator"),
-			"All (AND)",
 		)
 
 	def test_set_workspace_type_rejects_invalid_type(self):
@@ -1110,12 +1126,6 @@ class TestMissingMappingFailsLoudly(FrappeTestCase):
 		with self.assertRaises(frappe.DoesNotExistError):
 			set_channel_type(name="RCM-does-not-exist", type="Public")
 
-	def test_set_channel_combinator_rejects_unknown_name(self):
-		from raven_integration.api import set_channel_combinator
-
-		with self.assertRaises(frappe.DoesNotExistError):
-			set_channel_combinator(name="RCM-does-not-exist", combinator="All (AND)")
-
 
 class TestPreviewRuleValidatesConfig(FrappeTestCase):
 	"""preview_rule must validate the config before handing it to the provider."""
@@ -1268,9 +1278,7 @@ class TestLabelPropagatesToRaven(FrappeTestCase):
 		from raven_integration.api import update_channel
 
 		new_label = f"RI Upd Ch Renamed {self._suffix}"
-		self.ch_map = update_channel(
-			name=self.ch_map, label=new_label, type="Public", rules=[]
-		)
+		self.ch_map = update_channel(name=self.ch_map, label=new_label, type="Public", rules=None)
 
 		self.assertEqual(self.ch_map, f"RCM-{new_label}")
 		self.assertEqual(
@@ -1278,9 +1286,7 @@ class TestLabelPropagatesToRaven(FrappeTestCase):
 			new_label.strip().lower().replace(" ", "-"),
 		)
 		# Everything else the one call carries landed too, and the link is intact.
-		self.assertEqual(
-			frappe.db.get_value("Raven Channel Mapping", self.ch_map, "channel_type"), "Public"
-		)
+		self.assertEqual(frappe.db.get_value("Raven Channel Mapping", self.ch_map, "channel_type"), "Public")
 		self.assertEqual(
 			frappe.db.get_value("Raven Channel Mapping", self.ch_map, "raven_channel"), self.raven_ch
 		)
@@ -1292,10 +1298,8 @@ class TestLabelPropagatesToRaven(FrappeTestCase):
 
 		stored = frappe.db.get_value("Raven Channel Mapping", self.ch_map, "channel_label")
 		before = frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name")
-		self.ch_map = update_channel(name=self.ch_map, label=stored, type="Public", rules=[])
-		self.assertEqual(
-			frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name"), before
-		)
+		self.ch_map = update_channel(name=self.ch_map, label=stored, type="Public", rules=None)
+		self.assertEqual(frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name"), before)
 
 	def test_update_channel_failed_rename_rolls_the_raven_write_back(self):
 		"""The Raven write happens before the mapping rename, so a mapping-side
@@ -1318,15 +1322,11 @@ class TestLabelPropagatesToRaven(FrappeTestCase):
 		before_type = frappe.db.get_value("Raven Channel Mapping", self.ch_map, "channel_type")
 
 		with self.assertRaises(frappe.ValidationError):
-			update_channel(
-				name=self.ch_map, label=f"RI Taken {self._suffix}", type="Public", rules=[]
-			)
+			update_channel(name=self.ch_map, label=f"RI Taken {self._suffix}", type="Public", rules=None)
 
 		# Nothing half-applied: the Raven name, the mapping and its visibility all
 		# stand where they were.
-		self.assertEqual(
-			frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name"), before_name
-		)
+		self.assertEqual(frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name"), before_name)
 		self.assertTrue(frappe.db.exists("Raven Channel Mapping", self.ch_map))
 		self.assertEqual(
 			frappe.db.get_value("Raven Channel Mapping", self.ch_map, "channel_type"), before_type
@@ -1883,7 +1883,7 @@ class TestLinkExisting(FrappeTestCase):
 			frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name"),
 		)
 		self.assertEqual(row["channel_type"], "Public")
-		self.assertIsNone(row["rule_combinator"])
+		self.assertNotIn("rule_combinator", row)
 		self.assertEqual(row["enabled"], 1)
 		self.assertEqual(row["stale"], 0)
 

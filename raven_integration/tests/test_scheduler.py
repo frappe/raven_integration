@@ -106,12 +106,8 @@ class TestDanglingLinks(FrappeTestCase):
 				1,
 				"detect_dangling_links must flag at least one record",
 			)
-			stale, enabled = frappe.db.get_value(
-				"Raven Workspace Mapping", ws_map.name, ["stale", "enabled"]
-			)
-			self.assertEqual(
-				stale, 1, "mapping with a missing Raven Workspace must be marked stale=1"
-			)
+			stale, enabled = frappe.db.get_value("Raven Workspace Mapping", ws_map.name, ["stale", "enabled"])
+			self.assertEqual(stale, 1, "mapping with a missing Raven Workspace must be marked stale=1")
 			self.assertEqual(
 				enabled, 1, "the sweep must not disable the mapping — recreate only clears stale"
 			)

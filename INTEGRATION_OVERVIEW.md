@@ -48,7 +48,7 @@ This separation is the whole point: the integration is **generic**. Any Frappe a
 | **Channel Mapping** | "Keep *this* channel's members matching *these* rules." Rules live here and nowhere else. |
 | **Membership Rule** | One condition, e.g. "matches LMS rule: enrolled in Course X". Each rule names a *provider*, a *rule type*, and some *config* (the opaque settings the provider understands). |
 | **Provider** | The external app that answers "who matches this rule?". |
-| **Rule combinator** | How multiple rules on one record combine: **Any (OR)** = match any rule, **All (AND)** = must match every rule. |
+| **Condition tree** | How a channel's rules combine: a group joins its children with **or** (union) or **and** (intersection), and a child may be another group — so `A and (B or C)` is expressible. |
 | **`added_by_rule` flag** | A hidden marker on each membership row. The app **only ever removes members it added itself** — see Safety below. |
 | **Stale mapping** | A mapping whose Raven workspace/channel was deleted inside Raven. It keeps all its rules but stops syncing until an admin recreates the Raven record or deletes the mapping. |
 
@@ -56,8 +56,8 @@ This separation is the whole point: the integration is **generic**. Any Frappe a
 
 ## The data model (what gets stored)
 
-- **Raven Workspace Mapping** — `workspace_label`, `workspace_type` (Public/Private), link to the real `Raven Workspace`, an `enabled` switch and a read-only `stale` flag. No rules and no combinator.
-- **Raven Channel Mapping** — `channel_label`, `channel_type` (Public/Private/Open), link to its parent Workspace Mapping, link to the real `Raven Channel`, `enabled`, a read-only `stale` flag, `rule_combinator`, and a child table of **member rules**.
+- **Raven Workspace Mapping** — `workspace_label`, `workspace_type` (Public/Private), link to the real `Raven Workspace`, an `enabled` switch and a read-only `stale` flag. No conditions of its own.
+- **Raven Channel Mapping** — `channel_label`, `channel_type` (Public/Private/Open), link to its parent Workspace Mapping, link to the real `Raven Channel`, `enabled`, a read-only `stale` flag, and `member_rules_json` holding the **condition tree**.
 
 A cleared `enabled` and a set `stale` both stop a mapping syncing, but they are not the same thing. `enabled` is the admin's switch — clearing it pauses the mapping on purpose. `stale` is the app recording a fact: the Raven record this mapping managed has been deleted. Admins set `enabled`; only the app sets and clears `stale`.
 - **Raven Membership Rule** (child rows) — `label`, `provider`, `rule_type`, `status` (Active/Paused), `config` (JSON the provider interprets).
@@ -69,9 +69,28 @@ A cleared `enabled` and a set `stale` both stop a mapping syncing, but they are 
 
 For a **channel**, the app computes the expected member list:
 
-1. Take all its **Active** rules (Paused rules are ignored).
+1. Walk its condition tree, skipping **Paused** rules (they are absent, not "matches nobody").
 2. Ask each rule's provider "who matches?" → get a set of users per rule.
-3. Combine those sets using the combinator: **OR** = union, **AND** = intersection.
+3. Fold each group by its joiners: **or** = union, **and** = intersection. A group with nothing
+   left in it drops out of its parent rather than emptying it.
+
+Each joiner in `conjunctions` sits between the pair of conditions on either side of it, so a group
+always has one fewer joiner than it has conditions. A group is usually wholly `or` or wholly `and`
+— Frappe Learning's settings UI writes one operator per group — but the fold does not assume that:
+a level mixing both operators folds with classic precedence, `and` binding tighter than `or`, so it
+reads the way the expression looks rather than left to right:
+
+```
+conjunctions: [and, or, and]
+conditions:   [A,   B,  C,  D]
+=> (A and B) or (C and D)
+
+conjunctions: [or, and]
+conditions:   [A,  B,   C]
+=> A or (B and C)        # not (A or B) and C
+```
+
+A mixed level can only reach this engine through the API — the settings UI never produces one.
 
 For a **workspace**, membership is not computed from rules at all — it is **derived**:
 
@@ -125,7 +144,7 @@ Then the app compares expected vs. actual and applies the difference: add the mi
 - An admin can delete a workspace/channel inside Raven directly. The app **allows** that — it deliberately does not block Raven's own delete.
 - The mapping now points at a record that is gone. The nightly reconcile detects this and **marks the mapping `stale = 1`** and logs it. The mapping itself is *not* deleted and stays `enabled`.
 - A stale mapping stops syncing: `sync_workspace_members` / `sync_channel_members` return `{"skipped": True, "reason": "raven_record_deleted"}` and do nothing else. No crashes, no orphan syncs.
-- Everything the admin configured — the rules, the combinator, the label, the type — is still sitting there, intact.
+- Everything the admin configured — the conditions, the label, the type — is still sitting there, intact.
 
 ### 9. Recovering a stale mapping
 The UI surfaces a stale mapping with a **"Take action"** control offering exactly two choices:

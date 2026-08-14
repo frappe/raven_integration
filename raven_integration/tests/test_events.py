@@ -68,8 +68,12 @@ class TestResyncAll(FrappeTestCase):
 				"raven_integration.events.frappe.get_all",
 				side_effect=self._get_all([("c1", "w1"), ("c2", "w1")], ["w1"]),
 			),
-			patch("raven_integration.events.sync_channel_members", return_value={"added": 2, "removed": 1}) as mc,
-			patch("raven_integration.events.sync_workspace_members", return_value={"added": 3, "removed": 0}) as mw,
+			patch(
+				"raven_integration.events.sync_channel_members", return_value={"added": 2, "removed": 1}
+			) as mc,
+			patch(
+				"raven_integration.events.sync_workspace_members", return_value={"added": 3, "removed": 0}
+			) as mw,
 		):
 			summary = resync_all()
 
@@ -89,7 +93,9 @@ class TestResyncAll(FrappeTestCase):
 
 	def test_per_record_error_is_counted_and_does_not_abort(self):
 		with (
-			patch("raven_integration.events.frappe.get_all", side_effect=self._get_all([("c1", "w1")], ["w1"])),
+			patch(
+				"raven_integration.events.frappe.get_all", side_effect=self._get_all([("c1", "w1")], ["w1"])
+			),
 			patch("raven_integration.events.sync_channel_members", side_effect=RavenAPIError("boom")),
 			patch("raven_integration.events.sync_workspace_members", return_value={}),
 			patch("raven_integration.events.frappe.log_error") as log,

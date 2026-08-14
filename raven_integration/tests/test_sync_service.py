@@ -259,15 +259,19 @@ class TestSyncChannelMembers(_RavenFixtureMixin, FrappeTestCase):
 		# An active rule, so the mapping is genuinely rule-managed. Its population is
 		# irrelevant (these tests mock the engine) but its presence is what makes the
 		# sync authoritative — a rule-less mapping is correctly a no-op.
-		self.ch_map.append(
-			"member_rules",
+		self.ch_map.member_rules_json = frappe.as_json(
 			{
-				"label": "Always A",
-				"provider": "FAKE",
-				"rule_type": "always-a",
-				"config": "{}",
-				"status": "Active",
-			},
+				"conjunctions": [],
+				"conditions": [
+					{
+						"label": "Always A",
+						"provider": "FAKE",
+						"rule_type": "always-a",
+						"config": {},
+						"status": "Active",
+					}
+				],
+			}
 		)
 		self.ch_map.insert()
 		frappe.db.set_value(
@@ -384,7 +388,10 @@ class TestNoActiveRulesIsNotAuthoritative(unittest.TestCase):
 	_MEMBERS = ("a@example.com", "b@example.com", "c@example.com")
 
 	def _sync_channel(self, rules, expected=None):
-		channel = frappe._dict(member_rules=rules, stale=0, rule_combinator="Any (OR)")
+		channel = frappe._dict(
+			member_rules_json={"conjunctions": ["or"] * max(len(rules) - 1, 0), "conditions": list(rules)},
+			stale=0,
+		)
 		values = {"enabled": 1, "raven_channel": "RC-1"}
 		expectation = (
 			patch("raven_integration.engine.expected_channel_members", return_value=expected)
@@ -431,7 +438,7 @@ class TestDerivedWorkspaceSync(unittest.TestCase):
 	_MEMBERS = ("a@example.com", "b@example.com", "c@example.com")
 
 	def _sync_workspace(self, derived):
-		ws = frappe._dict(member_rules=[], stale=0)
+		ws = frappe._dict(member_rules_json=None, stale=0)
 		values = {"enabled": 1, "raven_workspace": "RW-1"}
 		with (
 			patch("raven_integration.sync_service.raven_installed", return_value=True),
