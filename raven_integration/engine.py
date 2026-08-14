@@ -8,6 +8,7 @@ from frappe import _
 from raven_integration.exceptions import ProviderDataError
 from raven_integration.registry import evaluate as registry_evaluate
 from raven_integration.registry import validate_rule_config
+from raven_integration.utils import raven_installed
 
 RULE_COMBINATOR_OR = "Any (OR)"
 RULE_COMBINATOR_AND = "All (AND)"
@@ -54,7 +55,9 @@ def validate_unique_member_rules(rules: list) -> None:
 		identity = _rule_identity(_normalize_rule(r))
 		if identity in seen:
 			frappe.throw(
-				_("Duplicate membership rule: a rule with the same type and settings already exists on this record."),
+				_(
+					"Duplicate membership rule: a rule with the same type and settings already exists on this record."
+				),
 				title=_("Duplicate Rule"),
 			)
 		seen.add(identity)
@@ -117,9 +120,7 @@ def _evaluate_one(rule: dict) -> set[str]:
 	return registry_evaluate(rule.get("provider"), rule.get("rule_type"), _parse_config(rule))
 
 
-def evaluate_rules(
-	rules: list, *, strict: bool = True, combinator: str = RULE_COMBINATOR_OR
-) -> set[str]:
+def evaluate_rules(rules: list, *, strict: bool = True, combinator: str = RULE_COMBINATOR_OR) -> set[str]:
 	"""Combine per-rule populations across every active rule.
 
 	When strict is False, a rule the provider cannot evaluate is logged and
@@ -155,36 +156,61 @@ def evaluate_rules(
 def expected_channel_members(
 	channel_name: str, *, strict: bool = True, cache: dict | None = None
 ) -> set[str]:
-	"""Channel members = (its rules combined by its combinator) ∩ workspace members.
+	"""Channel members = its own rules, combined by its combinator.
 
-	A workspace with no active rules expresses no opinion about who belongs, so it
-	imposes no constraint here — intersecting with its empty population would wipe
-	the channel instead.
+	Nothing narrows this. A channel does not sit inside a population the workspace
+	defines — it *is* where membership is defined, and the workspace's own membership
+	is derived back out of it (see expected_workspace_members). ``cache`` is accepted
+	for signature symmetry with the workspace side and is unused: a channel's rules
+	are evaluated once per sweep already.
 	"""
 	channel = frappe.get_doc("Raven Channel Mapping", channel_name)
-	own = evaluate_rules(
+	return evaluate_rules(
 		channel.member_rules,
 		strict=strict,
 		combinator=channel.rule_combinator or RULE_COMBINATOR_OR,
 	)
-	ws = frappe.get_doc("Raven Workspace Mapping", channel.workspace)
-	if not has_active_rules(ws.member_rules):
-		return own
-	return own & expected_workspace_members(channel.workspace, strict=strict, cache=cache)
 
 
-def expected_workspace_members(
-	workspace_name: str, *, strict: bool = True, cache: dict | None = None
-) -> set[str]:
-	"""Workspace members = its own rules combined by its combinator."""
-	if cache is not None and (workspace_name, strict) in cache:
-		return cache[(workspace_name, strict)]
-	ws = frappe.get_doc("Raven Workspace Mapping", workspace_name)
-	result = evaluate_rules(
-		ws.member_rules,
-		strict=strict,
-		combinator=ws.rule_combinator or RULE_COMBINATOR_OR,
-	)
+def expected_workspace_members(workspace_name: str, *, cache: dict | None = None) -> set[str]:
+	"""Workspace members = whoever is in at least one channel of the workspace.
+
+	Derived, never ruled: adding someone to a channel puts them in the workspace,
+	and losing their last channel takes them back out (only ever a row this app
+	added — the added_by_rule guard in sync_service is what enforces that).
+
+	Read from the channels' *actual* Raven membership rather than from their rules,
+	so a channel this app is not syncing — disabled, stale, or never mapped at all —
+	still holds its members in the workspace. resync_all sweeps channels before
+	workspaces for exactly this reason: by the time a workspace is diffed, its
+	channels already hold the membership their rules ask for.
+	"""
+	if cache is not None and workspace_name in cache:
+		return cache[workspace_name]
+	raven_workspace = frappe.db.get_value("Raven Workspace Mapping", workspace_name, "raven_workspace")
+	result = members_of_workspace_channels(raven_workspace) if raven_workspace else set()
 	if cache is not None:
-		cache[(workspace_name, strict)] = result
+		cache[workspace_name] = result
 	return result
+
+
+def members_of_workspace_channels(raven_workspace: str) -> set[str]:
+	"""Every user holding a membership row in any channel of a Raven workspace.
+
+	Direct-message and thread channels count too. Excluding them could only ever
+	*evict* someone Raven still shows a conversation to, and this app's one hard
+	rule is that it never removes what it did not add.
+	"""
+	if not raven_installed():
+		return set()
+	RC = frappe.qb.DocType("Raven Channel")
+	RCM = frappe.qb.DocType("Raven Channel Member")
+	return set(
+		frappe.qb.from_(RCM)
+		.join(RC)
+		.on(RC.name == RCM.channel_id)
+		.select(RCM.user_id)
+		.distinct()
+		.where(RC.workspace == raven_workspace)
+		.run(pluck=True)
+	)

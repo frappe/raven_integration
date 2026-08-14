@@ -21,9 +21,7 @@ _RAVEN_BACKED_MAPPINGS = {
 def is_active() -> bool:
 	"""True when membership sync should run: the integration must be enabled
 	(one-way `enabled` flag on Raven Membership Settings) AND Raven installed."""
-	return bool(
-		frappe.db.get_single_value("Raven Membership Settings", "enabled")
-	) and raven_installed()
+	return bool(frappe.db.get_single_value("Raven Membership Settings", "enabled")) and raven_installed()
 
 
 def _sweepable_channels(active_workspaces: list[str]) -> tuple[list[str], int]:
@@ -33,9 +31,7 @@ def _sweepable_channels(active_workspaces: list[str]) -> tuple[list[str], int]:
 	workspace mapping that is not enabled is never swept — so a channel under one
 	strands rule-managed workspace rows that nothing will ever reconcile.
 	"""
-	channels = frappe.get_all(
-		"Raven Channel Mapping", filters={"enabled": 1}, fields=["name", "workspace"]
-	)
+	channels = frappe.get_all("Raven Channel Mapping", filters={"enabled": 1}, fields=["name", "workspace"])
 	active = set(active_workspaces)
 	names = [c.name for c in channels if c.workspace in active]
 	return names, len(channels) - len(names)
@@ -44,10 +40,12 @@ def _sweepable_channels(active_workspaces: list[str]) -> tuple[list[str], int]:
 def resync_all() -> dict:
 	"""Diff-apply membership for every active channel and workspace mapping.
 
-	Channels are swept before workspaces so the pair is always torn down leaf-first:
-	add_channel_member joins the parent workspace before the channel, so removals
-	must run in the mirror order or a failed workspace pass would leave a channel
-	member who is not a member of the channel's own workspace.
+	Channels are swept first, and that order is load-bearing twice over. A workspace's
+	membership is *derived* from who is in its channels, so it can only be computed
+	once the channels are correct. And the pair is torn down leaf-first: adding a
+	channel member joins the parent workspace before the channel, so removals must
+	run in the mirror order or a failed workspace pass would leave a channel member
+	who is not a member of the channel's own workspace.
 	"""
 	workspaces = frappe.get_all("Raven Workspace Mapping", filters={"enabled": 1}, pluck="name")
 	channels, channels_skipped = _sweepable_channels(workspaces)
@@ -158,9 +156,7 @@ def mark_mappings_stale(doc, method=None) -> None:
 		mapping_doctype, link_field = _RAVEN_BACKED_MAPPINGS.get(doc.doctype, (None, None))
 		if not mapping_doctype:
 			return
-		for name in frappe.get_all(
-			mapping_doctype, filters={link_field: doc.name, "stale": 0}, pluck="name"
-		):
+		for name in frappe.get_all(mapping_doctype, filters={link_field: doc.name, "stale": 0}, pluck="name"):
 			frappe.db.set_value(mapping_doctype, name, "stale", 1, update_modified=False)
 	except Exception:
 		frappe.log_error(
@@ -214,9 +210,7 @@ def sync_workspace_rename_from_raven(doc, method=None, old_name=None, new_name=N
 	try:
 		from raven_integration.api import _set_mapping_label
 
-		mapping = frappe.db.get_value(
-			"Raven Workspace Mapping", {"raven_workspace": new_name}, "name"
-		)
+		mapping = frappe.db.get_value("Raven Workspace Mapping", {"raven_workspace": new_name}, "name")
 		if not mapping:
 			return
 		_set_mapping_label("Raven Workspace Mapping", mapping, new_name)

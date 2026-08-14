@@ -7,6 +7,7 @@ from frappe.tests.utils import FrappeTestCase
 from raven_integration import registry
 from raven_integration.exceptions import RavenAPIError
 from raven_integration.sync_service import (
+	_insert_unique_raven_doc,
 	add_channel_member,
 	add_workspace_member,
 	create_raven_workspace_for,
@@ -16,7 +17,6 @@ from raven_integration.sync_service import (
 	sync_channel_members,
 	sync_workspace_members,
 )
-from raven_integration.sync_service import _insert_unique_raven_doc
 
 
 class TestRavenUserAutoProvision(FrappeTestCase):
@@ -278,7 +278,9 @@ class TestSyncChannelMembers(_RavenFixtureMixin, FrappeTestCase):
 		if frappe.db.exists("Raven Channel Mapping", self.ch_map.name):
 			frappe.delete_doc("Raven Channel Mapping", self.ch_map.name, force=True, ignore_permissions=True)
 		if frappe.db.exists("Raven Workspace Mapping", self.ws_map.name):
-			frappe.delete_doc("Raven Workspace Mapping", self.ws_map.name, force=True, ignore_permissions=True)
+			frappe.delete_doc(
+				"Raven Workspace Mapping", self.ws_map.name, force=True, ignore_permissions=True
+			)
 		self._tearDown_raven_fixtures()
 
 	def _channel_member_exists(self, user: str, rule_flag: int | None = None) -> bool:
@@ -369,36 +371,48 @@ class TestErrorDistinction(unittest.TestCase):
 
 
 class TestNoActiveRulesIsNotAuthoritative(unittest.TestCase):
-	"""Regression: deleting or pausing the last rule must not evict every member.
+	"""Regression: deleting or pausing a channel's last rule must not evict everyone.
 
 	Before the fix, a rule-less mapping evaluated to an empty population and the
 	diff treated that as authoritative, so to_remove became every rule-managed
 	member. Reproduced against a real site as {'added': 0, 'removed': 5}.
+
+	The guard is channel-only now. A workspace carries no rules at all, so it has
+	nothing to be "no opinion" about — see TestDerivedWorkspaceSync.
 	"""
 
-	_MEMBERS = ["a@example.com", "b@example.com", "c@example.com"]
+	_MEMBERS = ("a@example.com", "b@example.com", "c@example.com")
 
-	def _sync_workspace(self, rules):
-		ws = frappe._dict(member_rules=rules)
-		values = {"enabled": 1, "raven_workspace": "RW-1"}
+	def _sync_channel(self, rules, expected=None):
+		channel = frappe._dict(member_rules=rules, stale=0, rule_combinator="Any (OR)")
+		values = {"enabled": 1, "raven_channel": "RC-1"}
+		expectation = (
+			patch("raven_integration.engine.expected_channel_members", return_value=expected)
+			if expected is not None
+			else patch("raven_integration.engine.frappe.get_doc", return_value=channel)
+		)
 		with (
 			patch("raven_integration.sync_service.raven_installed", return_value=True),
-			patch("raven_integration.sync_service.frappe.db.get_value", side_effect=lambda dt, n, f: values[f]),
-			patch("raven_integration.sync_service.frappe.get_doc", return_value=ws),
+			patch(
+				"raven_integration.sync_service.frappe.db.get_value", side_effect=lambda dt, n, f: values[f]
+			),
+			patch("raven_integration.sync_service.frappe.get_doc", return_value=channel),
 			patch("raven_integration.sync_service.frappe.get_all", return_value=list(self._MEMBERS)),
-			patch("raven_integration.sync_service.remove_workspace_member") as rm,
+			expectation,
+			patch("raven_integration.sync_service._fire_after_synced"),
+			patch("raven_integration.sync_service.remove_channel_member") as rm,
 		):
-			result = sync_workspace_members("WSM-1")
+			result = sync_channel_members("RCM-1")
 		return result, rm
 
 	def test_zero_rules_removes_nobody(self):
-		result, rm = self._sync_workspace([])
+		result, rm = self._sync_channel([])
 		rm.assert_not_called()
 		self.assertEqual(result, {"skipped": True, "reason": "no_active_rules"})
 
 	def test_all_rules_paused_removes_nobody(self):
 		paused = [{"provider": "FAKE", "rule_type": "always-a", "config": {}, "status": "Paused"}]
-		result, rm = self._sync_workspace(paused)
+		result, rm = self._sync_channel(paused)
 		rm.assert_not_called()
 		self.assertEqual(result, {"skipped": True, "reason": "no_active_rules"})
 
@@ -406,19 +420,50 @@ class TestNoActiveRulesIsNotAuthoritative(unittest.TestCase):
 		# The guard must not swallow a genuine empty population: an active rule that
 		# legitimately matches nobody is authoritative and evicts.
 		active = [{"provider": "FAKE", "rule_type": "always-none", "config": {}, "status": "Active"}]
-		ws = frappe._dict(member_rules=active)
+		result, rm = self._sync_channel(active, expected=set())
+		self.assertEqual(rm.call_count, len(self._MEMBERS))
+		self.assertEqual(result, {"added": 0, "removed": len(self._MEMBERS)})
+
+
+class TestDerivedWorkspaceSync(unittest.TestCase):
+	"""A workspace has no rules: its membership is whoever is in one of its channels."""
+
+	_MEMBERS = ("a@example.com", "b@example.com", "c@example.com")
+
+	def _sync_workspace(self, derived):
+		ws = frappe._dict(member_rules=[], stale=0)
 		values = {"enabled": 1, "raven_workspace": "RW-1"}
 		with (
 			patch("raven_integration.sync_service.raven_installed", return_value=True),
-			patch("raven_integration.sync_service.frappe.db.get_value", side_effect=lambda dt, n, f: values[f]),
+			patch(
+				"raven_integration.sync_service.frappe.db.get_value", side_effect=lambda dt, n, f: values[f]
+			),
 			patch("raven_integration.sync_service.frappe.get_doc", return_value=ws),
 			patch("raven_integration.sync_service.frappe.get_all", return_value=list(self._MEMBERS)),
-			patch("raven_integration.engine.expected_workspace_members", return_value=set()),
+			patch("raven_integration.engine.expected_workspace_members", return_value=set(derived)),
+			patch("raven_integration.sync_service.add_workspace_member") as add,
 			patch("raven_integration.sync_service.remove_workspace_member") as rm,
 		):
 			result = sync_workspace_members("WSM-1")
-		self.assertEqual(rm.call_count, len(self._MEMBERS))
-		self.assertEqual(result, {"added": 0, "removed": len(self._MEMBERS)})
+		return result, add, rm
+
+	def test_a_ruleless_workspace_is_not_skipped(self):
+		# The old "no opinion" guard would have skipped this outright, leaving the
+		# derived membership permanently unreconciled.
+		result, _add, rm = self._sync_workspace(self._MEMBERS)
+		self.assertEqual(result, {"added": 0, "removed": 0})
+		rm.assert_not_called()
+
+	def test_losing_the_last_channel_removes_from_the_workspace(self):
+		result, _add, rm = self._sync_workspace(["a@example.com", "b@example.com"])
+		self.assertEqual(result, {"added": 0, "removed": 1})
+		rm.assert_called_once_with("RW-1", "c@example.com")
+
+	def test_a_channel_member_with_no_workspace_row_is_added(self):
+		derived = [*self._MEMBERS, "d@example.com"]
+		result, add, _rm = self._sync_workspace(derived)
+		self.assertEqual(result, {"added": 1, "removed": 0})
+		add.assert_called_once_with("RW-1", "d@example.com")
 
 
 def _raven_supports_silent_add() -> bool:
@@ -515,7 +560,6 @@ class TestChannelNameCollision(_RavenFixtureMixin, FrappeTestCase):
 		self._tearDown_raven_fixtures()
 
 	def _make(self, label):
-		ch_map = frappe._dict(workspace=None, channel_label=label, channel_type="Private")
 		doc = _insert_unique_raven_doc(
 			{"doctype": "Raven Channel", "workspace": self.raven_workspace.name, "type": "Private"},
 			"channel_name",

@@ -2,7 +2,10 @@ from typing import Any
 
 import frappe
 from frappe import _
+from frappe.query_builder.functions import Count
 from frappe.utils import escape_html
+
+from raven_integration.utils import raven_installed
 
 _VALID_WS_TYPES = {"Public", "Private"}
 _VALID_CH_TYPES = {"Public", "Private", "Open"}
@@ -30,9 +33,9 @@ def _str(value: Any, field: str) -> str:
 	if not isinstance(value, str):
 		frappe.throw(
 			title=_("Invalid value for {0}").format(field),
-			msg=_(
-				"<b>{0}</b> must be text, but the request sent {1}. Reload the page and try again."
-			).format(field, type(value).__name__),
+			msg=_("<b>{0}</b> must be text, but the request sent {1}. Reload the page and try again.").format(
+				field, type(value).__name__
+			),
 		)
 	return value
 
@@ -42,8 +45,7 @@ def _bool(value: Any, field: str) -> bool:
 		frappe.throw(
 			title=_("Invalid value for {0}").format(field),
 			msg=_(
-				"<b>{0}</b> must be true or false, but the request sent {1}. "
-				"Reload the page and try again."
+				"<b>{0}</b> must be true or false, but the request sent {1}. Reload the page and try again."
 			).format(field, type(value).__name__),
 		)
 	return value
@@ -118,8 +120,7 @@ def _require_mapping(doctype: str, name: str) -> None:
 		frappe.throw(
 			title=_("{0} not found").format(_(doctype)),
 			msg=_(
-				"No {0} named <b>{1}</b> exists. It may have been deleted — "
-				"reload the page and try again."
+				"No {0} named <b>{1}</b> exists. It may have been deleted — reload the page and try again."
 			).format(_(doctype), escape_html(name)),
 			exc=frappe.DoesNotExistError,
 		)
@@ -147,9 +148,7 @@ def _require_rule_of(doctype: str, name: str, rule: str) -> None:
 	with different prefixes, so a shared docname cannot occur — but that is a
 	property of the naming rules, not of this check, and `Raven Membership Rule`
 	rows are only unique within their own table."""
-	row = frappe.db.get_value(
-		"Raven Membership Rule", rule, ["parent", "parenttype"], as_dict=True
-	)
+	row = frappe.db.get_value("Raven Membership Rule", rule, ["parent", "parenttype"], as_dict=True)
 	if not row or row.parent != name or row.parenttype != doctype:
 		frappe.throw(
 			title=_("Rule not found"),
@@ -229,8 +228,7 @@ def _set_mapping_label(doctype: str, name: str, label: str) -> str:
 			frappe.throw(
 				title=_("Name already in use"),
 				msg=_(
-					"Another {0} is already called <b>{1}</b>. "
-					"Pick a different name and try again."
+					"Another {0} is already called <b>{1}</b>. Pick a different name and try again."
 				).format(_(doctype), escape_html(label)),
 			)
 		# force=True: these doctypes do not set allow_rename, but renaming is the
@@ -260,8 +258,7 @@ def _rename_raven_workspace(mapping_name: str, label: str) -> None:
 		frappe.throw(
 			title=_("Name already in use"),
 			msg=_(
-				"A Raven workspace named <b>{0}</b> already exists. "
-				"Pick a different name and try again."
+				"A Raven workspace named <b>{0}</b> already exists. Pick a different name and try again."
 			).format(escape_html(label)),
 		)
 	# Suppress the reverse after_rename handler: this rename originates from the
@@ -296,9 +293,7 @@ def _rename_raven_channel(mapping_name: str, label: str) -> None:
 	valid. Raven slugifies channel_name and enforces per-workspace name uniqueness,
 	so a name Raven rejects surfaces as a friendly error. Skipped when the mapping
 	is stale or unlinked."""
-	row = frappe.db.get_value(
-		"Raven Channel Mapping", mapping_name, ["raven_channel", "stale"], as_dict=True
-	)
+	row = frappe.db.get_value("Raven Channel Mapping", mapping_name, ["raven_channel", "stale"], as_dict=True)
 	if not row or row.stale or not row.raven_channel:
 		return
 	ch = frappe.get_doc("Raven Channel", row.raven_channel)
@@ -339,14 +334,16 @@ def _create_mapping(
 	base: str,
 	label: "str | None",
 	fields: dict,
-	rule_rows: list[dict],
-	combinator: "str | None",
 	alloc_title: str,
 	alloc_msg: str,
+	rule_rows: "list[dict] | None" = None,
+	combinator: "str | None" = None,
 ) -> str:
 	"""Shared body of create_workspace / create_channel. ``fields`` carries the
 	doctype-specific columns (type, and a channel's parent workspace); with no label,
-	retries the next free default so a session losing the race still gets a row."""
+	retries the next free default so a session losing the race still gets a row.
+
+	``rule_rows``/``combinator`` are channel-only — a workspace holds no rules."""
 	explicit = bool(label and str(label).strip())
 	if explicit:
 		label = _str(label, "label")
@@ -357,9 +354,10 @@ def _create_mapping(
 		doc = frappe.new_doc(doctype)
 		doc.set(_MAPPING_LABEL_FIELDS[doctype], chosen)
 		doc.update(fields)
-		doc.rule_combinator = _combinator(combinator)
-		for r in rule_rows:
-			doc.append("member_rules", r)
+		if rule_rows is not None:
+			doc.rule_combinator = _combinator(combinator)
+			for r in rule_rows:
+				doc.append("member_rules", r)
 		try:
 			doc.insert()
 			return doc.name
@@ -371,18 +369,28 @@ def _create_mapping(
 
 
 def _update_mapping(
-	doctype: str, name: str, label: str, fields: dict, rule_rows: list[dict], combinator: str
+	doctype: str,
+	name: str,
+	label: str,
+	fields: dict,
+	rule_rows: "list[dict] | None" = None,
+	combinator: "str | None" = None,
 ) -> str:
 	"""Shared body of update_workspace / update_channel. Returns the (possibly new)
-	docname, which changes when the label changes."""
+	docname, which changes when the label changes.
+
+	``rule_rows`` is channel-only. A workspace update touches no rules, so it also
+	skips the resync: nothing it can change moves a member."""
 	doc = frappe.get_doc(doctype, name)
 	doc.update(fields)
-	doc.rule_combinator = combinator
-	doc.member_rules = []
-	for r in rule_rows:
-		doc.append("member_rules", r)
+	if rule_rows is not None:
+		doc.rule_combinator = combinator
+		doc.member_rules = []
+		for r in rule_rows:
+			doc.append("member_rules", r)
 	doc.save()
-	_schedule_resync()
+	if rule_rows is not None:
+		_schedule_resync()
 	return _set_mapping_label(doctype, name, label)
 
 
@@ -407,7 +415,7 @@ def _set_mapping_type(doctype: str, field: str, name: str, type_: str) -> dict:
 
 
 def _set_mapping_combinator(doctype: str, name: str, combinator: str) -> dict:
-	"""Shared body of set_workspace_combinator / set_channel_combinator."""
+	"""Body of set_channel_combinator. Rules live on channels, so nothing else calls it."""
 	_require_mapping(doctype, name)
 	# Through the doc, not db.set_value: this changes who belongs (union vs
 	# intersection), and set_value fires no hooks at all.
@@ -439,9 +447,7 @@ def _describe_rule(rule: dict) -> str:
 	from raven_integration.registry import list_rule_types
 
 	try:
-		decl = {rt["type"]: rt for rt in list_rule_types(rule.get("provider"))}.get(
-			rule.get("rule_type")
-		)
+		decl = {rt["type"]: rt for rt in list_rule_types(rule.get("provider"))}.get(rule.get("rule_type"))
 	except Exception:
 		decl = None
 	return (decl.get("label") if decl else None) or rule.get("rule_type") or ""
@@ -496,9 +502,7 @@ def enable_integration() -> dict:
 	"""Enable membership sync (one-way — there is no disable). Triggers an initial reconcile."""
 	_require_manager()
 	frappe.db.set_single_value("Raven Membership Settings", "enabled", 1)
-	frappe.enqueue(
-		"raven_integration.scheduler.reconcile_all", queue="long", enqueue_after_commit=True
-	)
+	frappe.enqueue("raven_integration.scheduler.reconcile_all", queue="long", enqueue_after_commit=True)
 	return {"enabled": True}
 
 
@@ -509,6 +513,21 @@ def list_providers() -> list:
 	from raven_integration.registry import list_providers as _list
 
 	return _list()
+
+
+def _channel_counts(workspaces: list[str]) -> dict[str, int]:
+	"""How many channel mappings sit under each workspace mapping, in one query."""
+	if not workspaces:
+		return {}
+	RCM = frappe.qb.DocType("Raven Channel Mapping")
+	rows = (
+		frappe.qb.from_(RCM)
+		.select(RCM.workspace, Count(RCM.name).as_("count"))
+		.where(RCM.workspace.isin(workspaces))
+		.groupby(RCM.workspace)
+		.run(as_dict=True)
+	)
+	return {row.workspace: row.count for row in rows}
 
 
 @frappe.whitelist()
@@ -522,25 +541,28 @@ def list_workspaces() -> list[dict]:
 			"name",
 			"workspace_label",
 			"workspace_type",
-			"rule_combinator",
 			"raven_workspace",
 			"enabled",
 			"stale",
 		],
 		order_by="modified desc",
 	)
+	counts = _channel_counts([row["name"] for row in managed])
 	for row in managed:
 		row["mapped"] = True
+		row["channel_count"] = counts.get(row["name"], 0)
 	unmanaged = [
 		{
 			"mapped": False,
 			"name": None,
 			"workspace_label": w["workspace_name"],
 			"workspace_type": w["type"],
-			"rule_combinator": None,
 			"raven_workspace": w["name"],
 			"enabled": 1,
 			"stale": 0,
+			# Nothing is managed under an unadopted workspace, so a count of 0 would
+			# read as "this workspace has no channels". It has none *here*.
+			"channel_count": None,
 		}
 		for w in list_unmapped_workspaces()
 	]
@@ -549,50 +571,95 @@ def list_workspaces() -> list[dict]:
 
 @frappe.whitelist()
 def get_workspace(name: str) -> dict:
-	"""Full workspace detail for the detail view + edit dialog."""
+	"""Full workspace detail for the detail page. Carries no rules: a workspace's
+	membership is derived from whoever is in at least one of its channels."""
 	_require_manager()
 	name = _str(name, "name")
 	from raven_integration.engine import expected_workspace_members
 
 	doc = frappe.get_doc("Raven Workspace Mapping", name)
-	channels = frappe.get_all(
-		"Raven Channel Mapping", filters={"workspace": name}, fields=["enabled"]
-	)
+	channels = frappe.get_all("Raven Channel Mapping", filters={"workspace": name}, fields=["enabled"])
 	return {
 		"name": doc.name,
 		"workspace_label": doc.workspace_label,
 		"workspace_type": doc.workspace_type,
-		"rule_combinator": doc.rule_combinator,
 		"enabled": doc.enabled,
 		"stale": doc.stale,
 		"raven_workspace": doc.raven_workspace,
 		"creation": doc.creation,
-		"member_count": len(expected_workspace_members(name, strict=False)),
+		"member_count": len(expected_workspace_members(name)),
 		"channels_active": sum(1 for c in channels if c.enabled),
 		"channels_paused": sum(1 for c in channels if not c.enabled),
-		"member_rules": [_serialize_rule_for_ui(r) for r in doc.member_rules],
 	}
 
 
 @frappe.whitelist()
-def create_workspace(
-	label: "str | None" = None,
-	type: str = "Private",
-	rules: "list[dict] | None" = None,
-	combinator: "str | None" = None,
-) -> str:
+def list_workspace_members(name: str) -> list[dict]:
+	"""The workspace's derived membership, each entry naming the channels it came from.
+
+	Read-only by construction: nothing here is settable, because membership is not
+	stored on the workspace — it is a consequence of the channel memberships below
+	each row. A user in no channel does not appear, even if a stale Raven Workspace
+	Member row still exists for them.
+	"""
+	_require_manager()
+	name = _str(name, "name")
+	_require_mapping("Raven Workspace Mapping", name)
+	raven_workspace = frappe.db.get_value("Raven Workspace Mapping", name, "raven_workspace")
+	if not raven_workspace or not raven_installed():
+		return []
+
+	RC = frappe.qb.DocType("Raven Channel")
+	RCM = frappe.qb.DocType("Raven Channel Member")
+	rows = (
+		frappe.qb.from_(RCM)
+		.join(RC)
+		.on(RC.name == RCM.channel_id)
+		.select(RCM.user_id, RCM.added_by_rule, RC.channel_name)
+		.where(RC.workspace == raven_workspace)
+		.orderby(RCM.user_id)
+		.orderby(RC.channel_name)
+		.run(as_dict=True)
+	)
+
+	members: dict[str, dict] = {}
+	for row in rows:
+		member = members.setdefault(
+			row.user_id,
+			{
+				"user": row.user_id,
+				"full_name": row.user_id,
+				"user_image": None,
+				"channels": [],
+				"added_by_rule": False,
+			},
+		)
+		if row.channel_name not in member["channels"]:
+			member["channels"].append(row.channel_name)
+		if row.added_by_rule:
+			member["added_by_rule"] = True
+
+	names = frappe.get_all(
+		"User", filters={"name": ("in", list(members))}, fields=["name", "full_name", "user_image"]
+	)
+	for user in names:
+		if user.full_name:
+			members[user.name]["full_name"] = user.full_name
+		members[user.name]["user_image"] = user.user_image
+	return sorted(members.values(), key=lambda m: m["full_name"].lower())
+
+
+@frappe.whitelist()
+def create_workspace(label: "str | None" = None, type: str = "Private") -> str:
 	"""Create a Raven Workspace Mapping. With no label, auto-names 'Workspace N'
 	(next free number) so the UI can add a row in one click."""
 	_require_manager()
 	type_ = _choice(type, "type", _VALID_WS_TYPES, _("Invalid workspace type"))
-	rule_rows = _rules_list(rules) if rules else []
 	return _create_mapping(
 		"Raven Workspace Mapping",
 		"Workspace",
 		label,
 		{"workspace_type": type_},
-		rule_rows,
-		combinator,
 		_("Could not allocate a default workspace name"),
 		_(
 			"Another session claimed the auto-generated name on every attempt. "
@@ -602,24 +669,14 @@ def create_workspace(
 
 
 @frappe.whitelist()
-def update_workspace(
-	name: str,
-	label: str,
-	type: str,
-	rules: list[dict],
-	combinator: "str | None" = None,
-) -> str:
+def update_workspace(name: str, label: str, type: str) -> str:
 	"""Update a Raven Workspace Mapping. Returns the docname, which changes when
 	the label changes (the docname is derived from the label)."""
 	_require_manager()
 	name = _str(name, "name")
 	label = _str(label, "label")
 	type_ = _choice(type, "type", _VALID_WS_TYPES, _("Invalid workspace type"))
-	combinator_ = _combinator(combinator)
-	rule_rows = _rules_list(rules)
-	return _update_mapping(
-		"Raven Workspace Mapping", name, label, {"workspace_type": type_}, rule_rows, combinator_
-	)
+	return _update_mapping("Raven Workspace Mapping", name, label, {"workspace_type": type_})
 
 
 @frappe.whitelist()
@@ -686,22 +743,6 @@ def set_workspace_label(name: str, label: str) -> dict:
 
 
 @frappe.whitelist()
-def set_workspace_combinator(name: str, combinator: str) -> dict:
-	"""Change how a Raven Workspace Mapping combines its rules (Any (OR) / All (AND))."""
-	_require_manager()
-	name = _str(name, "name")
-	combinator_ = _combinator(combinator)
-	return _set_mapping_combinator("Raven Workspace Mapping", name, combinator_)
-
-
-@frappe.whitelist()
-def set_workspace_rule_status(name: str, rule: str, status: str) -> dict:
-	"""Pause/resume one member rule of a Raven Workspace Mapping."""
-	_require_manager()
-	return _set_rule_status("Raven Workspace Mapping", name, rule, status)
-
-
-@frappe.whitelist()
 def list_channels(workspace: str) -> list[dict]:
 	"""Every channel in ``workspace`` the UI can show: managed channel mappings first
 	(current order), then unmanaged Raven channels in the backing workspace."""
@@ -725,9 +766,7 @@ def list_channels(workspace: str) -> list[dict]:
 		row["mapped"] = True
 	# No backing Raven workspace to scan (unknown/unlinked/stale parent) → managed only.
 	unmapped_rows = (
-		list_unmapped_channels(workspace)
-		if frappe.db.exists("Raven Workspace Mapping", workspace)
-		else []
+		list_unmapped_channels(workspace) if frappe.db.exists("Raven Workspace Mapping", workspace) else []
 	)
 	unmanaged = [
 		{
@@ -795,13 +834,13 @@ def create_channel(
 		"Channel",
 		label,
 		{"workspace": workspace, "channel_type": type_},
-		rule_rows,
-		combinator,
 		_("Could not allocate a default channel name"),
 		_(
 			"Another session claimed the auto-generated name on every attempt. "
 			"Try again, or create the channel with a name of your own."
 		),
+		rule_rows=rule_rows,
+		combinator=combinator,
 	)
 
 
@@ -822,7 +861,12 @@ def update_channel(
 	combinator_ = _combinator(combinator)
 	rule_rows = _rules_list(rules)
 	return _update_mapping(
-		"Raven Channel Mapping", name, label, {"channel_type": type_}, rule_rows, combinator_
+		"Raven Channel Mapping",
+		name,
+		label,
+		{"channel_type": type_},
+		rule_rows=rule_rows,
+		combinator=combinator_,
 	)
 
 
@@ -930,13 +974,18 @@ def reconcile_now(target_doctype: str, name: str) -> dict:
 
 @frappe.whitelist()
 def preview_rule(rule: dict) -> dict:
+	"""How many users one rule matches, with a few sample names.
+
+	The count is now exactly what the rule contributes to its channel: channels no
+	longer intersect with a workspace population, so nothing narrows this afterwards.
+	Only the channel's combinator can, by intersecting it with a sibling rule.
+	"""
 	_require_manager()
 	if not isinstance(rule, dict):
 		frappe.throw(
 			title=_("Invalid rule"),
 			msg=_(
-				"<b>Rule</b> must be a single rule, but the request sent {0}. "
-				"Reload the page and try again."
+				"<b>Rule</b> must be a single rule, but the request sent {0}. Reload the page and try again."
 			).format(type(rule).__name__),
 		)
 	from raven_integration.registry import evaluate as _evaluate
@@ -960,18 +1009,18 @@ def compute_rule_diff(
 	new_rules: "list[dict] | None" = None,
 	combinator: "str | None" = None,
 ) -> dict:
-	"""Return { added, removed, removed_users } for a proposed change."""
+	"""Return { added, removed, removed_users } for a proposed change.
+
+	Channels only. A workspace has no rules to propose a change to — the way to move
+	its membership is to change a channel's, and this endpoint reports that already."""
 	_require_manager()
 	target_doctype = _choice(
-		target_doctype, "target_doctype", set(_MAPPING_LABEL_FIELDS), _("Unsupported sync target")
+		target_doctype, "target_doctype", {"Raven Channel Mapping"}, _("Unsupported sync target")
 	)
 	name = _str(name, "name")
 	_require_mapping(target_doctype, name)
 	if new_rules is None:
-		new_rules = [
-			_serialize_rule_for_ui(r)
-			for r in frappe.get_doc(target_doctype, name).member_rules
-		]
+		new_rules = [_serialize_rule_for_ui(r) for r in frappe.get_doc(target_doctype, name).member_rules]
 	# Previewing a diff saves nothing, so an unnamed rule is not an error here.
 	new_rules = _rules_list(new_rules, require_label=False)
 
@@ -990,24 +1039,18 @@ def compute_rule_diff(
 	if not has_active_rules(new_rules):
 		return {"added": 0, "removed": 0, "removed_users": []}
 
-	if target_doctype == "Raven Workspace Mapping":
-		raven_link = frappe.db.get_value(target_doctype, name, "raven_workspace")
-		current = set(
-			frappe.get_all(
-				"Raven Workspace Member",
-				filters={"workspace": raven_link, "added_by_rule": 1},
-				pluck="user",
-			)
-		) if raven_link else set()
-	else:
-		raven_link = frappe.db.get_value(target_doctype, name, "raven_channel")
-		current = set(
+	raven_link = frappe.db.get_value(target_doctype, name, "raven_channel")
+	current = (
+		set(
 			frappe.get_all(
 				"Raven Channel Member",
 				filters={"channel_id": raven_link, "added_by_rule": 1},
 				pluck="user_id",
 			)
-		) if raven_link else set()
+		)
+		if raven_link
+		else set()
+	)
 
 	combinator_ = (
 		_combinator(combinator)
@@ -1035,9 +1078,7 @@ def list_unmapped_workspaces() -> list[dict]:
 	_require_manager()
 	RW = frappe.qb.DocType("Raven Workspace")
 	RWM = frappe.qb.DocType("Raven Workspace Mapping")
-	mapped = (
-		frappe.qb.from_(RWM).select(RWM.raven_workspace).where(RWM.raven_workspace.isnotnull())
-	)
+	mapped = frappe.qb.from_(RWM).select(RWM.raven_workspace).where(RWM.raven_workspace.isnotnull())
 	return (
 		frappe.qb.from_(RW)
 		.select(RW.name, RW.workspace_name, RW.type)
@@ -1048,11 +1089,7 @@ def list_unmapped_workspaces() -> list[dict]:
 
 
 @frappe.whitelist()
-def link_workspace(
-	raven_workspace: str,
-	combinator: "str | None" = None,
-	rules: "list[dict] | None" = None,
-) -> str:
+def link_workspace(raven_workspace: str) -> str:
 	"""Adopt an existing Raven Workspace into a new Raven Workspace Mapping.
 
 	No new Raven Workspace is created: flags.skip_raven_create suppresses the
@@ -1062,12 +1099,8 @@ def link_workspace(
 	Returns the new mapping's docname."""
 	_require_manager()
 	raven_workspace = _str(raven_workspace, "raven_workspace")
-	combinator_ = _combinator(combinator)
-	rule_rows = _rules_list(rules) if rules else []
 
-	ws = frappe.db.get_value(
-		"Raven Workspace", raven_workspace, ["workspace_name", "type"], as_dict=True
-	)
+	ws = frappe.db.get_value("Raven Workspace", raven_workspace, ["workspace_name", "type"], as_dict=True)
 	if not ws:
 		frappe.throw(
 			title=_("Workspace not found"),
@@ -1081,11 +1114,8 @@ def link_workspace(
 	doc = frappe.new_doc("Raven Workspace Mapping")
 	doc.workspace_label = ws.workspace_name
 	doc.workspace_type = ws.type if ws.type in _VALID_WS_TYPES else "Private"
-	doc.rule_combinator = combinator_
 	doc.raven_workspace = raven_workspace
 	doc.flags.skip_raven_create = True
-	for r in rule_rows:
-		doc.append("member_rules", r)
 	try:
 		doc.insert()
 	except frappe.DuplicateEntryError:
@@ -1108,9 +1138,7 @@ def list_unmapped_channels(workspace: str) -> list[dict]:
 	_require_manager()
 	workspace = _str(workspace, "workspace")
 	_require_mapping("Raven Workspace Mapping", workspace)
-	raven_workspace = frappe.db.get_value(
-		"Raven Workspace Mapping", workspace, "raven_workspace"
-	)
+	raven_workspace = frappe.db.get_value("Raven Workspace Mapping", workspace, "raven_workspace")
 	if not raven_workspace:
 		return []
 	RC = frappe.qb.DocType("Raven Channel")
@@ -1151,15 +1179,12 @@ def link_channel(
 	rule_rows = _rules_list(rules) if rules else []
 
 	_require_mapping("Raven Workspace Mapping", workspace)
-	ch = frappe.db.get_value(
-		"Raven Channel", raven_channel, ["channel_name", "type"], as_dict=True
-	)
+	ch = frappe.db.get_value("Raven Channel", raven_channel, ["channel_name", "type"], as_dict=True)
 	if not ch:
 		frappe.throw(
 			title=_("Channel not found"),
 			msg=_(
-				"No Raven Channel named <b>{0}</b> exists. "
-				"Reload the page and pick a channel from the list."
+				"No Raven Channel named <b>{0}</b> exists. Reload the page and pick a channel from the list."
 			).format(escape_html(raven_channel)),
 			exc=frappe.DoesNotExistError,
 		)

@@ -21,8 +21,12 @@ def _rule(label, rule_type="always-ab", config=None, status="Active"):
 
 
 class TestSetRuleStatus(FrappeTestCase):
-	"""set_workspace_rule_status / set_channel_rule_status — the escape hatch that
-	re-enables a rule the ordinary save path can no longer reach."""
+	"""set_channel_rule_status — the escape hatch that re-enables a rule the
+	ordinary save path can no longer reach.
+
+	Two channels under one workspace: the second is what proves a rule of one
+	mapping is not reachable through another.
+	"""
 
 	def setUp(self):
 		self.non_admin = frappe.get_doc(
@@ -40,49 +44,38 @@ class TestSetRuleStatus(FrappeTestCase):
 			ws.workspace_label = f"Rule Status WS {frappe.generate_hash(length=6)}"
 			ws.workspace_type = "Private"
 			ws.flags.skip_raven_create = True
-			ws.append("member_rules", _rule("First Rule"))
-			ws.append("member_rules", _rule("Second Rule", config={"tag": "b"}))
 			ws.insert()
 		self.workspace = ws.name
-		self.workspace_label = ws.workspace_label
-		self.ws_rules = [r.name for r in ws.member_rules]
 		self.addCleanup(
 			lambda: frappe.delete_doc(
 				"Raven Workspace Mapping", self.workspace, force=True, ignore_missing=True
 			)
 		)
 
+		self.channel, self.ch_rules = self._make_channel(
+			"Rule Status CH", [_rule("First Rule"), _rule("Second Rule", config={"tag": "b"})]
+		)
+		self.other_channel, self.other_rules = self._make_channel(
+			"Rule Status Other CH", [_rule("Other Channel Rule")]
+		)
+
+	def _make_channel(self, label, rules):
 		with patch.object(registry, "_provider_paths", return_value=_FAKE):
 			ch = frappe.new_doc("Raven Channel Mapping")
-			ch.channel_label = f"Rule Status CH {frappe.generate_hash(length=6)}"
+			ch.channel_label = f"{label} {frappe.generate_hash(length=6)}"
 			ch.workspace = self.workspace
 			ch.channel_type = "Private"
 			ch.flags.skip_raven_create = True
-			ch.append("member_rules", _rule("Channel Rule"))
+			for rule in rules:
+				ch.append("member_rules", rule)
 			ch.insert()
-		self.channel = ch.name
-		self.ch_rules = [r.name for r in ch.member_rules]
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Channel Mapping", self.channel, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Channel Mapping", ch.name, force=True, ignore_missing=True)
 		)
+		return ch.name, [r.name for r in ch.member_rules]
 
 	def _status(self, rule):
 		return frappe.db.get_value("Raven Membership Rule", rule, "status")
-
-	def test_workspace_rule_toggles_active_to_paused_and_back(self):
-		from raven_integration.api import set_workspace_rule_status
-
-		with patch.object(registry, "_provider_paths", return_value=_FAKE):
-			result = set_workspace_rule_status(self.workspace, self.ws_rules[0], "Paused")
-		self.assertEqual(result, {"status": "Paused"})
-		self.assertEqual(self._status(self.ws_rules[0]), "Paused")
-
-		with patch.object(registry, "_provider_paths", return_value=_FAKE):
-			result = set_workspace_rule_status(self.workspace, self.ws_rules[0], "Active")
-		self.assertEqual(result, {"status": "Active"})
-		self.assertEqual(self._status(self.ws_rules[0]), "Active")
 
 	def test_channel_rule_toggles_active_to_paused_and_back(self):
 		from raven_integration.api import set_channel_rule_status
@@ -100,26 +93,6 @@ class TestSetRuleStatus(FrappeTestCase):
 	def test_re_enables_a_paused_unnamed_rule(self):
 		"""The whole point: a Paused + unnamed rule is frozen in the UI and rejected
 		by the save path, so this endpoint is its only route back to Active."""
-		from raven_integration.api import set_workspace_rule_status
-
-		frappe.db.set_value(
-			"Raven Membership Rule",
-			self.ws_rules[0],
-			{"label": "", "status": "Paused"},
-			update_modified=False,
-		)
-
-		with patch.object(registry, "_provider_paths", return_value=_FAKE):
-			result = set_workspace_rule_status(self.workspace, self.ws_rules[0], "Active")
-
-		self.assertEqual(result, {"status": "Active"})
-		self.assertEqual(self._status(self.ws_rules[0]), "Active")
-		# Still unnamed — this endpoint changes status and nothing else.
-		self.assertEqual(
-			frappe.db.get_value("Raven Membership Rule", self.ws_rules[0], "label"), ""
-		)
-
-	def test_channel_endpoint_re_enables_a_paused_unnamed_rule(self):
 		from raven_integration.api import set_channel_rule_status
 
 		frappe.db.set_value(
@@ -134,48 +107,42 @@ class TestSetRuleStatus(FrappeTestCase):
 
 		self.assertEqual(result, {"status": "Active"})
 		self.assertEqual(self._status(self.ch_rules[0]), "Active")
+		# Still unnamed — this endpoint changes status and nothing else.
+		self.assertEqual(frappe.db.get_value("Raven Membership Rule", self.ch_rules[0], "label"), "")
 
 	def test_rejects_a_rule_belonging_to_another_mapping(self):
-		"""The channel's rule row must not be reachable through its parent workspace."""
-		from raven_integration.api import set_workspace_rule_status
+		"""A sibling channel's rule row must not be reachable through this channel."""
+		from raven_integration.api import set_channel_rule_status
 
 		with patch.object(registry, "_provider_paths", return_value=_FAKE):
 			with self.assertRaises(frappe.DoesNotExistError) as cm:
-				set_workspace_rule_status(self.workspace, self.ch_rules[0], "Paused")
+				set_channel_rule_status(self.channel, self.other_rules[0], "Paused")
 		self.assertIn("No member rule", str(cm.exception))
-		self.assertEqual(self._status(self.ch_rules[0]), "Active")
+		self.assertEqual(self._status(self.other_rules[0]), "Active")
 
-	def test_rejects_a_channel_rule_of_a_different_channel(self):
+	def test_rejects_an_unknown_rule(self):
 		from raven_integration.api import set_channel_rule_status
 
 		with patch.object(registry, "_provider_paths", return_value=_FAKE):
 			with self.assertRaises(frappe.DoesNotExistError):
-				set_channel_rule_status(self.channel, self.ws_rules[0], "Paused")
-		self.assertEqual(self._status(self.ws_rules[0]), "Active")
-
-	def test_rejects_an_unknown_rule(self):
-		from raven_integration.api import set_workspace_rule_status
-
-		with patch.object(registry, "_provider_paths", return_value=_FAKE):
-			with self.assertRaises(frappe.DoesNotExistError):
-				set_workspace_rule_status(self.workspace, "no-such-rule-row", "Paused")
+				set_channel_rule_status(self.channel, "no-such-rule-row", "Paused")
 
 	def test_rejects_an_unknown_mapping(self):
-		from raven_integration.api import set_workspace_rule_status
+		from raven_integration.api import set_channel_rule_status
 
 		with patch.object(registry, "_provider_paths", return_value=_FAKE):
 			with self.assertRaises(frappe.DoesNotExistError):
-				set_workspace_rule_status("RWM-No Such Workspace", self.ws_rules[0], "Paused")
-		self.assertEqual(self._status(self.ws_rules[0]), "Active")
+				set_channel_rule_status("RCM-No Such Channel", self.ch_rules[0], "Paused")
+		self.assertEqual(self._status(self.ch_rules[0]), "Active")
 
 	def test_rejects_an_invalid_status(self):
-		from raven_integration.api import set_workspace_rule_status
+		from raven_integration.api import set_channel_rule_status
 
 		with patch.object(registry, "_provider_paths", return_value=_FAKE):
 			with self.assertRaises(frappe.ValidationError) as cm:
-				set_workspace_rule_status(self.workspace, self.ws_rules[0], "Disabled")
+				set_channel_rule_status(self.channel, self.ch_rules[0], "Disabled")
 		self.assertIn("Active, Paused", str(cm.exception))
-		self.assertEqual(self._status(self.ws_rules[0]), "Active")
+		self.assertEqual(self._status(self.ch_rules[0]), "Active")
 
 	def test_rejects_a_non_string_status(self):
 		"""Called through the shared body: the whitelist wrapper's own type coercion
@@ -185,46 +152,37 @@ class TestSetRuleStatus(FrappeTestCase):
 		with patch.object(registry, "_provider_paths", return_value=_FAKE):
 			with self.assertRaises(frappe.ValidationError) as cm:
 				_set_rule_status(
-					"Raven Workspace Mapping",
-					self.workspace,
-					self.ws_rules[0],
+					"Raven Channel Mapping",
+					self.channel,
+					self.ch_rules[0],
 					{"status": "Paused"},
 				)
 		self.assertIn("must be text", str(cm.exception))
-		self.assertEqual(self._status(self.ws_rules[0]), "Active")
+		self.assertEqual(self._status(self.ch_rules[0]), "Active")
 
 	def test_leaves_sibling_rules_and_the_mapping_untouched(self):
-		from raven_integration.api import set_workspace_rule_status
+		from raven_integration.api import set_channel_rule_status
 
-		before = frappe.db.get_value(
-			"Raven Workspace Mapping",
-			self.workspace,
-			["workspace_label", "workspace_type", "rule_combinator", "enabled", "stale"],
-			as_dict=True,
-		)
+		fields = ["channel_label", "channel_type", "rule_combinator", "enabled", "stale"]
+		before = frappe.db.get_value("Raven Channel Mapping", self.channel, fields, as_dict=True)
 		sibling_before = frappe.db.get_value(
 			"Raven Membership Rule",
-			self.ws_rules[1],
+			self.ch_rules[1],
 			["label", "status", "provider", "rule_type", "config", "modified"],
 			as_dict=True,
 		)
 
 		with patch.object(registry, "_provider_paths", return_value=_FAKE):
-			set_workspace_rule_status(self.workspace, self.ws_rules[0], "Paused")
+			set_channel_rule_status(self.channel, self.ch_rules[0], "Paused")
 
 		self.assertEqual(
-			frappe.db.get_value(
-				"Raven Workspace Mapping",
-				self.workspace,
-				["workspace_label", "workspace_type", "rule_combinator", "enabled", "stale"],
-				as_dict=True,
-			),
+			frappe.db.get_value("Raven Channel Mapping", self.channel, fields, as_dict=True),
 			before,
 		)
 		self.assertEqual(
 			frappe.db.get_value(
 				"Raven Membership Rule",
-				self.ws_rules[1],
+				self.ch_rules[1],
 				["label", "status", "provider", "rule_type", "config", "modified"],
 				as_dict=True,
 			),
@@ -232,12 +190,12 @@ class TestSetRuleStatus(FrappeTestCase):
 		)
 		# Both rows still there — nothing was replaced or deleted.
 		self.assertEqual(
-			[r.name for r in frappe.get_doc("Raven Workspace Mapping", self.workspace).member_rules],
-			self.ws_rules,
+			[r.name for r in frappe.get_doc("Raven Channel Mapping", self.channel).member_rules],
+			self.ch_rules,
 		)
 		# Only the target row's own fields other than status are preserved.
 		self.assertEqual(
-			frappe.db.get_value("Raven Membership Rule", self.ws_rules[0], "label"), "First Rule"
+			frappe.db.get_value("Raven Membership Rule", self.ch_rules[0], "label"), "First Rule"
 		)
 
 	def test_schedules_a_resync(self):
@@ -246,19 +204,8 @@ class TestSetRuleStatus(FrappeTestCase):
 
 		with patch.object(registry, "_provider_paths", return_value=_FAKE):
 			with patch.object(api, "_schedule_resync") as scheduled:
-				api.set_workspace_rule_status(self.workspace, self.ws_rules[0], "Paused")
+				api.set_channel_rule_status(self.channel, self.ch_rules[0], "Paused")
 		scheduled.assert_called_once()
-
-	def test_workspace_endpoint_requires_system_manager(self):
-		from raven_integration.api import set_workspace_rule_status
-
-		frappe.set_user(self.non_admin.name)
-		try:
-			with self.assertRaises(frappe.PermissionError):
-				set_workspace_rule_status(self.workspace, self.ws_rules[0], "Paused")
-		finally:
-			frappe.set_user("Administrator")
-		self.assertEqual(self._status(self.ws_rules[0]), "Active")
 
 	def test_channel_endpoint_requires_system_manager(self):
 		from raven_integration.api import set_channel_rule_status
@@ -270,3 +217,10 @@ class TestSetRuleStatus(FrappeTestCase):
 		finally:
 			frappe.set_user("Administrator")
 		self.assertEqual(self._status(self.ch_rules[0]), "Active")
+
+	def test_there_is_no_workspace_rule_status_endpoint(self):
+		# A workspace holds no rules, so the endpoint that paused one is gone.
+		from raven_integration import api
+
+		self.assertFalse(hasattr(api, "set_workspace_rule_status"))
+		self.assertFalse(hasattr(api, "set_workspace_combinator"))

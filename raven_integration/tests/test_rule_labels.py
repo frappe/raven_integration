@@ -21,7 +21,11 @@ def _rule(label, rule_type="always-ab", config=None):
 
 
 class TestRuleNameRequired(FrappeTestCase):
-	"""A member rule must carry a name; the backend no longer invents one."""
+	"""A member rule must carry a name; the backend no longer invents one.
+
+	Rules only exist on a channel mapping, so every case here goes through the
+	channel endpoints — there is no workspace write that carries a rule any more.
+	"""
 
 	def setUp(self):
 		with patch.object(registry, "_provider_paths", return_value=_FAKE):
@@ -29,7 +33,6 @@ class TestRuleNameRequired(FrappeTestCase):
 			ws.workspace_label = f"Rule Name WS {frappe.generate_hash(length=6)}"
 			ws.workspace_type = "Private"
 			ws.flags.skip_raven_create = True
-			ws.append("member_rules", _rule("Original Rule"))
 			ws.insert()
 		self.workspace = ws.name
 		self.workspace_label = ws.workspace_label
@@ -50,68 +53,11 @@ class TestRuleNameRequired(FrappeTestCase):
 		self.channel = ch.name
 		self.channel_label = ch.channel_label
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Channel Mapping", self.channel, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Channel Mapping", self.channel, force=True, ignore_missing=True)
 		)
-
-	def _workspace_rule_labels(self):
-		return [
-			r.label for r in frappe.get_doc("Raven Workspace Mapping", self.workspace).member_rules
-		]
 
 	def _channel_rule_labels(self):
-		return [
-			r.label for r in frappe.get_doc("Raven Channel Mapping", self.channel).member_rules
-		]
-
-	def test_update_workspace_rejects_unnamed_rule(self):
-		from raven_integration.api import update_workspace
-
-		with patch.object(registry, "_provider_paths", return_value=_FAKE):
-			with self.assertRaises(frappe.ValidationError) as cm:
-				update_workspace(
-					name=self.workspace,
-					label=self.workspace_label,
-					type="Public",
-					rules=[_rule("")],
-				)
-		self.assertIn("Row #1 of <b>Member Rules</b> has no name", str(cm.exception))
-
-	def test_update_workspace_rejects_whitespace_only_rule_name(self):
-		from raven_integration.api import update_workspace
-
-		with patch.object(registry, "_provider_paths", return_value=_FAKE):
-			with self.assertRaises(frappe.ValidationError):
-				update_workspace(
-					name=self.workspace,
-					label=self.workspace_label,
-					type="Public",
-					rules=[_rule("   ")],
-				)
-
-	def test_rejected_unnamed_rule_writes_nothing(self):
-		"""The throw lands before any field on the mapping is touched."""
-		from raven_integration.api import update_workspace
-
-		with patch.object(registry, "_provider_paths", return_value=_FAKE):
-			with self.assertRaises(frappe.ValidationError):
-				update_workspace(
-					name=self.workspace,
-					label="Renamed By A Failed Save",
-					type="Public",
-					rules=[_rule("Renamed Rule"), _rule("", config={"tag": "b"})],
-				)
-
-		self.assertEqual(
-			frappe.db.get_value("Raven Workspace Mapping", self.workspace, "workspace_type"),
-			"Private",
-		)
-		self.assertEqual(
-			frappe.db.get_value("Raven Workspace Mapping", self.workspace, "workspace_label"),
-			self.workspace_label,
-		)
-		self.assertEqual(self._workspace_rule_labels(), ["Original Rule"])
+		return [r.label for r in frappe.get_doc("Raven Channel Mapping", self.channel).member_rules]
 
 	def test_update_channel_rejects_unnamed_rule(self):
 		from raven_integration.api import update_channel
@@ -127,48 +73,107 @@ class TestRuleNameRequired(FrappeTestCase):
 		self.assertIn("Row #1 of <b>Member Rules</b> has no name", str(cm.exception))
 		self.assertEqual(self._channel_rule_labels(), ["Original Rule"])
 
+	def test_update_channel_rejects_whitespace_only_rule_name(self):
+		from raven_integration.api import update_channel
+
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			with self.assertRaises(frappe.ValidationError):
+				update_channel(
+					name=self.channel,
+					label=self.channel_label,
+					type="Public",
+					rules=[_rule("   ")],
+				)
+
+	def test_rejected_unnamed_rule_writes_nothing(self):
+		"""The throw lands before any field on the mapping is touched."""
+		from raven_integration.api import update_channel
+
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			with self.assertRaises(frappe.ValidationError):
+				update_channel(
+					name=self.channel,
+					label="Renamed By A Failed Save",
+					type="Public",
+					rules=[_rule("Renamed Rule"), _rule("", config={"tag": "b"})],
+				)
+
+		self.assertEqual(
+			frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_type"),
+			"Private",
+		)
+		self.assertEqual(
+			frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_label"),
+			self.channel_label,
+		)
+		self.assertEqual(self._channel_rule_labels(), ["Original Rule"])
+
 	def test_diff_preview_accepts_an_unnamed_rule(self):
 		"""A preview saves nothing and the name does not change who matches."""
 		from raven_integration.api import compute_rule_diff
 
 		with patch.object(registry, "_provider_paths", return_value=_FAKE):
 			result = compute_rule_diff(
-				target_doctype="Raven Workspace Mapping",
-				name=self.workspace,
+				target_doctype="Raven Channel Mapping",
+				name=self.channel,
 				new_rules=[_rule("")],
 			)
 		self.assertIn("added", result)
 		self.assertIn("removed", result)
 
-	def test_update_workspace_saves_a_named_rule(self):
-		from raven_integration.api import get_workspace, update_workspace
+	def test_diff_preview_rejects_a_workspace_target(self):
+		# A workspace holds no rules, so there is no rule change to preview on one.
+		from raven_integration.api import compute_rule_diff
+
+		with self.assertRaises(frappe.ValidationError):
+			compute_rule_diff(
+				target_doctype="Raven Workspace Mapping",
+				name=self.workspace,
+				new_rules=[_rule("Whatever")],
+			)
+
+	def test_update_channel_saves_a_named_rule(self):
+		from raven_integration.api import get_channel, update_channel
 
 		with patch.object(registry, "_provider_paths", return_value=_FAKE):
-			new_name = update_workspace(
-				name=self.workspace,
-				label=self.workspace_label,
+			new_name = update_channel(
+				name=self.channel,
+				label=self.channel_label,
 				type="Private",
 				rules=[_rule("  Trainers of Vue Basics  ")],
 			)
-		self.assertEqual(new_name, self.workspace)
+		self.assertEqual(new_name, self.channel)
 		# Stored, trimmed, and served back to the UI.
-		self.assertEqual(self._workspace_rule_labels(), ["Trainers of Vue Basics"])
+		self.assertEqual(self._channel_rule_labels(), ["Trainers of Vue Basics"])
 		with patch.object(registry, "_provider_paths", return_value=_FAKE):
-			served = get_workspace(self.workspace)["member_rules"]
+			served = get_channel(self.channel)["member_rules"]
 		self.assertEqual([r["label"] for r in served], ["Trainers of Vue Basics"])
 
 	def test_combinator_switch_survives_an_unnamed_stored_rule(self):
-		# set_*_combinator saves the whole mapping doc, so a `reqd` label would make
-		# the patch's own blanked rules raise MandatoryError on every AND/OR switch.
-		from raven_integration.api import set_workspace_combinator
+		# set_channel_combinator saves the whole mapping doc, so a `reqd` label would
+		# make the patch's own blanked rules raise MandatoryError on every AND/OR switch.
+		from raven_integration.api import set_channel_combinator
 
 		frappe.db.set_value(
 			"Raven Membership Rule",
-			frappe.get_doc("Raven Workspace Mapping", self.workspace).member_rules[0].name,
+			frappe.get_doc("Raven Channel Mapping", self.channel).member_rules[0].name,
 			"label",
 			"",
 			update_modified=False,
 		)
 		with patch.object(registry, "_provider_paths", return_value=_FAKE):
-			result = set_workspace_combinator(self.workspace, "All (AND)")
+			result = set_channel_combinator(self.channel, "All (AND)")
 		self.assertEqual(result["combinator"], "All (AND)")
+
+	def test_update_workspace_takes_no_rules(self):
+		# The signature is the contract: a caller that still sends rules to a
+		# workspace gets a TypeError, not a silent drop.
+		from raven_integration.api import update_workspace
+
+		with self.assertRaises(TypeError):
+			update_workspace(
+				name=self.workspace,
+				label=self.workspace_label,
+				type="Private",
+				rules=[_rule("Nope")],
+			)

@@ -9,11 +9,12 @@ _FAKE = ["raven_integration.tests.fake_provider.get_provider"]
 
 
 class TestRavenWorkspaceMapping(FrappeTestCase):
-	def test_workspace_mapping_member_rules_options(self):
+	def test_workspace_mapping_carries_no_rules(self):
+		# Rules live on channels only; a workspace's membership is derived from them.
 		meta = frappe.get_meta("Raven Workspace Mapping")
 		f = {df.fieldname: df for df in meta.fields}
-		self.assertIn("member_rules", f)
-		self.assertEqual(f["member_rules"].options, "Raven Membership Rule")
+		self.assertNotIn("member_rules", f)
+		self.assertNotIn("rule_combinator", f)
 
 
 class TestRavenChannelMapping(FrappeTestCase):
@@ -52,19 +53,13 @@ class TestWorkspaceDeleteCascade(FrappeTestCase):
 		ch2 = self._make_channel(ws.name, "Cascade Test Channel 2")
 		# Belt-and-braces: if the cascade ever regresses, clean up by hand.
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Channel Mapping", ch1.name, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Channel Mapping", ch1.name, force=True, ignore_missing=True)
 		)
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Channel Mapping", ch2.name, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Channel Mapping", ch2.name, force=True, ignore_missing=True)
 		)
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Workspace Mapping", ws.name, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Workspace Mapping", ws.name, force=True, ignore_missing=True)
 		)
 
 		# Should not raise LinkExistsError despite the child channels linking back.
@@ -78,14 +73,10 @@ class TestWorkspaceDeleteCascade(FrappeTestCase):
 		ws = self._make_workspace("Channel-Only Delete WS")
 		ch = self._make_channel(ws.name, "Lone Channel")
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Workspace Mapping", ws.name, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Workspace Mapping", ws.name, force=True, ignore_missing=True)
 		)
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Channel Mapping", ch.name, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Channel Mapping", ch.name, force=True, ignore_missing=True)
 		)
 
 		frappe.delete_doc("Raven Channel Mapping", ch.name)
@@ -95,8 +86,20 @@ class TestWorkspaceDeleteCascade(FrappeTestCase):
 
 
 class TestDuplicateRuleGuard(FrappeTestCase):
-	"""A mapping rejects two rules with the same provider/rule_type/config —
+	"""A channel mapping rejects two rules with the same provider/rule_type/config —
 	provider-agnostic duplicate detection."""
+
+	def setUp(self):
+		self.workspace = frappe.new_doc("Raven Workspace Mapping")
+		self.workspace.workspace_label = f"Dup Rule WS {frappe.generate_hash(length=6)}"
+		self.workspace.workspace_type = "Private"
+		self.workspace.flags.skip_raven_create = True
+		self.workspace.insert()
+		self.addCleanup(
+			lambda: frappe.delete_doc(
+				"Raven Workspace Mapping", self.workspace.name, force=True, ignore_missing=True
+			)
+		)
 
 	def _rule(self, label, rule_type="always-a"):
 		return {
@@ -107,33 +110,33 @@ class TestDuplicateRuleGuard(FrappeTestCase):
 			"config": {},
 		}
 
+	def _channel(self, label):
+		ch = frappe.new_doc("Raven Channel Mapping")
+		ch.channel_label = f"{label} {frappe.generate_hash(length=6)}"
+		ch.workspace = self.workspace.name
+		ch.channel_type = "Private"
+		ch.flags.skip_raven_create = True
+		return ch
+
 	def test_identical_rules_rejected(self):
-		ws = frappe.new_doc("Raven Workspace Mapping")
-		ws.workspace_label = "Dup Rule WS"
-		ws.workspace_type = "Private"
-		ws.flags.skip_raven_create = True
+		ch = self._channel("Dup Rule Channel")
 		# Same selection criteria twice (labels differ, but that is cosmetic).
-		ws.append("member_rules", self._rule("First"))
-		ws.append("member_rules", self._rule("Second"))
+		ch.append("member_rules", self._rule("First"))
+		ch.append("member_rules", self._rule("Second"))
 		with patch.object(registry, "_provider_paths", lambda: _FAKE):
 			with self.assertRaises(frappe.ValidationError):
-				ws.insert()
+				ch.insert()
 
 	def test_distinct_rules_allowed(self):
-		ws = frappe.new_doc("Raven Workspace Mapping")
-		ws.workspace_label = "Distinct Rule WS"
-		ws.workspace_type = "Private"
-		ws.flags.skip_raven_create = True
-		ws.append("member_rules", self._rule("A", rule_type="always-a"))
-		ws.append("member_rules", self._rule("B", rule_type="always-ab"))
+		ch = self._channel("Distinct Rule Channel")
+		ch.append("member_rules", self._rule("A", rule_type="always-a"))
+		ch.append("member_rules", self._rule("B", rule_type="always-ab"))
 		with patch.object(registry, "_provider_paths", lambda: _FAKE):
-			ws.insert()
+			ch.insert()
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Workspace Mapping", ws.name, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Channel Mapping", ch.name, force=True, ignore_missing=True)
 		)
-		self.assertEqual(len(ws.member_rules), 2)
+		self.assertEqual(len(ch.member_rules), 2)
 
 
 class TestRavenDeleteNotBlocked(FrappeTestCase):
@@ -168,9 +171,7 @@ class TestRavenDeleteNotBlocked(FrappeTestCase):
 		ws_map.insert()
 		frappe.db.set_value("Raven Workspace Mapping", ws_map.name, "raven_workspace", raven_ws.name)
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Workspace Mapping", ws_map.name, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Workspace Mapping", ws_map.name, force=True, ignore_missing=True)
 		)
 
 		# Must NOT raise LinkExistsError despite the mapping linking to it.

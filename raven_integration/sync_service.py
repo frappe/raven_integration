@@ -33,8 +33,12 @@ def ensure_raven_user(user_id: str) -> None:
 		return
 	try:
 		frappe.get_doc(
-			{"doctype": "Raven User", "user": user_id,
-			 "full_name": user.full_name or user.first_name or user_id, "type": "User"}
+			{
+				"doctype": "Raven User",
+				"user": user_id,
+				"full_name": user.full_name or user.first_name or user_id,
+				"type": "User",
+			}
 		).insert(ignore_permissions=True)
 	except (frappe.UniqueValidationError, frappe.DuplicateEntryError):
 		# Raven User.user is unique=1; a concurrent sweep (event + nightly
@@ -131,14 +135,17 @@ def _sync_rule_managed_members(
 	member_user_field: str,
 	add,
 	remove,
+	rule_gated: bool = True,
 	after_synced=None,
 	cache: dict | None = None,
 ) -> dict:
 	"""Diff-apply one mapping's rule-managed membership onto its Raven record.
 
-	The channel/workspace scoping asymmetry (a channel can only narrow its parent
-	workspace's population) is deliberately not a parameter — it lives entirely
-	inside the ``expected_members`` callable the caller supplies.
+	``rule_gated`` is off for a workspace, which carries no rules: its membership is
+	derived from its channels, so the two rule guards below — skip when nothing is
+	active, freeze whoever a disabled rule put here — have nothing to read and no
+	meaning. Everything else about the diff, including the added_by_rule safety rule,
+	is identical on both paths.
 	"""
 	if not raven_installed():
 		return {"skipped": True, "reason": "raven_not_installed"}
@@ -149,19 +156,21 @@ def _sync_rule_managed_members(
 	mapping = frappe.get_doc(mapping_doctype, mapping_name)
 	if mapping.stale:
 		return {"skipped": True, "reason": "raven_record_deleted"}
-	if not has_active_rules(mapping.member_rules):
+	if rule_gated and not has_active_rules(mapping.member_rules):
 		return {"skipped": True, "reason": "no_active_rules"}
 	expected = expected_members(mapping_name, cache=cache)
 	raven_record = frappe.db.get_value(mapping_doctype, mapping_name, link_field)
 	if not raven_record:
 		return {"skipped": True, "reason": no_link_reason}
-	current_rule_managed = set(frappe.get_all(
-		member_doctype,
-		filters={member_link_field: raven_record, "added_by_rule": 1},
-		pluck=member_user_field,
-	))
+	current_rule_managed = set(
+		frappe.get_all(
+			member_doctype,
+			filters={member_link_field: raven_record, "added_by_rule": 1},
+			pluck=member_user_field,
+		)
+	)
 	# Members a disabled rule put here stay put; it just stops granting membership.
-	frozen = current_rule_managed & disabled_rule_members(mapping.member_rules)
+	frozen = current_rule_managed & disabled_rule_members(mapping.member_rules) if rule_gated else set()
 	to_add = expected - current_rule_managed
 	to_remove = current_rule_managed - expected - frozen
 	for u in to_add:
@@ -198,7 +207,13 @@ def sync_channel_members(channel_name: str, *, cache: dict | None = None) -> dic
 
 
 def sync_workspace_members(workspace_name: str, *, cache: dict | None = None) -> dict:
-	"""Diff-apply rule-managed workspace membership for the given Raven Workspace Mapping."""
+	"""Reconcile derived workspace membership for the given Raven Workspace Mapping.
+
+	The expected set is whoever is in one of the workspace's channels, so this only
+	ever tidies up after the channel sweep: it drops the rule-managed workspace rows
+	of people who have just lost their last channel, and re-adds anyone a channel
+	holds who somehow has no workspace row.
+	"""
 	from raven_integration.engine import expected_workspace_members
 
 	return _sync_rule_managed_members(
@@ -212,6 +227,7 @@ def sync_workspace_members(workspace_name: str, *, cache: dict | None = None) ->
 		member_user_field="user",
 		add=add_workspace_member,
 		remove=remove_workspace_member,
+		rule_gated=False,
 		cache=cache,
 	)
 
@@ -241,7 +257,8 @@ def create_raven_workspace_for(ws_map) -> None:
 		with pushing_to_raven():
 			rw = _insert_unique_raven_doc(
 				{"doctype": "Raven Workspace", "type": ws_map.workspace_type},
-				"workspace_name", ws_map.workspace_label,
+				"workspace_name",
+				ws_map.workspace_label,
 			)
 	except RavenAPIError:
 		raise
@@ -261,9 +278,13 @@ def create_raven_channel_for(ch_map) -> None:
 	try:
 		with pushing_to_raven():
 			rc = _insert_unique_raven_doc(
-				{"doctype": "Raven Channel", "workspace": parent.raven_workspace,
-				 "type": ch_map.channel_type},
-				"channel_name", ch_map.channel_label,
+				{
+					"doctype": "Raven Channel",
+					"workspace": parent.raven_workspace,
+					"type": ch_map.channel_type,
+				},
+				"channel_name",
+				ch_map.channel_label,
 			)
 	except RavenAPIError:
 		raise

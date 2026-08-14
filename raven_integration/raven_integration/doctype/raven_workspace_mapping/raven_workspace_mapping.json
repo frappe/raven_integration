@@ -9,19 +9,9 @@
   "workspace_type",
   "raven_workspace",
   "enabled",
-  "stale",
-  "section_rules",
-  "rule_combinator",
-  "member_rules"
+  "stale"
  ],
  "fields": [
-  {
-   "default": "Any (OR)",
-   "fieldname": "rule_combinator",
-   "fieldtype": "Select",
-   "label": "Combine rules with",
-   "options": "Any (OR)\nAll (AND)"
-  },
   {
    "fieldname": "workspace_label",
    "fieldtype": "Data",
@@ -58,21 +48,10 @@
    "fieldtype": "Check",
    "label": "Stale",
    "read_only": 1
-  },
-  {
-   "fieldname": "section_rules",
-   "fieldtype": "Section Break",
-   "label": "Member Rules"
-  },
-  {
-   "fieldname": "member_rules",
-   "fieldtype": "Table",
-   "label": "Member Rules",
-   "options": "Raven Membership Rule"
   }
  ],
  "links": [],
- "modified": "2026-06-01 00:00:00.000000",
+ "modified": "2026-08-03 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Raven Integration",
  "name": "Raven Workspace Mapping",

@@ -4,12 +4,10 @@ from frappe.model.document import Document
 
 class RavenWorkspaceMapping(Document):
 	def validate(self) -> None:
-		from raven_integration.engine import validate_member_rules
-
-		# Surface the friendly "field is required" error before the custom rule
-		# checks, which would otherwise flag two blank rows as duplicates.
+		# Membership rules live on Raven Channel Mapping only, so a workspace has
+		# nothing rule-shaped to validate: its membership is derived from whoever is
+		# in at least one of its channels.
 		self._validate_mandatory()
-		validate_member_rules(self.member_rules)
 
 	def before_insert(self) -> None:
 		if self.flags.get("skip_raven_create"):

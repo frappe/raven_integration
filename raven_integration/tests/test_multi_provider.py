@@ -111,9 +111,7 @@ class TestMixedProviderMapping(FrappeTestCase):
 
 class TestProviderDeclarationIsValidated(FrappeTestCase):
 	def test_duplicate_provider_name_is_refused(self):
-		with patch.object(
-			registry, "_provider_paths", return_value=[_FAKE_PATH, _COLLIDING_PATH]
-		):
+		with patch.object(registry, "_provider_paths", return_value=[_FAKE_PATH, _COLLIDING_PATH]):
 			with self.assertRaises(frappe.ValidationError) as cm:
 				registry.list_providers()
 		message = str(cm.exception)
@@ -145,10 +143,7 @@ class TestApiPathsForANonLmsProvider(FrappeTestCase):
 			ws = frappe.new_doc("Raven Workspace Mapping")
 			ws.workspace_label = f"Multi Provider WS {frappe.generate_hash(length=6)}"
 			ws.workspace_type = "Private"
-			ws.rule_combinator = "Any (OR)"
 			ws.flags.skip_raven_create = True
-			ws.append("member_rules", _rule("FAKE", "always-ab"))
-			ws.append("member_rules", _rule("FAKE2", "b-and-c"))
 			ws.insert()
 		self.workspace = ws.name
 		self.addCleanup(
@@ -157,8 +152,23 @@ class TestApiPathsForANonLmsProvider(FrappeTestCase):
 			)
 		)
 
+		with _both_providers():
+			ch = frappe.new_doc("Raven Channel Mapping")
+			ch.channel_label = f"Multi Provider CH {frappe.generate_hash(length=6)}"
+			ch.workspace = self.workspace
+			ch.channel_type = "Private"
+			ch.rule_combinator = "Any (OR)"
+			ch.flags.skip_raven_create = True
+			ch.append("member_rules", _rule("FAKE", "always-ab"))
+			ch.append("member_rules", _rule("FAKE2", "b-and-c"))
+			ch.insert()
+		self.channel = ch.name
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Channel Mapping", self.channel, force=True, ignore_missing=True)
+		)
+
 	def test_a_mapping_can_store_rules_from_both_providers(self):
-		rules = frappe.get_doc("Raven Workspace Mapping", self.workspace).member_rules
+		rules = frappe.get_doc("Raven Channel Mapping", self.channel).member_rules
 		self.assertEqual(sorted(r.provider for r in rules), ["FAKE", "FAKE2"])
 
 	def test_preview_rule_works_for_the_second_provider(self):
@@ -182,8 +192,8 @@ class TestApiPathsForANonLmsProvider(FrappeTestCase):
 
 		with _both_providers():
 			result = compute_rule_diff(
-				target_doctype="Raven Workspace Mapping",
-				name=self.workspace,
+				target_doctype="Raven Channel Mapping",
+				name=self.channel,
 				new_rules=[_rule("FAKE2", "b-and-c")],
 			)
 		self.assertEqual(result["added"], 2)
@@ -195,13 +205,13 @@ class TestApiPathsForANonLmsProvider(FrappeTestCase):
 
 		with _both_providers():
 			any_or = compute_rule_diff(
-				target_doctype="Raven Workspace Mapping",
-				name=self.workspace,
+				target_doctype="Raven Channel Mapping",
+				name=self.channel,
 				combinator="Any (OR)",
 			)
 			all_and = compute_rule_diff(
-				target_doctype="Raven Workspace Mapping",
-				name=self.workspace,
+				target_doctype="Raven Channel Mapping",
+				name=self.channel,
 				combinator="All (AND)",
 			)
 		self.assertEqual(any_or["added"], 3)
