@@ -270,3 +270,91 @@ class TestSetRuleStatus(FrappeTestCase):
 		from raven_integration import api
 
 		self.assertFalse(hasattr(api, "set_channel_combinator"))
+
+
+class TestConcurrentRuleStatusWrites(FrappeTestCase):
+	"""Two managers pausing two different conditions of one channel at once.
+
+	The endpoint reads the whole tree, edits one leaf and writes the whole tree
+	back, so the second writer has to see the first writer's edit or it overwrites
+	it. Under MariaDB's REPEATABLE READ a plain read cannot see it: the second
+	session's snapshot predates the first session's commit. That needs two real
+	connections and committed rows, which is why this class commits where the rest
+	of the suite does not — see frappe.tests.test_db.TestConcurrency for the same
+	pattern.
+	"""
+
+	def setUp(self):
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			ws = frappe.new_doc("Raven Workspace Mapping")
+			ws.workspace_label = f"Rule Race WS {frappe.generate_hash(length=6)}"
+			ws.workspace_type = "Private"
+			ws.flags.skip_raven_create = True
+			ws.insert()
+			ch = frappe.new_doc("Raven Channel Mapping")
+			ch.channel_label = f"Rule Race CH {frappe.generate_hash(length=6)}"
+			ch.workspace = ws.name
+			ch.channel_type = "Private"
+			ch.flags.skip_raven_create = True
+			ch.member_rules_json = frappe.as_json(
+				_tree(_rule("First Rule"), _rule("Second Rule", config={"tag": "b"}))
+			)
+			ch.insert()
+		self.workspace = ws.name
+		self.channel = ch.name
+		# The second connection can only see rows that are committed.
+		frappe.db.commit()
+		self.addCleanup(self._drop)
+
+	def _drop(self):
+		for doctype, name in (
+			("Raven Channel Mapping", self.channel),
+			("Raven Workspace Mapping", self.workspace),
+		):
+			frappe.delete_doc(doctype, name, force=True, ignore_missing=True, ignore_permissions=True)
+		frappe.db.commit()
+
+	def _statuses(self):
+		tree = frappe.parse_json(
+			frappe.db.get_value("Raven Channel Mapping", self.channel, "member_rules_json")
+		)
+		return [condition["status"] for condition in tree["conditions"]]
+
+	def test_two_sessions_pausing_two_conditions_keep_both_pauses(self):
+		from raven_integration.api import set_channel_rule_status
+
+		with self.secondary_connection():
+			# Opens the second session's transaction — and with it the snapshot the
+			# rest of its reads are answered from — before the first session writes.
+			frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_label")
+
+		with self.primary_connection():
+			with patch.object(registry, "_provider_paths", return_value=_FAKE):
+				set_channel_rule_status(self.channel, [0], "Paused")
+			frappe.db.commit()
+
+		with self.secondary_connection():
+			with patch.object(registry, "_provider_paths", return_value=_FAKE):
+				set_channel_rule_status(self.channel, [1], "Paused")
+			frappe.db.commit()
+
+		with self.primary_connection():
+			self.assertEqual(self._statuses(), ["Paused", "Paused"])
+
+	def test_a_tree_edit_that_started_first_fails_loudly_rather_than_silently(self):
+		"""The other order: a full save that read the mapping before the pause landed.
+
+		doc.save() carries the timestamp check, so this half is already safe — the
+		edit is refused, not lost. Pinned so it stays that way; the pause endpoint
+		writes with db.set_value, which has no such check of its own.
+		"""
+		from raven_integration.api import set_channel_rule_status
+
+		doc = frappe.get_doc("Raven Channel Mapping", self.channel)
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			set_channel_rule_status(self.channel, [0], "Paused")
+
+		doc.channel_type = "Public"
+		with self.assertRaises(frappe.TimestampMismatchError):
+			doc.save()
+		self.assertEqual(self._statuses(), ["Paused", "Active"])

@@ -295,10 +295,15 @@ def _set_rule_status(doctype: str, name: str, path: Any, status: str) -> dict:
 	# precisely to reach a rule a full save cannot: a Paused, unnamed one, whose card
 	# the UI freezes and whose save path the name check rejects. _schedule_resync()
 	# supplies the membership refresh a skipped save would have triggered.
-	tree = parse_tree(frappe.db.get_value(doctype, name, "member_rules_json")) or {
-		"conjunctions": [],
-		"conditions": [],
-	}
+	#
+	# The read locks the row (for_update, on the primary key), because the write puts
+	# the whole tree back: two managers pausing two different conditions would each
+	# otherwise write a tree that predates the other's edit, and one of the two pauses
+	# would silently vanish. A plain read cannot see the other session's commit —
+	# under REPEATABLE READ it is answered from the snapshot this transaction opened
+	# with — so the lock, which reads current, is what makes the second write correct.
+	stored = frappe.db.get_value(doctype, name, "member_rules_json", for_update=True)
+	tree = parse_tree(stored) or {"conjunctions": [], "conditions": []}
 	leaf = _leaf_at(tree, path_)
 	if status_ == "Paused" and not pausable(tree, path_):
 		frappe.throw(
