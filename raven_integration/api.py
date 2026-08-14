@@ -847,11 +847,13 @@ def update_workspace(name: str, label: str, type: str) -> str:
 
 @frappe.whitelist()
 def delete_workspace(name: str) -> None:
-	"""Delete the Raven Workspace Mapping and its child channel mappings.
+	"""Delete the Raven Workspace Mapping, its child channel mappings, and the
+	membership their rules had granted.
 
-	Deletes this app's own records only. The backing Raven Workspace — with its
-	channels, members and conversations — is left intact and simply becomes
-	unmanaged; deleting it is Raven's decision to make, not ours.
+	Of Raven's own records it deletes none: the backing Raven Workspace, its
+	channels and their conversations are left intact and simply become unmanaged,
+	as are the members a human added there. Deleting the workspace itself is
+	Raven's decision to make, not ours.
 	"""
 	_require_manager()
 	name = _str(name, "name")
@@ -1036,10 +1038,10 @@ def update_channel(
 
 @frappe.whitelist()
 def delete_channel(name: str) -> None:
-	"""Delete the Raven Channel Mapping.
+	"""Delete the Raven Channel Mapping and the membership its rules had granted.
 
-	Deletes this app's own record only. The backing Raven Channel and its messages
-	are left intact and simply become unmanaged.
+	The backing Raven Channel and its messages are left intact and simply become
+	unmanaged, as are the members a human added there.
 	"""
 	_require_manager()
 	name = _str(name, "name")

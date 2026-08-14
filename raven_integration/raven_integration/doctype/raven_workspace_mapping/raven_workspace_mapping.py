@@ -27,10 +27,23 @@ class RavenWorkspaceMapping(Document):
 		push_workspace_type_to_raven(self)
 
 	def on_trash(self) -> None:
+		from raven_integration.sync_service import evict_rule_managed_members
+
 		# A Raven Channel Mapping links back to its workspace, so the framework
 		# blocks the workspace delete while channels exist. Cascade-delete the
 		# child channel mappings first to clear the link.
-		for channel in frappe.get_all(
-			"Raven Channel Mapping", filters={"workspace": self.name}, pluck="name"
-		):
-			frappe.delete_doc("Raven Channel Mapping", channel)
+		channels = frappe.get_all(
+			"Raven Channel Mapping", filters={"workspace": self.name}, fields=["name", "raven_channel"]
+		)
+		# Before the cascade, not after: the Raven ids these rows are addressed by
+		# live on the channel mappings, and a deleted mapping cannot say which
+		# Raven channel it managed. Inside the delete's own transaction too, so a
+		# workspace that fails to delete does not lose its members on the way.
+		evict_rule_managed_members(self.raven_workspace, [c.raven_channel for c in channels])
+		# Each cascaded delete evicts its own channel too. By now there is nothing
+		# left for it to find, so it is a no-op rather than a second withdrawal —
+		# but doing the whole workspace in one pass first is what makes the
+		# workspace's own member rows go unconditionally, which a per-channel
+		# eviction, deriving them from the channels, would not do.
+		for channel in channels:
+			frappe.delete_doc("Raven Channel Mapping", channel.name)

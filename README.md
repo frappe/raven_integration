@@ -40,8 +40,12 @@ tickets. It asks a *provider* — another installed app that registers itself th
   on every migrate). Removal only ever targets flagged rows, so members a human added inside Raven
   are never touched.
 - **It never deletes a Raven workspace or channel.** Deleting a mapping deletes the mapping and its
-  rules — the Raven workspace/channel it was managing survives, along with its history and everyone
-  in it. No endpoint in this app can destroy a Raven workspace or channel.
+  rules — the Raven workspace/channel it was managing survives, with its history intact. No endpoint
+  in this app can destroy a Raven workspace or channel.
+- **Deleting a mapping withdraws the membership its rules granted.** The `added_by_rule` rows under
+  it go — for a workspace mapping, across every channel it managed and on the workspace itself; for
+  a channel mapping, on that channel — because those people are in there only on the authority of
+  rules that are being deleted. Rows a human added are flagged as such and stay, as everywhere else.
 - **Enabling is one-way.** There is an `enable_integration` endpoint and no global disable, so no
   single click can mass-evict members. Disable individual mappings instead (clear `enabled`).
 - **A mapping with no active rules is unmanaged, not empty.** Deleting or pausing the last rule
@@ -90,9 +94,13 @@ mapping pointed at no longer exists (see [Stale mappings](#stale-mappings)). `st
 it is set and cleared by the app, never by hand.
 
 Creating a mapping **creates a new** Raven workspace/channel behind it (with a uniqueness-safe name);
-it never adopts an existing one. Deleting a workspace mapping cascades to its channel mappings.
-Deletion stops there: the app deletes only its own mappings and their rules, and the Raven workspace
-or channel is left intact — unmanaged, but whole.
+it never adopts an existing one. Deleting a workspace mapping cascades to its channel mappings, and
+withdraws the membership those mappings' rules had granted (`added_by_rule` rows on the channels and
+on the workspace). Deletion stops there: of Raven's own records the app deletes none — the workspace
+and its channels are left intact, unmanaged but whole, with their history and their hand-added
+members. Deleting a single channel mapping withdraws that channel's `added_by_rule` members the same
+way; the workspace mapping stays, so its membership stays derived — only someone whose last channel
+in the workspace this was loses their workspace row with it.
 
 ## Stale mappings
 
@@ -298,11 +306,11 @@ Manager role.
 | `enable_integration` | Turn sync on and queue the first full reconcile. |
 | `list_providers` | Registered providers and their rule types, for the rule-builder UI. |
 | `list_workspaces` / `get_workspace` | List and detail (incl. member count and `stale`). A workspace holds no conditions. |
-| `create_workspace` / `update_workspace` / `delete_workspace` | CRUD. `delete_workspace` removes the mapping and its child channel mappings; the Raven workspace is never deleted. |
+| `create_workspace` / `update_workspace` / `delete_workspace` | CRUD. `delete_workspace` removes the mapping, its child channel mappings and the membership their rules granted; the Raven workspace is never deleted. |
 | `recreate_workspace` | For a stale mapping: create a fresh Raven workspace from the stored label, repoint the link, clear `stale`. Returns the new Raven workspace name. |
 | `set_workspace_enabled` / `set_workspace_type` / `set_workspace_label` | Inline edits. Enabling re-syncs in the background. |
 | `list_channels` / `get_channel` | List and detail, incl. `stale`. `get_channel` serves the condition tree as `rules`, each leaf annotated with the `matches` label its provider declares. |
-| `create_channel` / `update_channel` / `delete_channel` | CRUD; `rules` is the condition tree. `delete_channel` removes the mapping only; the Raven channel is never deleted. |
+| `create_channel` / `update_channel` / `delete_channel` | CRUD; `rules` is the condition tree. `delete_channel` removes the mapping and the membership its rules granted; the Raven channel is never deleted. |
 | `recreate_channel` | For a stale mapping: create a fresh Raven channel from the stored label, repoint the link, clear `stale`. Returns the new Raven channel name. |
 | `set_channel_enabled` / `set_channel_type` / `set_channel_label` | Inline edits. |
 | `set_channel_rule_status` | Pause/resume one condition, addressed by its `path` (child indices from the root). Refuses to pause a condition with an `and` anywhere above it. |

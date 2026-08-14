@@ -136,9 +136,12 @@ Then the app compares expected vs. actual and applies the difference: add the mi
 
 ### 7. Deleting a mapping
 - Delete a **Workspace Mapping** → its child Channel Mappings, and with them the rules, are deleted too.
-- The **real Raven workspace/channel is left intact** — just no longer managed. Its messages, history and members stay exactly as they were.
-- There is no option to do otherwise. **The app never deletes a Raven workspace or channel**, on any code path. "Delete" here only ever means "delete our own mapping record and the rules on it".
-- Members the app had added stay in Raven. Nothing evicts them, because eviction only happens as part of a sync, and a deleted mapping is never swept again.
+- **The membership those rules granted is withdrawn**: every `added_by_rule` row on the workspace's channels and on the workspace itself is removed. Those people were in there on the authority of rules that are being deleted, and leaving them behind would leave a channel populated by a rule the site can no longer show, explain or undo.
+- Members a human added inside Raven are **not** touched. They carry no `added_by_rule` flag, and the rule that this app only ever removes what it added holds on the way out exactly as it does during a sync.
+- The **real Raven workspace/channel is left intact** — just no longer managed. Its messages and history stay exactly as they were.
+- There is no option to do otherwise. **The app never deletes a Raven workspace or channel**, on any code path. "Delete" here only ever means "delete our own mapping record, the rules on it, and the membership those rules put in place".
+- Deleting a single **Channel Mapping** withdraws the same way, narrowed to that one channel: its `added_by_rule` members go, the other channels are untouched, and the Raven channel itself survives.
+- The workspace mapping survives a channel delete and stays managed, so its own membership stays **derived** rather than wiped: someone who was only in the workspace because of the deleted channel loses their workspace row too, and someone still in another channel keeps it. That is the same conclusion the next `sync_workspace_members` sweep would reach — doing it during the delete just means a paused or unswept workspace never sits on membership it can no longer account for.
 
 ### 8. Stale mappings (someone deleted the Raven side directly)
 - An admin can delete a workspace/channel inside Raven directly. The app **allows** that — it deliberately does not block Raven's own delete.
@@ -186,7 +189,7 @@ This is what makes the app reusable across LMS, CRM, or anything else.
 
 ## Safety guarantees (why it won't wreck your data)
 
-- **Never deletes a Raven workspace or channel.** Not when you delete a mapping, not when you uninstall the app, not through any endpoint. The only records it deletes are its own mappings and rules, plus the individual member rows it added.
+- **Never deletes a Raven workspace or channel.** Not when you delete a mapping, not when you uninstall the app, not through any endpoint. The only records it deletes are its own mappings and rules, plus the individual member rows it added — including on the way out, when a workspace mapping is deleted.
 - **Only removes what it added.** Every member the app adds is tagged `added_by_rule = 1`. Members added manually inside Raven are **never** touched. Removal only ever targets tagged rows.
 - **One-way enable.** No global off-switch that would mass-remove everyone. You disable individual mappings instead.
 - **Idempotent / race-safe.** Concurrent runs (nightly + event at once) can't double-add or crash — database uniqueness constraints catch the loser, and it's treated as already-done.

@@ -70,6 +70,114 @@ def _remove_rule_managed_member(member_doctype: str, filters: dict) -> None:
 		frappe.delete_doc(member_doctype, name, ignore_permissions=True, force=True)
 
 
+def _delete_member_rows(member_doctype: str, names: "list[str]") -> int:
+	"""Delete the named member rows. Returns how many went."""
+	for name in names:
+		frappe.delete_doc(member_doctype, name, ignore_permissions=True, force=True)
+	return len(names)
+
+
+def _delete_rule_managed_rows(member_doctype: str, link_field: str, links: "list[str]") -> int:
+	"""Delete every rule-managed member row on ``links``. Returns how many went.
+
+	Rows with added_by_rule cleared are left where they are: somebody put them
+	there by hand inside Raven, and this app removing them would be the one thing
+	it promises never to do.
+	"""
+	if not links:
+		return 0
+	return _delete_member_rows(
+		member_doctype,
+		frappe.get_all(
+			member_doctype,
+			filters={link_field: ("in", links), "added_by_rule": 1},
+			pluck="name",
+		),
+	)
+
+
+def _drop_workspace_members_without_a_channel(raven_workspace: str) -> int:
+	"""Withdraw the rule-managed workspace rows of anyone now in no channel of it.
+
+	This is the derived-membership rule of expected_workspace_members applied at a
+	single moment instead of on a sweep: a workspace member is whoever is in at
+	least one channel of the workspace, so someone whose last channel row has just
+	gone has nothing left holding them there. Anyone still in a channel — including
+	a channel this app does not manage, or one a human added them to — keeps their
+	row, and so does anyone whose workspace row is not flagged as this app's.
+	"""
+	from raven_integration.engine import members_of_workspace_channels
+
+	still_in_a_channel = members_of_workspace_channels(raven_workspace)
+	rows = frappe.get_all(
+		"Raven Workspace Member",
+		filters={"workspace": raven_workspace, "added_by_rule": 1},
+		fields=["name", "user"],
+	)
+	return _delete_member_rows(
+		"Raven Workspace Member", [row.name for row in rows if row.user not in still_in_a_channel]
+	)
+
+
+def evict_rule_managed_members(raven_workspace: "str | None", raven_channels: "list[str]") -> dict:
+	"""Take back every membership this app's rules granted under one workspace.
+
+	Called when a workspace mapping is deleted. Up to then the app has kept each
+	channel's membership matching its conditions, so the people in them are there
+	*because* of the mapping — dropping the mapping and leaving them behind would
+	leave a channel populated by a rule that no longer exists, with nothing on the
+	site able to explain or undo it.
+
+	This is not a Raven delete and does not become one: the workspace, the
+	channels and every message in them are untouched, and so is anyone a human
+	added. Only the rows this app inserted itself are withdrawn.
+
+	Workspace membership is derived from channel membership, so both halves go
+	together — a workspace row this app added exists only because one of these
+	channel rows did, and nothing is left managing the workspace afterwards.
+	"""
+	if not raven_installed():
+		return {"channel_members": 0, "workspace_members": 0}
+	channels = [c for c in raven_channels if c]
+	return {
+		"channel_members": _delete_rule_managed_rows("Raven Channel Member", "channel_id", channels),
+		"workspace_members": _delete_rule_managed_rows(
+			"Raven Workspace Member", "workspace", [raven_workspace] if raven_workspace else []
+		),
+	}
+
+
+def evict_channel_rule_managed_members(raven_workspace: "str | None", raven_channel: "str | None") -> dict:
+	"""Take back what one channel's rules granted, when its mapping is deleted.
+
+	The channel half is the workspace-delete withdrawal narrowed to a single
+	channel, and for the same reason: those members are in there on the authority
+	of rules that are going away with the mapping.
+
+	The workspace half is deliberately *not* the same. The workspace mapping
+	survives a channel delete and stays managed, so its membership keeps being
+	derived rather than wiped: only the people this channel was the last thing
+	keeping in the workspace lose their workspace row, which is exactly what the
+	next sync_workspace_members sweep would conclude anyway. Doing it here means a
+	disabled or unswept workspace does not sit on membership it can no longer
+	account for.
+
+	Safe to call twice, and safe to call after a workspace-level eviction has
+	already run — both halves are "delete the rows that are still there", so the
+	cascade from a workspace delete finds nothing left to do.
+	"""
+	if not raven_installed():
+		return {"channel_members": 0, "workspace_members": 0}
+	return {
+		"channel_members": _delete_rule_managed_rows(
+			"Raven Channel Member", "channel_id", [raven_channel] if raven_channel else []
+		),
+		"workspace_members": (
+			_drop_workspace_members_without_a_channel(raven_workspace) if raven_workspace else 0
+		),
+	}
+
+
 def add_channel_member(channel: str, user: str) -> None:
 	"""Add user to a Raven Channel and its parent workspace, flagging the row as rule-managed.
 

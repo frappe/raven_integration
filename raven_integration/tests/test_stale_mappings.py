@@ -328,6 +328,262 @@ class TestRecreatePermissions(_StaleFixtureMixin, FrappeTestCase):
 			frappe.set_user("Administrator")
 
 
+class _RuleMembershipMixin(_StaleFixtureMixin):
+	"""Real members in a real Raven channel, tagged as the app's or a human's."""
+
+	def setUp(self):
+		self._setUp_mappings()
+		self.raven_channel = self.ch_map.raven_channel
+		self.raven_workspace = self.ws_map.raven_workspace
+
+	def _user(self, tag: str) -> str:
+		user = frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": f"ri-evict-{tag}-{self.suffix}@example.com",
+				"first_name": f"Evict {tag}",
+				"send_welcome_email": 0,
+			}
+		).insert()
+		self.addCleanup(lambda: frappe.db.delete("User", {"name": user.name}))
+
+		from raven_integration.sync_service import ensure_raven_user
+
+		ensure_raven_user(user.name)
+		self.addCleanup(lambda: frappe.db.delete("Raven User", {"user": user.name}))
+		return user.name
+
+	def _member(self, user: str, *, by_rule: bool, channel: str | None = None) -> None:
+		"""One channel member row and its workspace row, flagged as the app or a human."""
+		flag = 1 if by_rule else 0
+		frappe.get_doc(
+			{
+				"doctype": "Raven Channel Member",
+				"channel_id": channel or self.raven_channel,
+				"user_id": user,
+				"added_by_rule": flag,
+			}
+		).insert(ignore_permissions=True)
+		if frappe.db.exists("Raven Workspace Member", {"workspace": self.raven_workspace, "user": user}):
+			return
+		frappe.get_doc(
+			{
+				"doctype": "Raven Workspace Member",
+				"workspace": self.raven_workspace,
+				"user": user,
+				"added_by_rule": flag,
+			}
+		).insert(ignore_permissions=True)
+
+	def _second_channel_mapping(self, tag: str):
+		"""Another mapped channel in the same Raven workspace."""
+		ch = frappe.new_doc("Raven Channel Mapping")
+		ch.channel_label = f"stale-{tag}-{self.suffix}"
+		ch.workspace = self.ws_map.name
+		ch.channel_type = "Private"
+		ch.insert()
+		return ch
+
+	def _has_channel_member(self, user: str, channel: str | None = None) -> bool:
+		return bool(
+			frappe.db.exists(
+				"Raven Channel Member", {"channel_id": channel or self.raven_channel, "user_id": user}
+			)
+		)
+
+	def _has_workspace_member(self, user: str) -> bool:
+		return bool(
+			frappe.db.exists("Raven Workspace Member", {"workspace": self.raven_workspace, "user": user})
+		)
+
+
+class TestDeleteWithdrawsRuleMembership(_RuleMembershipMixin, FrappeTestCase):
+	"""Deleting a workspace mapping takes back what its rules granted.
+
+	Those members are in the channel on the authority of rules that are being
+	deleted, so leaving them behind would leave a channel populated by a rule the
+	site can no longer show or undo. What must survive is everything the app did
+	not put there: the Raven records themselves, and any member a human added.
+	"""
+
+	def test_delete_workspace_removes_the_members_its_rules_added(self):
+		from raven_integration.api import delete_workspace
+
+		by_rule = self._user("rule")
+		self._member(by_rule, by_rule=True)
+
+		delete_workspace(name=self.ws_map.name)
+
+		self.assertFalse(self._has_channel_member(by_rule))
+		self.assertFalse(self._has_workspace_member(by_rule))
+
+	def test_delete_workspace_leaves_a_member_a_human_added(self):
+		from raven_integration.api import delete_workspace
+
+		by_hand = self._user("hand")
+		self._member(by_hand, by_rule=False)
+
+		delete_workspace(name=self.ws_map.name)
+
+		self.assertTrue(
+			self._has_channel_member(by_hand),
+			"a member with added_by_rule cleared was not this app's to remove",
+		)
+		self.assertTrue(self._has_workspace_member(by_hand))
+
+	def test_delete_workspace_sorts_the_two_apart_in_one_channel(self):
+		"""The flag decides per row, not per channel."""
+		from raven_integration.api import delete_workspace
+
+		by_rule = self._user("mixed-rule")
+		by_hand = self._user("mixed-hand")
+		self._member(by_rule, by_rule=True)
+		self._member(by_hand, by_rule=False)
+
+		delete_workspace(name=self.ws_map.name)
+
+		self.assertFalse(self._has_channel_member(by_rule))
+		self.assertTrue(self._has_channel_member(by_hand))
+
+	def test_the_raven_records_still_survive_the_withdrawal(self):
+		"""Emptying a channel of rule-added members is not deleting the channel."""
+		from raven_integration.api import delete_workspace
+
+		self._member(self._user("survives"), by_rule=True)
+
+		delete_workspace(name=self.ws_map.name)
+
+		self.assertTrue(frappe.db.exists("Raven Channel", self.raven_channel))
+		self.assertTrue(frappe.db.exists("Raven Workspace", self.raven_workspace))
+
+	def test_delete_workspace_withdraws_across_every_channel_it_managed(self):
+		"""The cascade covers the whole workspace, not just the channel in the fixture.
+
+		Also the case where each cascaded channel delete runs its own eviction on the
+		way past: the workspace pass has already taken these rows, so the second pass
+		must find nothing rather than fail on rows that are no longer there.
+		"""
+		from raven_integration.api import delete_workspace
+
+		second = self._second_channel_mapping("cascade")
+		by_rule = self._user("cascade-rule")
+		by_hand = self._user("cascade-hand")
+		self._member(by_rule, by_rule=True)
+		self._member(by_rule, by_rule=True, channel=second.raven_channel)
+		self._member(by_hand, by_rule=False, channel=second.raven_channel)
+
+		delete_workspace(name=self.ws_map.name)
+
+		self.assertFalse(self._has_channel_member(by_rule))
+		self.assertFalse(self._has_channel_member(by_rule, second.raven_channel))
+		self.assertFalse(self._has_workspace_member(by_rule))
+		self.assertTrue(self._has_channel_member(by_hand, second.raven_channel))
+		self.assertTrue(self._has_workspace_member(by_hand))
+		self.assertFalse(frappe.db.exists("Raven Channel Mapping", second.name))
+		self.assertTrue(frappe.db.exists("Raven Channel", second.raven_channel))
+
+
+class TestDeletingAChannelMappingWithdrawsItsMembership(_RuleMembershipMixin, FrappeTestCase):
+	"""Deleting one channel mapping withdraws what that channel's rules granted.
+
+	Same reasoning as the workspace delete, narrowed to one channel: the rules that
+	put those people in the channel are going away with the mapping. The difference
+	is the workspace, which survives and stays managed — so its membership stays
+	*derived* (whoever is in at least one channel) instead of being wiped, and only
+	someone whose last channel this was loses their workspace row.
+	"""
+
+	def test_it_removes_the_members_its_rules_added(self):
+		from raven_integration.api import delete_channel
+
+		by_rule = self._user("channel-rule")
+		self._member(by_rule, by_rule=True)
+
+		delete_channel(name=self.ch_map.name)
+
+		self.assertFalse(self._has_channel_member(by_rule))
+
+	def test_it_leaves_a_member_a_human_added(self):
+		from raven_integration.api import delete_channel
+
+		by_hand = self._user("channel-hand")
+		self._member(by_hand, by_rule=False)
+
+		delete_channel(name=self.ch_map.name)
+
+		self.assertTrue(
+			self._has_channel_member(by_hand),
+			"a member with added_by_rule cleared was not this app's to remove",
+		)
+		self.assertTrue(self._has_workspace_member(by_hand))
+
+	def test_it_sorts_the_two_apart_in_one_channel(self):
+		"""The flag decides per row, not per channel."""
+		from raven_integration.api import delete_channel
+
+		by_rule = self._user("ch-mixed-rule")
+		by_hand = self._user("ch-mixed-hand")
+		self._member(by_rule, by_rule=True)
+		self._member(by_hand, by_rule=False)
+
+		delete_channel(name=self.ch_map.name)
+
+		self.assertFalse(self._has_channel_member(by_rule))
+		self.assertTrue(self._has_channel_member(by_hand))
+
+	def test_the_raven_channel_survives_the_withdrawal(self):
+		from raven_integration.api import delete_channel
+
+		self._member(self._user("ch-survives"), by_rule=True)
+
+		delete_channel(name=self.ch_map.name)
+
+		self.assertTrue(frappe.db.exists("Raven Channel", self.raven_channel))
+		self.assertTrue(frappe.db.exists("Raven Workspace", self.raven_workspace))
+
+	def test_losing_the_last_channel_removes_the_workspace_row_too(self):
+		"""What sync_workspace_members would conclude on its next sweep, done now."""
+		from raven_integration.api import delete_channel
+
+		by_rule = self._user("ch-last")
+		self._member(by_rule, by_rule=True)
+
+		delete_channel(name=self.ch_map.name)
+
+		self.assertFalse(self._has_workspace_member(by_rule))
+
+	def test_a_member_still_in_another_channel_keeps_the_workspace_row(self):
+		"""Derived, not wiped: one channel left is enough to stay in the workspace."""
+		from raven_integration.api import delete_channel
+
+		second = self._second_channel_mapping("stays")
+		by_rule = self._user("ch-stays")
+		self._member(by_rule, by_rule=True)
+		self._member(by_rule, by_rule=True, channel=second.raven_channel)
+
+		delete_channel(name=self.ch_map.name)
+
+		self.assertFalse(self._has_channel_member(by_rule))
+		self.assertTrue(self._has_channel_member(by_rule, second.raven_channel))
+		self.assertTrue(
+			self._has_workspace_member(by_rule),
+			"still in a channel of the workspace, so still a member of it",
+		)
+
+	def test_it_leaves_the_other_channels_alone(self):
+		"""One mapping's delete withdraws from one channel."""
+		from raven_integration.api import delete_channel
+
+		second = self._second_channel_mapping("untouched")
+		other = self._user("ch-other")
+		self._member(other, by_rule=True, channel=second.raven_channel)
+
+		delete_channel(name=self.ch_map.name)
+
+		self.assertTrue(self._has_channel_member(other, second.raven_channel))
+		self.assertTrue(frappe.db.exists("Raven Channel Mapping", second.name))
+
+
 class TestDeleteNeverTouchesRaven(_StaleFixtureMixin, FrappeTestCase):
 	"""This app deletes its own mappings and rules and nothing else."""
 
