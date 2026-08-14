@@ -209,6 +209,32 @@ def evaluate(rule_type: str, config: dict) -> set[str]:
 - **`triggers`** is a list of doctype names. Dict entries of the form `{"doctype": "..."}` are also
   accepted. A save on any of these doctypes anywhere on the site schedules a resync.
 
+### Who may manage the integration
+
+Every whitelisted endpoint in `api.py` is gated on a **manager role**. `System Manager` always
+qualifies. A host app adds its own admin role with a second hook:
+
+```python
+# my_app/hooks.py
+raven_integration_manager_roles = ["Moderator"]
+```
+
+The gate alone is not the whole story. This app's endpoints create, rename and delete their own
+mapping documents through the framework, which applies DocPerms, so a declared role also needs
+permissions on `Raven Membership Settings`, `Raven Workspace Mapping` and `Raven Channel Mapping`.
+`raven_integration.permissions.sync_manager_docperms` grants them from `after_install`,
+`after_migrate` and `after_app_install` — the last so a host app installed *after* this one is still
+picked up — and `before_uninstall` removes them again. Declaring a role that does not exist yet is
+harmless; it is skipped until it does.
+
+Two consequences worth knowing:
+
+- Granting a role this way creates `Custom DocPerm` rows, and Frappe then ignores the doctypes' own
+  JSON permissions for those three doctypes. Edit permissions through Role Permissions Manager from
+  that point on, not the doctype JSON.
+- A manager role buys no authority inside Raven. Every write to a Raven document is made with
+  `ignore_permissions=True`, because the app only ever touches records it created itself.
+
 ### Trigger caching
 
 The union of all providers' `triggers` is cached in Redis under

@@ -46,6 +46,21 @@ Do **not** add `raven_integration` to `required_apps`. The integration is option
 import and run even when it is not installed (see Step 5). It is `raven_integration` that depends on
 `raven`, not your app that depends on `raven_integration`.
 
+If your app has its own admin role and you want those admins managing the integration — not just
+System Managers — declare it in the same `hooks.py`:
+
+```python
+# my_app/hooks.py
+raven_integration_manager_roles = ["Moderator"]
+```
+
+`raven_integration` grants that role the DocPerms its endpoints need on install/migrate, and revokes
+them on uninstall. This is a separate hook from the provider one on purpose: registering rule types
+should not hand out management rights. Declare it only for a role you are happy to give full control
+of every mapping — there is no per-mapping scoping. Note that if your app's UI already shows the
+Raven settings screen to that role, this hook is not optional; without it every call the screen makes
+answers `PermissionError`.
+
 ## Step 2 — write the provider callable
 
 Create `my_app/raven_provider.py`:
@@ -338,6 +353,8 @@ bench --site $YOUR_SITE run-tests --module my_app.tests.test_raven_provider
 Before you report the integration done, verify every box:
 
 - [ ] `raven_membership_providers` in `hooks.py` points at a real zero-argument callable.
+- [ ] If your app surfaces the Raven settings UI to a non-System-Manager role, that role is declared in
+      `raven_integration_manager_roles`.
 - [ ] `get_provider()` returns a dict with `name`, `rule_types`, `evaluate` (and `label`/`triggers` if
       wanted). `name` is a non-empty string unlikely to collide.
 - [ ] Every `rule_types[].type` your UI can create is handled in `evaluate`.

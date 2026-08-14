@@ -120,7 +120,13 @@ scheduler_events = {
 # Providers are declared in other apps' hooks.py, so the memoized trigger-doctype
 # set goes stale the moment one of those apps arrives or leaves. Both hooks are
 # called with the name of the app being installed/uninstalled.
-after_app_install = ["raven_integration.events.clear_trigger_doctypes_cache"]
+#
+# Manager roles come from other apps' hooks.py too, so a host app installed after
+# this one needs its DocPerms granted at that point rather than at our own install.
+after_app_install = [
+	"raven_integration.events.clear_trigger_doctypes_cache",
+	"raven_integration.permissions.sync_manager_docperms",
+]
 
 # Integration Cleanup
 # -------------------
@@ -310,4 +316,3 @@ raven_membership_providers = []
 # installed_apps order and every failure is logged and swallowed, so a handler
 # can never abort a sweep. Contract and example: see README.md.
 after_raven_member_synced = []
-

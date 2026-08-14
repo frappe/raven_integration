@@ -18,8 +18,12 @@ _MAPPING_LABEL_FIELDS = {
 }
 
 
-def _require_system_manager() -> None:
-	frappe.only_for(["System Manager"])
+def _require_manager() -> None:
+	"""Gate every management endpoint. System Manager, plus any role a host app
+	declares — see raven_integration.permissions.manager_roles."""
+	from raven_integration.permissions import require_manager
+
+	require_manager()
 
 
 def _str(value: Any, field: str) -> str:
@@ -264,10 +268,24 @@ def _rename_raven_workspace(mapping_name: str, label: str) -> None:
 	# mapping, and _relabel_mapping renames the mapping itself right after. Without
 	# this, the reverse handler would rename the mapping first and the caller's own
 	# rename would then fail on a docname that no longer exists.
+	# ignore_permissions like every other Raven-side write in this app: the endpoint
+	# has already authorized the caller, and the app only ever touches the Raven
+	# records it created itself. Without it a manager who is not a Raven admin has
+	# no write permission on Raven Workspace and the rename fails half way through,
+	# after the mapping has been relabelled. frappe.rename_doc does not forward
+	# ignore_permissions, so this goes through the model function directly.
+	from frappe.model.rename_doc import rename_doc
+
 	from raven_integration.sync_service import pushing_to_raven
 
 	with pushing_to_raven():
-		frappe.rename_doc("Raven Workspace", row.raven_workspace, label, show_alert=False)
+		rename_doc(
+			doctype="Raven Workspace",
+			old=row.raven_workspace,
+			new=label,
+			ignore_permissions=True,
+			show_alert=False,
+		)
 
 
 def _rename_raven_channel(mapping_name: str, label: str) -> None:
@@ -462,9 +480,9 @@ def is_setup() -> dict:
 	"""Whether both Raven and this app are installed, plus whether the integration
 	has been enabled (drives the Settings UI gate).
 
-	System Manager only: the reply enumerates installed apps, and every action the
-	Settings panel offers already requires that role."""
-	_require_system_manager()
+	Managers only: the reply enumerates installed apps, and every action the Settings
+	panel offers already requires the same roles."""
+	_require_manager()
 	apps = frappe.get_installed_apps()
 	return {
 		"raven": "raven" in apps,
@@ -476,7 +494,7 @@ def is_setup() -> dict:
 @frappe.whitelist()
 def enable_integration() -> dict:
 	"""Enable membership sync (one-way — there is no disable). Triggers an initial reconcile."""
-	_require_system_manager()
+	_require_manager()
 	frappe.db.set_single_value("Raven Membership Settings", "enabled", 1)
 	frappe.enqueue(
 		"raven_integration.scheduler.reconcile_all", queue="long", enqueue_after_commit=True
@@ -487,7 +505,7 @@ def enable_integration() -> dict:
 @frappe.whitelist()
 def list_providers() -> list:
 	"""Membership providers registered by consumer apps (UI rule-type discovery)."""
-	_require_system_manager()
+	_require_manager()
 	from raven_integration.registry import list_providers as _list
 
 	return _list()
@@ -497,7 +515,7 @@ def list_providers() -> list:
 def list_workspaces() -> list[dict]:
 	"""Every Raven workspace the UI can show: managed mappings first (current order),
 	then unmanaged Raven workspaces re-projected into the same row shape."""
-	_require_system_manager()
+	_require_manager()
 	managed = frappe.get_all(
 		"Raven Workspace Mapping",
 		fields=[
@@ -532,7 +550,7 @@ def list_workspaces() -> list[dict]:
 @frappe.whitelist()
 def get_workspace(name: str) -> dict:
 	"""Full workspace detail for the detail view + edit dialog."""
-	_require_system_manager()
+	_require_manager()
 	name = _str(name, "name")
 	from raven_integration.engine import expected_workspace_members
 
@@ -565,7 +583,7 @@ def create_workspace(
 ) -> str:
 	"""Create a Raven Workspace Mapping. With no label, auto-names 'Workspace N'
 	(next free number) so the UI can add a row in one click."""
-	_require_system_manager()
+	_require_manager()
 	type_ = _choice(type, "type", _VALID_WS_TYPES, _("Invalid workspace type"))
 	rule_rows = _rules_list(rules) if rules else []
 	return _create_mapping(
@@ -593,7 +611,7 @@ def update_workspace(
 ) -> str:
 	"""Update a Raven Workspace Mapping. Returns the docname, which changes when
 	the label changes (the docname is derived from the label)."""
-	_require_system_manager()
+	_require_manager()
 	name = _str(name, "name")
 	label = _str(label, "label")
 	type_ = _choice(type, "type", _VALID_WS_TYPES, _("Invalid workspace type"))
@@ -612,7 +630,7 @@ def delete_workspace(name: str) -> None:
 	channels, members and conversations — is left intact and simply becomes
 	unmanaged; deleting it is Raven's decision to make, not ours.
 	"""
-	_require_system_manager()
+	_require_manager()
 	name = _str(name, "name")
 	frappe.get_doc("Raven Workspace Mapping", name).delete()
 
@@ -620,7 +638,7 @@ def delete_workspace(name: str) -> None:
 @frappe.whitelist()
 def recreate_workspace(name: str) -> str:
 	"""Give a stale Raven Workspace Mapping a fresh backing Raven Workspace."""
-	_require_system_manager()
+	_require_manager()
 	name = _str(name, "name")
 	_require_stale("Raven Workspace Mapping", name)
 	from raven_integration.sync_service import create_raven_workspace_for
@@ -641,7 +659,7 @@ def recreate_workspace(name: str) -> str:
 @frappe.whitelist()
 def set_workspace_enabled(name: str, enabled: bool) -> dict:
 	"""Enable/disable membership sync for a single Raven Workspace Mapping."""
-	_require_system_manager()
+	_require_manager()
 	name = _str(name, "name")
 	enabled = _bool(enabled, "enabled")
 	return _set_mapping_enabled("Raven Workspace Mapping", name, enabled)
@@ -650,7 +668,7 @@ def set_workspace_enabled(name: str, enabled: bool) -> dict:
 @frappe.whitelist()
 def set_workspace_type(name: str, type: str) -> dict:
 	"""Change a Raven Workspace Mapping's visibility (Public/Private)."""
-	_require_system_manager()
+	_require_manager()
 	name = _str(name, "name")
 	type_ = _choice(type, "type", _VALID_WS_TYPES, _("Invalid workspace type"))
 	return _set_mapping_type("Raven Workspace Mapping", "workspace_type", name, type_)
@@ -659,7 +677,7 @@ def set_workspace_type(name: str, type: str) -> dict:
 @frappe.whitelist()
 def set_workspace_label(name: str, label: str) -> dict:
 	"""Rename a Raven Workspace Mapping and its backing Raven Workspace (inline edit)."""
-	_require_system_manager()
+	_require_manager()
 	name = _str(name, "name")
 	label = _str(label, "label")
 	return _relabel_mapping(
@@ -670,7 +688,7 @@ def set_workspace_label(name: str, label: str) -> dict:
 @frappe.whitelist()
 def set_workspace_combinator(name: str, combinator: str) -> dict:
 	"""Change how a Raven Workspace Mapping combines its rules (Any (OR) / All (AND))."""
-	_require_system_manager()
+	_require_manager()
 	name = _str(name, "name")
 	combinator_ = _combinator(combinator)
 	return _set_mapping_combinator("Raven Workspace Mapping", name, combinator_)
@@ -679,7 +697,7 @@ def set_workspace_combinator(name: str, combinator: str) -> dict:
 @frappe.whitelist()
 def set_workspace_rule_status(name: str, rule: str, status: str) -> dict:
 	"""Pause/resume one member rule of a Raven Workspace Mapping."""
-	_require_system_manager()
+	_require_manager()
 	return _set_rule_status("Raven Workspace Mapping", name, rule, status)
 
 
@@ -687,7 +705,7 @@ def set_workspace_rule_status(name: str, rule: str, status: str) -> dict:
 def list_channels(workspace: str) -> list[dict]:
 	"""Every channel in ``workspace`` the UI can show: managed channel mappings first
 	(current order), then unmanaged Raven channels in the backing workspace."""
-	_require_system_manager()
+	_require_manager()
 	workspace = _str(workspace, "workspace")
 	managed = frappe.get_all(
 		"Raven Channel Mapping",
@@ -730,7 +748,7 @@ def list_channels(workspace: str) -> list[dict]:
 @frappe.whitelist()
 def get_channel(name: str) -> dict:
 	"""Full channel detail incl. member rules flattened for the rules panel."""
-	_require_system_manager()
+	_require_manager()
 	name = _str(name, "name")
 	from raven_integration.engine import expected_channel_members
 
@@ -759,7 +777,7 @@ def create_channel(
 ) -> str:
 	"""Create a Raven Channel Mapping. With no label, auto-names 'Channel N'
 	(next free number) so the UI can add a row in one click."""
-	_require_system_manager()
+	_require_manager()
 	workspace = _str(workspace, "workspace")
 	type_ = _choice(type, "type", _VALID_CH_TYPES, _("Invalid channel type"))
 	if not frappe.db.exists("Raven Workspace Mapping", workspace):
@@ -797,7 +815,7 @@ def update_channel(
 ) -> str:
 	"""Update a Raven Channel Mapping. Returns the docname, which changes when the
 	label changes (the docname is derived from the label)."""
-	_require_system_manager()
+	_require_manager()
 	name = _str(name, "name")
 	label = _str(label, "label")
 	type_ = _choice(type, "type", _VALID_CH_TYPES, _("Invalid channel type"))
@@ -815,7 +833,7 @@ def delete_channel(name: str) -> None:
 	Deletes this app's own record only. The backing Raven Channel and its messages
 	are left intact and simply become unmanaged.
 	"""
-	_require_system_manager()
+	_require_manager()
 	name = _str(name, "name")
 	frappe.get_doc("Raven Channel Mapping", name).delete()
 
@@ -823,7 +841,7 @@ def delete_channel(name: str) -> None:
 @frappe.whitelist()
 def recreate_channel(name: str) -> str:
 	"""Give a stale Raven Channel Mapping a fresh backing Raven Channel."""
-	_require_system_manager()
+	_require_manager()
 	name = _str(name, "name")
 	_require_stale("Raven Channel Mapping", name)
 
@@ -855,7 +873,7 @@ def recreate_channel(name: str) -> str:
 @frappe.whitelist()
 def set_channel_enabled(name: str, enabled: bool) -> dict:
 	"""Enable/disable membership sync for a single Raven Channel Mapping."""
-	_require_system_manager()
+	_require_manager()
 	name = _str(name, "name")
 	enabled = _bool(enabled, "enabled")
 	return _set_mapping_enabled("Raven Channel Mapping", name, enabled)
@@ -864,7 +882,7 @@ def set_channel_enabled(name: str, enabled: bool) -> dict:
 @frappe.whitelist()
 def set_channel_type(name: str, type: str) -> dict:
 	"""Change a Raven Channel Mapping's visibility (Public/Private/Open)."""
-	_require_system_manager()
+	_require_manager()
 	name = _str(name, "name")
 	type_ = _choice(type, "type", _VALID_CH_TYPES, _("Invalid channel type"))
 	return _set_mapping_type("Raven Channel Mapping", "channel_type", name, type_)
@@ -873,7 +891,7 @@ def set_channel_type(name: str, type: str) -> dict:
 @frappe.whitelist()
 def set_channel_label(name: str, label: str) -> dict:
 	"""Rename a Raven Channel Mapping and its backing Raven Channel (inline edit)."""
-	_require_system_manager()
+	_require_manager()
 	name = _str(name, "name")
 	label = _str(label, "label")
 	return _relabel_mapping(
@@ -884,7 +902,7 @@ def set_channel_label(name: str, label: str) -> dict:
 @frappe.whitelist()
 def set_channel_combinator(name: str, combinator: str) -> dict:
 	"""Change how a Raven Channel Mapping combines its rules (Any (OR) / All (AND))."""
-	_require_system_manager()
+	_require_manager()
 	name = _str(name, "name")
 	combinator_ = _combinator(combinator)
 	return _set_mapping_combinator("Raven Channel Mapping", name, combinator_)
@@ -893,14 +911,14 @@ def set_channel_combinator(name: str, combinator: str) -> dict:
 @frappe.whitelist()
 def set_channel_rule_status(name: str, rule: str, status: str) -> dict:
 	"""Pause/resume one member rule of a Raven Channel Mapping."""
-	_require_system_manager()
+	_require_manager()
 	return _set_rule_status("Raven Channel Mapping", name, rule, status)
 
 
 @frappe.whitelist()
 def reconcile_now(target_doctype: str, name: str) -> dict:
 	"""Queue a full member re-sync for one mapping."""
-	_require_system_manager()
+	_require_manager()
 	target_doctype = _choice(
 		target_doctype, "target_doctype", set(_MAPPING_LABEL_FIELDS), _("Unsupported sync target")
 	)
@@ -912,7 +930,7 @@ def reconcile_now(target_doctype: str, name: str) -> dict:
 
 @frappe.whitelist()
 def preview_rule(rule: dict) -> dict:
-	_require_system_manager()
+	_require_manager()
 	if not isinstance(rule, dict):
 		frappe.throw(
 			title=_("Invalid rule"),
@@ -943,7 +961,7 @@ def compute_rule_diff(
 	combinator: "str | None" = None,
 ) -> dict:
 	"""Return { added, removed, removed_users } for a proposed change."""
-	_require_system_manager()
+	_require_manager()
 	target_doctype = _choice(
 		target_doctype, "target_doctype", set(_MAPPING_LABEL_FIELDS), _("Unsupported sync target")
 	)
@@ -1014,7 +1032,7 @@ def list_unmapped_workspaces() -> list[dict]:
 
 	Uses frappe.qb with a NOT IN over the mappings' non-null raven_workspace links
 	(specs/security.md §2 — no raw SQL)."""
-	_require_system_manager()
+	_require_manager()
 	RW = frappe.qb.DocType("Raven Workspace")
 	RWM = frappe.qb.DocType("Raven Workspace Mapping")
 	mapped = (
@@ -1042,7 +1060,7 @@ def link_workspace(
 	unique raven_workspace constraint (not an exists-then-insert) enforces one
 	mapping per Raven workspace — a second attempt surfaces as 'already managed'.
 	Returns the new mapping's docname."""
-	_require_system_manager()
+	_require_manager()
 	raven_workspace = _str(raven_workspace, "raven_workspace")
 	combinator_ = _combinator(combinator)
 	rule_rows = _rules_list(rules) if rules else []
@@ -1087,7 +1105,7 @@ def list_unmapped_channels(workspace: str) -> list[dict]:
 
 	Direct-message and thread channels are excluded — only regular channels are
 	adoptable. frappe.qb only."""
-	_require_system_manager()
+	_require_manager()
 	workspace = _str(workspace, "workspace")
 	_require_mapping("Raven Workspace Mapping", workspace)
 	raven_workspace = frappe.db.get_value(
@@ -1126,7 +1144,7 @@ def link_channel(
 	pointed at the supplied id. The unique raven_channel constraint enforces one
 	mapping per Raven channel — a second attempt surfaces as 'already managed'.
 	Returns the new mapping's docname."""
-	_require_system_manager()
+	_require_manager()
 	workspace = _str(workspace, "workspace")
 	raven_channel = _str(raven_channel, "raven_channel")
 	combinator_ = _combinator(combinator)

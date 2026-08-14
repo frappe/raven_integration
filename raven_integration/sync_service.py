@@ -216,10 +216,27 @@ def sync_workspace_members(workspace_name: str, *, cache: dict | None = None) ->
 	)
 
 
+def _ensure_creator_is_a_raven_user() -> None:
+	"""Provision the acting user in Raven before creating a workspace or channel.
+
+	Raven makes whoever creates one its first admin — Raven Workspace.after_insert
+	and Raven Channel.after_insert both insert a member row for the session user —
+	and those rows link to Raven User, not User. A manager who is not a Raven user
+	yet (LMS's Moderator role has desk_access = 0, so such a user is a Website User
+	and Raven's auto-add for System Users never fires) would otherwise fail the
+	create with "Could not find User". Provisioning is what this app already does for
+	every member it adds.
+	"""
+	if frappe.session.user in ("Guest", "Administrator"):
+		return
+	ensure_raven_user(frappe.session.user)
+
+
 def create_raven_workspace_for(ws_map) -> None:
 	"""Called from RavenWorkspaceMapping.before_insert to create the backing Raven Workspace."""
 	if not raven_installed():
 		raise RavenNotInstalledError("Raven is not installed on this site")
+	_ensure_creator_is_a_raven_user()
 	try:
 		with pushing_to_raven():
 			rw = _insert_unique_raven_doc(
@@ -237,6 +254,7 @@ def create_raven_channel_for(ch_map) -> None:
 	"""Called from RavenChannelMapping.before_insert to create the backing Raven Channel."""
 	if not raven_installed():
 		raise RavenNotInstalledError("Raven is not installed on this site")
+	_ensure_creator_is_a_raven_user()
 	parent = frappe.get_doc("Raven Workspace Mapping", ch_map.workspace)
 	if not parent.raven_workspace:
 		raise RavenAPIError(f"Parent workspace {parent.name} has no Raven workspace link")

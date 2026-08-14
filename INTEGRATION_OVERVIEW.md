@@ -171,7 +171,7 @@ This is what makes the app reusable across LMS, CRM, or anything else.
 - **Idempotent / race-safe.** Concurrent runs (nightly + event at once) can't double-add or crash — database uniqueness constraints catch the loser, and it's treated as already-done.
 - **Fail-safe events.** The "on every save" handler can never break an unrelated document save; errors are logged, not raised.
 - **Per-record error isolation.** If one mapping fails during a sweep, the others still complete; the failure is logged.
-- **Admin-only.** Every management action requires the **System Manager** role, with strict input-type checks.
+- **Admin-only.** Every management action requires a **manager role**, with strict input-type checks. **System Manager** always qualifies; a host app adds its own admin role through the `raven_integration_manager_roles` hook (LMS declares `Moderator`), and this app grants that role the permissions its endpoints need at install/migrate time. Nothing else in Raven is handed out with it — the app writes to Raven with its own authority, not the caller's.
 
 ---
 

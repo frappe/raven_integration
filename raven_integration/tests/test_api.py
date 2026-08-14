@@ -265,7 +265,7 @@ class TestWorkspaceAPI(FrappeTestCase):
 			)
 		)
 
-		# Runs as Administrator (a System Manager), satisfying _require_system_manager.
+		# Runs as Administrator (a System Manager), satisfying _require_manager.
 		delete_workspace(name=ws.name)
 
 		self.assertFalse(frappe.db.exists("Raven Workspace Mapping", ws.name))
