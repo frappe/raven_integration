@@ -803,6 +803,79 @@ class TestWithdrawalCannotOrphanTheWorkspaceAdmin(_ManagedPairMixin, FrappeTestC
 		)
 
 
+class TestTheWorkspaceSweepClaimsNothingItDidNotAdd(_ManagedPairMixin, FrappeTestCase):
+	"""The workspace pass carries no rules: its expected set is every channel member.
+
+	That says who is in a channel, not who this app put there, so a row it finds
+	is not evidence of anything it can later withdraw.
+	"""
+
+	def setUp(self):
+		self._setUp_managed()
+
+	def _added_by_rule(self, user: str):
+		return frappe.db.get_value(
+			"Raven Workspace Member", {"workspace": self.raven_workspace, "user": user}, "added_by_rule"
+		)
+
+	def test_a_hand_added_workspace_row_is_not_claimed(self):
+		alice = self._user("hand-claim")
+		self._channel_row(alice, by_rule=False)
+		self._workspace_row(alice, by_rule=False)
+
+		sync_workspace_members(self.ws_map.name)
+
+		self.assertEqual(self._added_by_rule(alice), 0)
+
+	def test_the_owners_admin_row_is_not_claimed(self):
+		"""Raven Workspace.create_member_for_owner wrote this row, not the app."""
+		sync_workspace_members(self.ws_map.name)
+
+		self.assertEqual(self._added_by_rule(frappe.session.user), 0)
+
+	def test_a_hand_added_workspace_row_survives_losing_its_channel(self):
+		alice = self._user("hand-survive")
+		self._channel_row(alice, by_rule=False)
+		self._workspace_row(alice, by_rule=False)
+
+		sync_workspace_members(self.ws_map.name)
+		# A human takes her out of the channel from inside Raven.
+		frappe.db.delete("Raven Channel Member", {"channel_id": self.raven_channel, "user_id": alice})
+		sync_workspace_members(self.ws_map.name)
+
+		self.assertTrue(
+			self._has_workspace_row(alice),
+			"the app never added this row, so no sweep of its own may remove it",
+		)
+
+	def test_a_second_sweep_adds_nothing(self):
+		"""Rows it will not claim must not be re-added on every sweep either.
+
+		Raven answers a duplicate insert with a thrown ValidationError, which lands
+		in the message log of whatever request drove the sweep.
+		"""
+		alice = self._user("idempotent")
+		self._channel_row(alice, by_rule=False)
+		self._workspace_row(alice, by_rule=False)
+
+		sync_workspace_members(self.ws_map.name)
+		second = sync_workspace_members(self.ws_map.name)
+
+		self.assertEqual(second, {"added": 0, "removed": 0})
+
+	def test_a_rule_added_member_is_still_withdrawn_when_their_last_channel_goes(self):
+		"""The contrast: what the app did add, it still takes back."""
+		bob = self._user("rule-sweep")
+		self._channel_row(bob, by_rule=True)
+		self._workspace_row(bob, by_rule=True)
+
+		frappe.db.delete("Raven Channel Member", {"channel_id": self.raven_channel, "user_id": bob})
+		result = sync_workspace_members(self.ws_map.name)
+
+		self.assertEqual(result["removed"], 1)
+		self.assertFalse(self._has_workspace_row(bob))
+
+
 class TestWithdrawalLeavesTheChannelOpen(_ManagedPairMixin, FrappeTestCase):
 	"""Raven archives a private channel whose last member leaves.
 

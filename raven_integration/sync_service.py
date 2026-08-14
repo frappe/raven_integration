@@ -57,6 +57,8 @@ def _adopt_existing_member(member_doctype: str, filters: dict) -> None:
 
 	Without this, a user who joined manually before a rule started matching them
 	would keep added_by_rule=0 and never be removed when the rule stops matching.
+	Only the channel side claims: there a rule has named the user, which is what
+	makes the row the rule's to withdraw later. See add_workspace_member.
 	"""
 	name = frappe.db.exists(member_doctype, filters)
 	if name and not frappe.db.get_value(member_doctype, name, "added_by_rule"):
@@ -263,7 +265,14 @@ def remove_channel_member(channel: str, user: str) -> None:
 
 
 def add_workspace_member(workspace: str, user: str) -> None:
-	"""Add user to a Raven Workspace, flagging the row as rule-managed."""
+	"""Add user to a Raven Workspace, flagging the row as rule-managed.
+
+	A row that is already there is left exactly as it is, unlike the channel one.
+	Nothing here is evidence that this app should own it: workspace membership is
+	derived from channel membership, so the only thing being in a channel says
+	about a workspace row somebody else wrote — a hand-added member, or the admin
+	row Raven writes for whoever created the workspace — is that it should stay.
+	"""
 	if not raven_installed():
 		return
 	ensure_raven_user(user)
@@ -274,7 +283,7 @@ def add_workspace_member(workspace: str, user: str) -> None:
 	except (frappe.UniqueValidationError, frappe.ValidationError):
 		# Raven raises a bare ValidationError for its own duplicate-member check,
 		# so this catch is broader than the channel one.
-		_adopt_existing_member("Raven Workspace Member", {"workspace": workspace, "user": user})
+		return
 
 
 def remove_workspace_member(workspace: str, user: str) -> None:
@@ -297,16 +306,24 @@ def _sync_rule_managed_members(
 	add,
 	remove,
 	rule_gated: bool = True,
+	claims_existing: bool = True,
 	after_synced=None,
 	cache: dict | None = None,
 ) -> dict:
 	"""Diff-apply one mapping's rule-managed membership onto its Raven record.
 
-	``rule_gated`` is off for a workspace, which carries no rules: its membership is
-	derived from its channels, so the two rule guards below — skip when nothing is
-	active, freeze whoever a disabled rule put here — have nothing to read and no
-	meaning. Everything else about the diff, including the added_by_rule safety rule,
-	is identical on both paths.
+	Both switches are off for a workspace, which carries no rules:
+
+	``rule_gated`` — its membership is derived from its channels, so the two rule
+	guards below (skip when nothing is active, freeze whoever a disabled rule put
+	here) have nothing to read and no meaning.
+
+	``claims_existing`` — the expected set is every channel member, which says who
+	is in a channel and nothing about who put them there, so a row already sitting
+	in the workspace is not this app's to claim. Excluding those rows from the diff
+	is also what stops the sweep re-proposing them forever: the insert would fail
+	Raven's duplicate check every time, and the throw lands in the message log of
+	whatever request drove the sweep.
 	"""
 	if not raven_installed():
 		return {"skipped": True, "reason": "raven_not_installed"}
@@ -332,7 +349,14 @@ def _sync_rule_managed_members(
 	)
 	# Members a disabled rule put here stay put; it just stops granting membership.
 	frozen = current_rule_managed & disabled_rule_members(mapping.member_rules_json) if rule_gated else set()
-	to_add = expected - current_rule_managed
+	already_there = (
+		current_rule_managed
+		if claims_existing
+		else set(
+			frappe.get_all(member_doctype, filters={member_link_field: raven_record}, pluck=member_user_field)
+		)
+	)
+	to_add = expected - already_there
 	to_remove = current_rule_managed - expected - frozen
 	for u in to_add:
 		add(raven_record, u)
@@ -389,6 +413,7 @@ def sync_workspace_members(workspace_name: str, *, cache: dict | None = None) ->
 		add=add_workspace_member,
 		remove=remove_workspace_member,
 		rule_gated=False,
+		claims_existing=False,
 		cache=cache,
 	)
 
