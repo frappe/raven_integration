@@ -626,11 +626,13 @@ class TestDeleteNeverTouchesRaven(_StaleFixtureMixin, FrappeTestCase):
 
 
 class TestNightlySweepDoesNotBlockRecreate(_StaleFixtureMixin, FrappeTestCase):
-	"""The nightly backstop must mark mappings stale, never clear `enabled`.
+	"""The nightly backstop must mark mappings stale and change nothing else.
 
 	detect_dangling_links used to clear `enabled`, and recreate_* only clears
 	`stale` — so within 24h of any Raven-side delete, recreating the record left
-	the mapping disabled and it silently never resumed syncing.
+	the mapping disabled and it silently never resumed syncing. A workspace has no
+	`enabled` of its own now, so what is pinned here is that the sweep touches
+	`stale` alone.
 	"""
 
 	def setUp(self):
@@ -639,18 +641,15 @@ class TestNightlySweepDoesNotBlockRecreate(_StaleFixtureMixin, FrappeTestCase):
 	def tearDown(self):
 		self._tearDown_mappings()
 
-	def test_sweep_marks_stale_and_leaves_enabled_alone(self):
+	def test_sweep_marks_stale_and_nothing_else(self):
 		from raven_integration.scheduler import detect_dangling_links
 
 		self._delete_raven_workspace()
 		frappe.db.set_value("Raven Workspace Mapping", self.ws_map.name, "stale", 0)
 		result = detect_dangling_links()
 		self.assertGreaterEqual(result.get("flagged_stale", 0), 1)
-		stale, enabled = frappe.db.get_value(
-			"Raven Workspace Mapping", self.ws_map.name, ["stale", "enabled"]
-		)
+		stale = frappe.db.get_value("Raven Workspace Mapping", self.ws_map.name, "stale")
 		self.assertEqual(stale, 1)
-		self.assertEqual(enabled, 1, "the sweep must not disable — recreate only clears stale")
 
 	def test_recreate_after_the_sweep_resumes_syncing(self):
 		from raven_integration.api import recreate_workspace

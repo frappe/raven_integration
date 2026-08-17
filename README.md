@@ -47,7 +47,8 @@ tickets. It asks a *provider* — another installed app that registers itself th
   a channel mapping, on that channel — because those people are in there only on the authority of
   rules that are being deleted. Rows a human added are flagged as such and stay, as everywhere else.
 - **Enabling is one-way.** There is an `enable_integration` endpoint and no global disable, so no
-  single click can mass-evict members. Disable individual mappings instead (clear `enabled`).
+  single click can mass-evict members. Disable individual channel mappings instead (clear
+  `enabled`); a workspace has none, and empties out when its channels are switched off.
 - **A mapping with no active rules is unmanaged, not empty.** Deleting or pausing the last rule
   makes sync skip the mapping (`reason: "no_active_rules"`) rather than evicting everyone.
 - **Errors are isolated.** The wildcard document handler never raises into an unrelated save, and a
@@ -81,7 +82,7 @@ frappe.call("raven_integration.api.enable_integration")
 
 | Doctype | Kind | Purpose |
 |---|---|---|
-| **Raven Workspace Mapping** | Document | A managed Raven workspace. `workspace_label`, `workspace_type` (Public/Private), `enabled`, `stale` (read-only), and a read-only `raven_workspace` link to the Raven workspace it created. Named `RWM-{workspace_label}`. |
+| **Raven Workspace Mapping** | Document | A managed Raven workspace. `workspace_label`, `workspace_type` (Public/Private), `stale` (read-only), and a read-only `raven_workspace` link to the Raven workspace it created. Named `RWM-{workspace_label}`. Carries no `enabled`: its membership is derived from its channels, so switching those off is what stops it syncing. |
 | **Raven Channel Mapping** | Document | A managed channel inside a mapped workspace. `channel_label`, `workspace` (link to the workspace mapping), `channel_type` (Public/Private/Open), `enabled`, `stale` (read-only), `member_rules_json` (the condition tree), and a read-only `raven_channel` link. Named `RCM-{channel_label}`. |
 | **Raven Membership Rule** | Child table | One rule row: `label`, `provider`, `rule_type`, `status` (Active/Paused), and `config` (JSON, opaque to this app — only the provider interprets it). |
 | **Raven Membership Settings** | Single | One `enabled` switch that gates the whole integration. |
@@ -89,9 +90,9 @@ frappe.call("raven_integration.api.enable_integration")
 All three non-child doctypes are System Manager-only.
 
 Two flags stop a mapping from syncing, and they mean different things. A cleared `enabled` is an admin's
-choice — pause this mapping. `stale` is a fact the app discovered — the Raven workspace/channel this
-mapping pointed at no longer exists (see [Stale mappings](#stale-mappings)). `stale` is read-only:
-it is set and cleared by the app, never by hand.
+choice — pause this channel; only a channel mapping carries it. `stale` is a fact the app discovered —
+the Raven workspace/channel this mapping pointed at no longer exists (see
+[Stale mappings](#stale-mappings)). `stale` is read-only: it is set and cleared by the app, never by hand.
 
 Creating a mapping **creates a new** Raven workspace/channel behind it (with a uniqueness-safe name);
 it never adopts an existing one. Deleting a workspace mapping cascades to its channel mappings, and
@@ -310,7 +311,7 @@ Manager role.
 | `list_workspaces` / `get_workspace` | List and detail (incl. member count and `stale`). A workspace holds no conditions. |
 | `create_workspace` / `update_workspace` / `delete_workspace` | CRUD. `delete_workspace` removes the mapping, its child channel mappings and the membership their rules granted; the Raven workspace is never deleted. |
 | `recreate_workspace` | For a stale mapping: create a fresh Raven workspace from the stored label, repoint the link, clear `stale`. Returns the new Raven workspace name. |
-| `set_workspace_enabled` / `set_workspace_type` / `set_workspace_label` | Inline edits. Enabling re-syncs in the background. |
+| `set_workspace_type` / `set_workspace_label` | Inline edits. There is no `set_workspace_enabled`: a workspace mapping has no on/off, because its membership is derived from its channels. |
 | `list_channels` / `get_channel` | List and detail, incl. `stale`. `get_channel` serves the condition tree as `rules`, each leaf annotated with the `matches` label its provider declares. |
 | `create_channel` / `update_channel` / `delete_channel` | CRUD; `rules` is the condition tree. `delete_channel` removes the mapping and the membership its rules granted; the Raven channel is never deleted. |
 | `recreate_channel` | For a stale mapping: create a fresh Raven channel from the stored label, repoint the link, clear `stale`. Returns the new Raven channel name. |

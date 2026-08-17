@@ -23,9 +23,9 @@ def detect_dangling_links() -> dict:
 
 	The on_trash hook is the primary signal, but it is fail-safe and is bypassed
 	entirely by frappe.db.delete, bulk deletes and app uninstalls, so this sweep is
-	the backstop. It sets `stale`, never clears `enabled`: `enabled` is the user's own
-	choice to stop syncing, and recreating a Raven record clears only `stale` — so
-	disabling here would leave a recreated mapping silently unsynced.
+	the backstop. It sets `stale`, never clears a channel's `enabled`: that flag is
+	the user's own choice to stop syncing, and recreating a Raven record clears only
+	`stale` — so disabling here would leave a recreated mapping silently unsynced.
 	"""
 	if not raven_installed():
 		return {"skipped": True}

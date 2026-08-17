@@ -557,15 +557,6 @@ def _update_mapping(
 	return new_name
 
 
-def _set_mapping_enabled(doctype: str, name: str, enabled: bool) -> dict:
-	"""Shared body of set_workspace_enabled / set_channel_enabled."""
-	_require_mapping(doctype, name)
-	frappe.db.set_value(doctype, name, "enabled", 1 if enabled else 0)
-	if enabled:
-		_enqueue_member_sync(doctype, name)
-	return {"enabled": enabled}
-
-
 def _set_mapping_type(doctype: str, field: str, name: str, type_: str) -> dict:
 	"""Shared body of set_workspace_type / set_channel_type. Saves through the doc
 	(not db.set_value) so the controller's on_update carries the new visibility onto
@@ -726,14 +717,14 @@ def list_workspaces() -> list[dict]:
 			"workspace_label",
 			"workspace_type",
 			"raven_workspace",
-			"enabled",
 			"stale",
 		],
-		# By creation, never `modified`: the UI reloads this list after every inline
-		# edit, so ordering by `modified` sends the edited row to the top and shifts
-		# every row under the pointer. Toggling one row's switch then reads as having
-		# toggled its neighbour. Creation still puts a freshly created row first,
-		# which is where the create flow expects to find and select it.
+		# By creation, never `modified`: the UI reloads this list after every edit,
+		# so ordering by `modified` would send the edited row to the top and shift
+		# every row under the pointer — an edit made from the row menu would land
+		# somewhere else by the time the list came back. Creation still puts a
+		# freshly created row first, which is where the create flow expects to find
+		# and select it.
 		order_by="creation desc",
 	)
 	counts = _channel_counts([row["name"] for row in managed])
@@ -747,7 +738,6 @@ def list_workspaces() -> list[dict]:
 			"workspace_label": w["workspace_name"],
 			"workspace_type": w["type"],
 			"raven_workspace": w["name"],
-			"enabled": 1,
 			"stale": 0,
 			# Nothing is managed under an unadopted workspace, so a count of 0 would
 			# read as "this workspace has no channels". It has none *here*.
@@ -772,7 +762,6 @@ def get_workspace(name: str) -> dict:
 		"name": doc.name,
 		"workspace_label": doc.workspace_label,
 		"workspace_type": doc.workspace_type,
-		"enabled": doc.enabled,
 		"stale": doc.stale,
 		"raven_workspace": doc.raven_workspace,
 		"creation": doc.creation,
@@ -915,15 +904,6 @@ def recreate_workspace(name: str) -> str:
 	)
 	_enqueue_member_sync("Raven Workspace Mapping", name)
 	return doc.raven_workspace
-
-
-@frappe.whitelist()
-def set_workspace_enabled(name: str, enabled: bool) -> dict:
-	"""Enable/disable membership sync for a single Raven Workspace Mapping."""
-	_require_manager()
-	name = _str(name, "name")
-	enabled = _bool(enabled, "enabled")
-	return _set_mapping_enabled("Raven Workspace Mapping", name, enabled)
 
 
 @frappe.whitelist()
@@ -1125,11 +1105,20 @@ def recreate_channel(name: str) -> str:
 
 @frappe.whitelist()
 def set_channel_enabled(name: str, enabled: bool) -> dict:
-	"""Enable/disable membership sync for a single Raven Channel Mapping."""
+	"""Enable/disable membership sync for a single Raven Channel Mapping.
+
+	A channel is the only thing that carries this. Its parent workspace has no
+	on/off of its own: workspace membership is derived from whoever is in the
+	channels, so switching the channels off is what stops a workspace syncing.
+	"""
 	_require_manager()
 	name = _str(name, "name")
 	enabled = _bool(enabled, "enabled")
-	return _set_mapping_enabled("Raven Channel Mapping", name, enabled)
+	_require_mapping("Raven Channel Mapping", name)
+	frappe.db.set_value("Raven Channel Mapping", name, "enabled", 1 if enabled else 0)
+	if enabled:
+		_enqueue_member_sync("Raven Channel Mapping", name)
+	return {"enabled": enabled}
 
 
 @frappe.whitelist()

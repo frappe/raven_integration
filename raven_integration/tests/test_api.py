@@ -673,7 +673,11 @@ class TestComputeRuleDiff(FrappeTestCase):
 
 
 class TestMappingEnabledToggle(FrappeTestCase):
-	"""set_workspace_enabled / set_channel_enabled — per-mapping disabled flag."""
+	"""set_channel_enabled — the per-channel disabled flag.
+
+	A workspace mapping has no counterpart: its membership is derived from its
+	channels, so switching those off is what stops it syncing.
+	"""
 
 	def setUp(self):
 		self.non_admin = frappe.get_doc(
@@ -703,16 +707,14 @@ class TestMappingEnabledToggle(FrappeTestCase):
 		self.channel = ch.name
 		self.addCleanup(lambda: frappe.delete_doc("Raven Channel Mapping", self.channel, force=True))
 
-	def test_set_workspace_enabled_toggles_enabled_flag(self):
-		from raven_integration.api import set_workspace_enabled
+	def test_workspace_mapping_carries_no_enabled_field(self):
+		# The endpoint is gone and so is the field it wrote. Pinned as a field-level
+		# assertion rather than an import check so it fails if the column comes back
+		# through the doctype JSON without an endpoint attached.
+		from raven_integration import api
 
-		result = set_workspace_enabled(name=self.workspace, enabled=False)
-		self.assertFalse(result["enabled"])
-		self.assertEqual(frappe.db.get_value("Raven Workspace Mapping", self.workspace, "enabled"), 0)
-
-		result = set_workspace_enabled(name=self.workspace, enabled=True)
-		self.assertTrue(result["enabled"])
-		self.assertEqual(frappe.db.get_value("Raven Workspace Mapping", self.workspace, "enabled"), 1)
+		self.assertNotIn("enabled", frappe.get_meta("Raven Workspace Mapping").get_valid_columns())
+		self.assertFalse(hasattr(api, "set_workspace_enabled"))
 
 	def test_set_channel_enabled_toggles_enabled_flag(self):
 		from raven_integration.api import set_channel_enabled
@@ -725,27 +727,17 @@ class TestMappingEnabledToggle(FrappeTestCase):
 		self.assertTrue(result["enabled"])
 		self.assertEqual(frappe.db.get_value("Raven Channel Mapping", self.channel, "enabled"), 1)
 
-	def test_set_workspace_enabled_rejects_non_bool(self):
-		from raven_integration.api import set_workspace_enabled
+	def test_set_channel_enabled_rejects_non_bool(self):
+		from raven_integration.api import set_channel_enabled
 
 		with self.assertRaises((frappe.ValidationError, frappe.exceptions.FrappeTypeError)):
-			set_workspace_enabled(name=self.workspace, enabled="nope")
+			set_channel_enabled(name=self.channel, enabled="nope")
 
 	def test_set_channel_enabled_rejects_non_string_name(self):
 		from raven_integration.api import set_channel_enabled
 
 		with self.assertRaises((frappe.ValidationError, frappe.exceptions.FrappeTypeError)):
 			set_channel_enabled(name=42, enabled=True)
-
-	def test_set_workspace_enabled_requires_system_manager(self):
-		from raven_integration.api import set_workspace_enabled
-
-		frappe.set_user(self.non_admin.name)
-		try:
-			with self.assertRaises(frappe.PermissionError):
-				set_workspace_enabled(name=self.workspace, enabled=True)
-		finally:
-			frappe.set_user("Administrator")
 
 	def test_set_channel_enabled_requires_system_manager(self):
 		from raven_integration.api import set_channel_enabled
@@ -1101,12 +1093,6 @@ class TestDefaultLabelAllocation(FrappeTestCase):
 class TestMissingMappingFailsLoudly(FrappeTestCase):
 	"""db.set_value on a missing row is a silent no-op — every set_* endpoint must
 	reject an unknown name instead of reporting a change that never landed."""
-
-	def test_set_workspace_enabled_rejects_unknown_name(self):
-		from raven_integration.api import set_workspace_enabled
-
-		with self.assertRaises(frappe.DoesNotExistError):
-			set_workspace_enabled(name="RWM-does-not-exist", enabled=True)
 
 	def test_set_workspace_type_rejects_unknown_name(self):
 		from raven_integration.api import set_workspace_type
@@ -2015,7 +2001,7 @@ class TestLinkExisting(FrappeTestCase):
 		self.assertEqual(row["workspace_label"], self.raven_ws)
 		self.assertEqual(row["workspace_type"], "Public")
 		self.assertNotIn("rule_combinator", row)
-		self.assertEqual(row["enabled"], 1)
+		self.assertNotIn("enabled", row)
 		self.assertEqual(row["stale"], 0)
 
 	def test_list_workspaces_managed_row_carries_flag_and_fields(self):
@@ -2030,9 +2016,10 @@ class TestLinkExisting(FrappeTestCase):
 		row = mapped[0]
 		self.assertTrue(row["mapped"])
 		self.assertEqual(row["name"], name)
-		for field in ("workspace_label", "workspace_type", "raven_workspace", "enabled", "stale"):
+		for field in ("workspace_label", "workspace_type", "raven_workspace", "stale"):
 			self.assertIn(field, row)
 		self.assertNotIn("rule_combinator", row)
+		self.assertNotIn("enabled", row)
 
 	def test_list_workspaces_counts_the_channels_it_manages(self):
 		"""The Channels column reads a real count, not the length of a list the UI
@@ -2081,10 +2068,9 @@ class TestLinkExisting(FrappeTestCase):
 
 	def test_list_workspaces_order_survives_an_edit(self):
 		"""Row order must not depend on `modified`. The UI reloads this list after every
-		inline edit, so a row that jumps to the top on being edited drags every row
-		below it up one — and a click on a row's Enabled switch then reads as having
-		toggled its neighbour."""
-		from raven_integration.api import list_workspaces, set_workspace_enabled
+		edit, so a row that jumps to the top on being edited drags every row below it
+		up one, and the row under the pointer is no longer the row that was there."""
+		from raven_integration.api import list_workspaces, set_workspace_type
 
 		names = []
 		for i in range(3):
@@ -2102,7 +2088,7 @@ class TestLinkExisting(FrappeTestCase):
 		before = order()
 		# The oldest of the three, so it sits last under any newest-first order and has
 		# the furthest to jump.
-		set_workspace_enabled(name=names[0], enabled=False)
+		set_workspace_type(name=names[0], type="Public")
 		self.assertEqual(order(), before, "editing a row must not move it in the list")
 
 	def test_list_channels_order_survives_an_edit(self):

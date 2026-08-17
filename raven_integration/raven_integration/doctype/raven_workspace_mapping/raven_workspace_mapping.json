@@ -8,7 +8,6 @@
   "workspace_label",
   "workspace_type",
   "raven_workspace",
-  "enabled",
   "stale"
  ],
  "fields": [
@@ -33,13 +32,6 @@
    "options": "Raven Workspace",
    "read_only": 1,
    "unique": 1
-  },
-  {
-   "default": "1",
-   "description": "Sync only touches enabled records. Cleared when the underlying Raven workspace is missing.",
-   "fieldname": "enabled",
-   "fieldtype": "Check",
-   "label": "Enabled"
   },
   {
    "default": "0",

@@ -77,9 +77,10 @@ class TestReconcile(FrappeTestCase):
 class TestDanglingLinks(FrappeTestCase):
 	"""Tests for detect_dangling_links(): stale-on-missing-Raven-doc behaviour.
 
-	It must set `stale`, never clear `enabled` — `enabled` is the user's own choice
-	to keep syncing, and recreate only clears `stale`, so disabling here would
-	leave a recreated mapping silently unsynced."""
+	It must set `stale` and nothing else. A workspace mapping has no `enabled` to
+	clear; a channel's is the user's own choice to keep syncing, and recreate only
+	clears `stale`, so disabling here would leave a recreated mapping silently
+	unsynced."""
 
 	def setUp(self):
 		if "raven" not in frappe.get_installed_apps():
@@ -106,15 +107,12 @@ class TestDanglingLinks(FrappeTestCase):
 				1,
 				"detect_dangling_links must flag at least one record",
 			)
-			stale, enabled = frappe.db.get_value("Raven Workspace Mapping", ws_map.name, ["stale", "enabled"])
+			stale = frappe.db.get_value("Raven Workspace Mapping", ws_map.name, "stale")
 			self.assertEqual(stale, 1, "mapping with a missing Raven Workspace must be marked stale=1")
-			self.assertEqual(
-				enabled, 1, "the sweep must not disable the mapping — recreate only clears stale"
-			)
 		finally:
 			frappe.db.delete("Raven Workspace Mapping", {"name": ws_map.name})
 
-	def test_active_workspace_with_valid_link_not_disabled(self):
+	def test_workspace_with_valid_link_is_not_marked_stale(self):
 		"""A Raven Workspace Mapping whose raven_workspace exists is left untouched."""
 		suffix = frappe.generate_hash(length=6)
 
@@ -137,11 +135,11 @@ class TestDanglingLinks(FrappeTestCase):
 
 		try:
 			detect_dangling_links()
-			enabled = frappe.db.get_value("Raven Workspace Mapping", ws_map.name, "enabled")
+			stale = frappe.db.get_value("Raven Workspace Mapping", ws_map.name, "stale")
 			self.assertNotEqual(
-				enabled,
-				0,
-				"Raven Workspace Mapping with a valid Raven Workspace link must NOT be disabled",
+				stale,
+				1,
+				"Raven Workspace Mapping with a valid Raven Workspace link must NOT be marked stale",
 			)
 		finally:
 			frappe.db.delete("Raven Workspace Mapping", {"name": ws_map.name})

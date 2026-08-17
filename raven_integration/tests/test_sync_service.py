@@ -439,7 +439,9 @@ class TestDerivedWorkspaceSync(unittest.TestCase):
 
 	def _sync_workspace(self, derived):
 		ws = frappe._dict(member_rules_json=None, stale=0)
-		values = {"enabled": 1, "raven_workspace": "RW-1"}
+		# No `enabled`: a workspace mapping has no such field, and the sync path is
+		# not gated on one — a KeyError here would mean it started reading it again.
+		values = {"raven_workspace": "RW-1"}
 		with (
 			patch("raven_integration.sync_service.raven_installed", return_value=True),
 			patch(

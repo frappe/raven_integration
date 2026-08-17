@@ -307,12 +307,13 @@ def _sync_rule_managed_members(
 	remove,
 	rule_gated: bool = True,
 	claims_existing: bool = True,
+	enabled_gated: bool = True,
 	after_synced=None,
 	cache: dict | None = None,
 ) -> dict:
 	"""Diff-apply one mapping's rule-managed membership onto its Raven record.
 
-	Both switches are off for a workspace, which carries no rules:
+	All three switches are off for a workspace, which carries no rules:
 
 	``rule_gated`` — its membership is derived from its channels, so the two rule
 	guards below (skip when nothing is active, freeze whoever a disabled rule put
@@ -324,10 +325,15 @@ def _sync_rule_managed_members(
 	is also what stops the sweep re-proposing them forever: the insert would fail
 	Raven's duplicate check every time, and the throw lands in the message log of
 	whatever request drove the sweep.
+
+	``enabled_gated`` — a workspace mapping has no ``enabled`` field to read. Only
+	a channel can be switched off, and switching every channel off is what stops a
+	workspace: its derived membership empties out because the channels stop
+	feeding it, not because the workspace itself was ever gated.
 	"""
 	if not raven_installed():
 		return {"skipped": True, "reason": "raven_not_installed"}
-	if not frappe.db.get_value(mapping_doctype, mapping_name, "enabled"):
+	if enabled_gated and not frappe.db.get_value(mapping_doctype, mapping_name, "enabled"):
 		return {"skipped": True, "reason": "disabled"}
 	from raven_integration.engine import disabled_rule_members, has_active_rules
 
@@ -414,6 +420,7 @@ def sync_workspace_members(workspace_name: str, *, cache: dict | None = None) ->
 		remove=remove_workspace_member,
 		rule_gated=False,
 		claims_existing=False,
+		enabled_gated=False,
 		cache=cache,
 	)
 

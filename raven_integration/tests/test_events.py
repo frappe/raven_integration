@@ -52,12 +52,14 @@ class TestResyncAll(FrappeTestCase):
 		"""Fake frappe.get_all. ``channels`` is a list of (name, parent workspace) pairs."""
 
 		def fake(doctype, **kw):
-			# Contract: the sweep only ever pulls active (enabled=1) mappings.
-			self.assertEqual(kw.get("filters"), {"enabled": 1})
 			if "Channel" in doctype:
-				# The parent mapping is needed to skip orphaned channels.
+				# Contract: only enabled channels are swept, and the parent mapping is
+				# pulled with them so an orphaned channel can be skipped.
+				self.assertEqual(kw.get("filters"), {"enabled": 1})
 				self.assertEqual(kw.get("fields"), ["name", "workspace"])
 				return [frappe._dict(name=n, workspace=w) for n, w in channels]
+			# Workspaces are pulled unfiltered: a workspace mapping has no `enabled`.
+			self.assertIsNone(kw.get("filters"))
 			return list(workspaces)
 
 		return fake
@@ -81,7 +83,7 @@ class TestResyncAll(FrappeTestCase):
 			summary,
 			{
 				"channels_processed": 2,
-				"channels_skipped_disabled_workspace": 0,
+				"channels_skipped_orphaned": 0,
 				"workspaces_processed": 1,
 				"added": 2 + 2 + 3,
 				"removed": 1 + 1 + 0,
@@ -106,11 +108,12 @@ class TestResyncAll(FrappeTestCase):
 		self.assertEqual(summary["channels_processed"], 1)
 		log.assert_called()
 
-	def test_channel_under_a_disabled_workspace_mapping_is_not_swept(self):
-		# Syncing a channel also joins its members to the parent Raven workspace,
-		# but a disabled workspace mapping is excluded from the sweep — so those
-		# workspace rows would accumulate with nothing left to reconcile them.
-		# "w2" is absent from the active-workspace list, i.e. disabled.
+	def test_channel_whose_workspace_mapping_is_gone_is_not_swept(self):
+		# Syncing a channel also joins its members to the parent Raven workspace, so
+		# a channel whose workspace mapping no longer exists would strand workspace
+		# rows with nothing left to reconcile them. Deleting a workspace cascades
+		# its channels, so this is the guard for a cascade that did not finish.
+		# "w2" is absent from the workspace list, i.e. its mapping is gone.
 		with (
 			patch(
 				"raven_integration.events.frappe.get_all",
@@ -123,7 +126,7 @@ class TestResyncAll(FrappeTestCase):
 
 		self.assertEqual([c.args[0] for c in mc.call_args_list], ["c1"])
 		self.assertEqual(summary["channels_processed"], 1)
-		self.assertEqual(summary["channels_skipped_disabled_workspace"], 1)
+		self.assertEqual(summary["channels_skipped_orphaned"], 1)
 
 	def test_channels_are_swept_before_workspaces(self):
 		# add_channel_member joins the parent workspace before the channel, so the

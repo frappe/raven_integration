@@ -24,21 +24,23 @@ def is_active() -> bool:
 	return bool(frappe.db.get_single_value("Raven Membership Settings", "enabled")) and raven_installed()
 
 
-def _sweepable_channels(active_workspaces: list[str]) -> tuple[list[str], int]:
-	"""Active channel mappings whose parent workspace mapping is also active.
+def _sweepable_channels(swept_workspaces: list[str]) -> tuple[list[str], int]:
+	"""Enabled channel mappings whose parent workspace mapping still exists.
 
-	Syncing a channel joins its members to the parent Raven workspace too, but a
-	workspace mapping that is not enabled is never swept — so a channel under one
-	strands rule-managed workspace rows that nothing will ever reconcile.
+	Syncing a channel joins its members to the parent Raven workspace too, so a
+	channel whose workspace mapping is gone strands rule-managed workspace rows
+	that nothing will ever reconcile. Deleting a workspace cascades its channels,
+	so this should find nothing; it is the guard for the case where that cascade
+	did not complete, not a state the UI can produce.
 	"""
 	channels = frappe.get_all("Raven Channel Mapping", filters={"enabled": 1}, fields=["name", "workspace"])
-	active = set(active_workspaces)
-	names = [c.name for c in channels if c.workspace in active]
+	swept = set(swept_workspaces)
+	names = [c.name for c in channels if c.workspace in swept]
 	return names, len(channels) - len(names)
 
 
 def resync_all() -> dict:
-	"""Diff-apply membership for every active channel and workspace mapping.
+	"""Diff-apply membership for every enabled channel and every workspace mapping.
 
 	Channels are swept first, and that order is load-bearing twice over. A workspace's
 	membership is *derived* from who is in its channels, so it can only be computed
@@ -47,7 +49,10 @@ def resync_all() -> dict:
 	run in the mirror order or a failed workspace pass would leave a channel member
 	who is not a member of the channel's own workspace.
 	"""
-	workspaces = frappe.get_all("Raven Workspace Mapping", filters={"enabled": 1}, pluck="name")
+	# Every workspace mapping, unfiltered: a workspace has no on/off of its own.
+	# What can be switched off is a channel, and a workspace with every channel
+	# disabled sweeps to an empty expected set on its own.
+	workspaces = frappe.get_all("Raven Workspace Mapping", pluck="name")
 	channels, channels_skipped = _sweepable_channels(workspaces)
 	added = removed = errors = 0
 	cache: dict = {}
@@ -76,7 +81,7 @@ def resync_all() -> dict:
 
 	return {
 		"channels_processed": len(channels),
-		"channels_skipped_disabled_workspace": channels_skipped,
+		"channels_skipped_orphaned": channels_skipped,
 		"workspaces_processed": len(workspaces),
 		"added": added,
 		"removed": removed,
