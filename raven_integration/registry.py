@@ -183,8 +183,32 @@ def validate_rule_config(provider: str, rule_type: str, config) -> None:
 		return  # mandatory check handles emptiness
 	decl = _get_rule_type(_get_provider(provider), provider, rule_type)
 	cfg = json.loads(config) if isinstance(config, str) else (config or {})
-	for f in decl.get("fields", []):
+	for f in _applicable_fields(decl.get("fields", []) or [], cfg):
 		if f.get("reqd") and not cfg.get(f["fieldname"]):
 			frappe.throw(
 				_("Rule field '{0}' is required for {1}").format(f.get("label", f["fieldname"]), rule_type)
 			)
+
+
+def _applicable_fields(fields: list, cfg: dict) -> list:
+	"""The declared fields that apply to ``cfg`` — those with no ``depends_on``, and
+	those whose named field holds the named value.
+
+	The rule builder renders on the same rule, so a field it never drew must not be
+	judged here: the row would be complete on screen and refused on save. The value
+	compared is the one the control *shows* — a Select with nothing stored renders
+	its declared default, so an untouched row is judged as the user sees it.
+	"""
+	shown = {}
+	for f in fields:
+		name = f.get("fieldname")
+		if name:
+			shown[name] = cfg.get(name) if cfg.get(name) is not None else f.get("default")
+
+	applicable = []
+	for f in fields:
+		dep = f.get("depends_on")
+		if dep and shown.get(dep.get("field")) != dep.get("value"):
+			continue
+		applicable.append(f)
+	return applicable

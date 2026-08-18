@@ -8,6 +8,7 @@ from raven_integration.exceptions import ProviderDataError
 
 _FAKE_PATH = "raven_integration.tests.fake_provider.get_provider"
 _SLOPPY_PATH = "raven_integration.tests.test_registry.get_sloppy_provider"
+_CONDITIONAL_PATH = "raven_integration.tests.test_registry.get_conditional_provider"
 
 # What a third-party evaluate() might hand back instead of a population. Every one
 # of these is something set() accepts silently or blows up on somewhere further down.
@@ -33,6 +34,75 @@ def get_sloppy_provider():
 		"rule_types": [{"type": t, "label": t, "fields": []} for t in _SLOPPY_RETURNS],
 		"evaluate": lambda rule_type, config: _SLOPPY_RETURNS[rule_type],
 	}
+
+
+def get_conditional_provider():
+	"""A provider whose required field only applies to one choice of a Select.
+
+	`depends_on` is what the rule builder renders on, so it has to be what the
+	config is judged against too — a field the row never drew cannot be missing.
+	"""
+	return {
+		"name": "CONDITIONAL",
+		"label": "Conditional",
+		"rule_types": [
+			{
+				"type": "scoped",
+				"label": "Scoped",
+				"fields": [
+					{
+						"fieldname": "mode",
+						"fieldtype": "Select",
+						"label": "Mode",
+						"options": ["role", "tagged"],
+						"reqd": 1,
+						"default": "role",
+					},
+					{
+						"fieldname": "courses",
+						"fieldtype": "MultiSelect",
+						"label": "Courses",
+						"options": "LMS Course",
+						"reqd": 1,
+						"depends_on": {"field": "mode", "value": "tagged"},
+					},
+				],
+			}
+		],
+		"evaluate": lambda rule_type, config: set(),
+	}
+
+
+class TestConditionalFields(FrappeTestCase):
+	"""`reqd` is judged against the fields that apply, not every field declared."""
+
+	def _patch(self):
+		return patch.object(registry, "_provider_paths", return_value=[_CONDITIONAL_PATH])
+
+	def test_a_field_whose_condition_is_unmet_is_not_required(self):
+		with self._patch():
+			registry.validate_rule_config("CONDITIONAL", "scoped", {"mode": "role"})
+
+	def test_a_field_whose_condition_is_met_is_required(self):
+		with self._patch():
+			with self.assertRaises(frappe.ValidationError) as cm:
+				registry.validate_rule_config("CONDITIONAL", "scoped", {"mode": "tagged"})
+		self.assertIn("Courses", str(cm.exception))
+
+	def test_the_condition_reads_the_declared_default(self):
+		"""An unset Select renders its default, so the config is judged as if it
+		held it. An empty config is still refused — `mode` is required — but for
+		`mode` alone: `courses` depends on a value the default is not, so it is not
+		one of the things missing."""
+		with self._patch():
+			with self.assertRaises(frappe.ValidationError) as cm:
+				registry.validate_rule_config("CONDITIONAL", "scoped", {})
+		self.assertIn("Mode", str(cm.exception))
+		self.assertNotIn("Courses", str(cm.exception))
+
+	def test_a_met_condition_still_passes_once_filled(self):
+		with self._patch():
+			registry.validate_rule_config("CONDITIONAL", "scoped", {"mode": "tagged", "courses": ["C1"]})
 
 
 class TestRegistry(FrappeTestCase):
