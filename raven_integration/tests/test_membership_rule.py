@@ -80,17 +80,25 @@ class TestMemberRuleValidation(FrappeTestCase):
 		"""One leaf of the mapping's stored tree."""
 		return frappe.parse_json(ch.member_rules_json)["conditions"][index]
 
-	def test_a_sibling_duplicate_is_rejected(self):
+	def test_a_sibling_duplicate_is_kept(self):
+		"""Two identical siblings save. The check that refused them only ever saw
+		leaves that were literally equal, so it caught the one restatement a reader
+		can already see and missed every other: two groups evaluating to the same
+		population, or a leaf the group above it already subsumes. A rule that says
+		nothing new is harmless — it adds the people it names, who are added
+		already — so half a check bought nothing but a save the user could not make."""
 		ch = self._new_channel()
 		rule = {"label": "x", "provider": "FAKE", "rule_type": "always-a", "status": "Active", "config": {}}
 		ch.member_rules_json = frappe.as_json({"conjunctions": ["or"], "conditions": [rule, dict(rule)]})
-		with self.assertRaises(frappe.ValidationError) as cm:
-			self._insert_under(ch, _FAKE)
-		self.assertIn("Duplicate", str(cm.exception))
+		self._insert_under(ch, _FAKE)
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Channel Mapping", ch.name, force=True, ignore_missing=True)
+		)
+		self.assertEqual(len(frappe.parse_json(ch.member_rules_json)["conditions"]), 2)
 
 	def test_the_same_rule_in_two_groups_is_allowed(self):
-		# Meaningful in a tree — `A and (A or B)` narrows — and unsayable in the flat
-		# model the global duplicate check was written for.
+		# `A and (A or B)` narrows rather than repeats, and the flat model this
+		# replaced could not say it at all.
 		ch = self._new_channel()
 		rule = {"label": "x", "provider": "FAKE", "rule_type": "always-a", "status": "Active", "config": {}}
 		ch.member_rules_json = frappe.as_json(
@@ -154,14 +162,14 @@ class TestMemberRuleValidation(FrappeTestCase):
 			self._save_mapping_with_rule(_FAKE, label="x", status="Active")
 		self.assertIn("no type chosen", str(cm.exception).lower())
 
-	def test_two_blank_rules_are_rejected_for_their_provider_not_as_duplicates(self):
-		"""Two empty leaves must surface the provider error, not a spurious duplicate."""
+	def test_two_blank_rules_are_rejected_for_their_provider(self):
+		"""Two empty leaves must surface the provider error rather than saving."""
 		ch = self._new_channel()
 		blank = {"status": "Active"}
 		ch.member_rules_json = frappe.as_json({"conjunctions": ["or"], "conditions": [blank, blank]})
 		with self.assertRaises(frappe.ValidationError) as cm:
 			self._insert_under(ch, _FAKE)
-		self.assertNotIn("Duplicate", str(cm.exception))
+		self.assertIn("no type chosen", str(cm.exception).lower())
 
 	def test_rejects_an_unknown_provider(self):
 		with self.assertRaises(frappe.ValidationError) as cm:

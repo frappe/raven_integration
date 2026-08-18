@@ -89,9 +89,8 @@ class TestWorkspaceDeleteCascade(FrappeTestCase):
 		self.assertTrue(frappe.db.exists("Raven Workspace Mapping", ws.name))
 
 
-class TestDuplicateRuleGuard(FrappeTestCase):
-	"""A channel mapping rejects two rules with the same provider/rule_type/config —
-	provider-agnostic duplicate detection."""
+class TestSiblingRules(FrappeTestCase):
+	"""A channel mapping keeps every sibling rule it is given, alike or not."""
 
 	def setUp(self):
 		self.workspace = frappe.new_doc("Raven Workspace Mapping")
@@ -122,15 +121,20 @@ class TestDuplicateRuleGuard(FrappeTestCase):
 		ch.flags.skip_raven_create = True
 		return ch
 
-	def test_identical_rules_rejected(self):
+	def test_identical_rules_kept(self):
 		ch = self._channel("Dup Rule Channel")
-		# Same selection criteria twice (labels differ, but that is cosmetic).
+		# Same selection criteria twice (labels differ, but that is cosmetic). Both
+		# survive: the second names people the first adds already, so it changes
+		# nothing, and refusing it only blocked a save.
 		ch.member_rules_json = frappe.as_json(
 			{"conjunctions": ["or"], "conditions": [self._rule("First"), self._rule("Second")]}
 		)
 		with patch.object(registry, "_provider_paths", lambda: _FAKE):
-			with self.assertRaises(frappe.ValidationError):
-				ch.insert()
+			ch.insert()
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Channel Mapping", ch.name, force=True, ignore_missing=True)
+		)
+		self.assertEqual(len(frappe.parse_json(ch.member_rules_json)["conditions"]), 2)
 
 	def test_distinct_rules_allowed(self):
 		ch = self._channel("Distinct Rule Channel")

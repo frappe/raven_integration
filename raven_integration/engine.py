@@ -41,19 +41,6 @@ def _parse_config(rule: dict) -> dict:
 	return config or {}
 
 
-def _rule_identity(rule: dict) -> tuple:
-	"""Identity of a rule for duplicate detection: provider + rule_type + config.
-
-	config is normalized through json.dumps(sort_keys=True) so key order /
-	string-vs-dict storage don't matter.
-	"""
-	return (
-		rule.get("provider"),
-		rule.get("rule_type"),
-		json.dumps(_parse_config(rule), sort_keys=True),
-	)
-
-
 def is_group(node) -> bool:
 	"""True if ``node`` is a group rather than a leaf.
 
@@ -96,34 +83,8 @@ def iter_leaves(tree, _path: "list[int] | None" = None):
 			yield [*path, index], node
 
 
-def validate_unique_member_rules(tree) -> None:
-	"""Throw if any two *sibling* rules are identical (same provider/rule_type/config).
-
-	Siblings, not the whole mapping: two identical rules in one group say nothing
-	the group does not already say, but the same rule inside two different groups is
-	meaningful — ``A and (A or B)`` is a narrowing, not a mistake — and the flat
-	model had no way to express it, so the old check could afford to be global.
-	"""
-	if not is_group(tree):
-		return
-	seen: set[tuple] = set()
-	for node in tree.get("conditions") or []:
-		if is_group(node):
-			validate_unique_member_rules(node)
-			continue
-		identity = _rule_identity(_normalize_rule(node))
-		if identity in seen:
-			frappe.throw(
-				_(
-					"Duplicate membership rule: a rule with the same type and settings already exists in this group."
-				),
-				title=_("Duplicate Rule"),
-			)
-		seen.add(identity)
-
-
 def validate_member_rules(tree) -> None:
-	"""Validate every leaf's config, reject sibling duplicates, hold the pause rule."""
+	"""Validate every leaf's config and hold the pause rule."""
 	for path, leaf in iter_leaves(tree):
 		# The registry returns early on an empty provider or rule type, because a
 		# child row's own reqd fields used to catch that. A leaf of a JSON tree has no
@@ -145,7 +106,6 @@ def validate_member_rules(tree) -> None:
 					"join its group with <b>or</b>."
 				),
 			)
-	validate_unique_member_rules(tree)
 
 
 def pausable(tree, path: list) -> bool:
