@@ -1049,6 +1049,46 @@ class TestTheWorkspaceSweepClaimsNothingItDidNotAdd(_ManagedPairMixin, FrappeTes
 		self.assertFalse(self._has_workspace_row(bob))
 
 
+class TestAStaleExpectedSetCannotWipeAHandAddedRow(_ManagedPairMixin, FrappeTestCase):
+	"""The expected set is read at the top of a sweep; the removals run after it.
+
+	Raven answers a deleted workspace row by wiping every channel row that user
+	holds in the workspace, added_by_rule or not, so a channel row a human added in
+	between is destroyed by a decision taken before it existed. The stale set here is
+	what the sweep's transaction read a moment before the human's insert committed —
+	a snapshot read cannot see it, and a locking re-read can.
+	"""
+
+	def setUp(self):
+		self._setUp_managed()
+
+	def test_a_channel_row_added_after_the_read_survives(self):
+		bob = self._user("toctou")
+		self._workspace_row(bob, by_rule=True)
+		self._channel_row(bob, by_rule=False)
+
+		with patch("raven_integration.engine.expected_workspace_members", return_value=set()):
+			result = sync_workspace_members(self.ws_map.name)
+
+		self.assertTrue(
+			self._has_channel_row(bob),
+			"a channel row a human added is not this app's to remove, not even by cascade",
+		)
+		self.assertTrue(self._has_workspace_row(bob))
+		self.assertEqual(result, {"added": 0, "removed": 0})
+
+	def test_a_member_no_channel_holds_is_still_withdrawn(self):
+		"""The contrast: the re-read only spares someone a channel actually holds."""
+		bob = self._user("no-channel")
+		self._workspace_row(bob, by_rule=True)
+
+		with patch("raven_integration.engine.expected_workspace_members", return_value=set()):
+			result = sync_workspace_members(self.ws_map.name)
+
+		self.assertFalse(self._has_workspace_row(bob))
+		self.assertEqual(result["removed"], 1)
+
+
 class TestWithdrawalLeavesTheChannelOpen(_ManagedPairMixin, FrappeTestCase):
 	"""Raven archives a private channel whose last member leaves.
 

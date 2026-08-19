@@ -301,6 +301,42 @@ def add_workspace_member(workspace: str, user: str) -> None:
 		)
 
 
+def _still_in_a_channel_of(raven_workspace: str, user: str) -> bool:
+	"""Re-read, under a lock, whether the user holds any channel row in the workspace.
+
+	The expected set a removal is decided from was read at the top of the sweep, and
+	Raven answers a deleted workspace row by wiping every channel row that user holds
+	in the workspace — added_by_rule or not, in channels this app never mapped. So a
+	row a human added in Raven in between is destroyed by a decision taken before it
+	existed. The locking read is what closes that window: it reads the latest
+	committed row rather than this transaction's snapshot, and holds the gap until
+	commit. It runs on the unique (channel_id, user_id) index Raven adds.
+	"""
+	channels = frappe.get_all("Raven Channel", filters={"workspace": raven_workspace}, pluck="name")
+	if not channels:
+		return False
+	return bool(
+		frappe.db.get_value(
+			"Raven Channel Member",
+			{"channel_id": ("in", channels), "user_id": user},
+			"name",
+			for_update=True,
+		)
+	)
+
+
+def remove_workspace_member(workspace: str, user: str) -> int:
+	"""Remove a rule-managed workspace member row; leaves manually-added rows untouched.
+
+	Returns how many rows went — none, if the user turns out to still be in a channel
+	of the workspace, which is the whole of what a workspace row means here."""
+	if not raven_installed():
+		return 0
+	if _still_in_a_channel_of(workspace, user):
+		return 0
+	return _remove_rule_managed_member("Raven Workspace Member", {"workspace": workspace, "user": user})
+
+
 def _apply_one_member(action, raven_record: str, user: str, member_doctype: str, verb: str) -> bool:
 	"""Run one member's add or remove in its own savepoint. True if a row was written.
 
