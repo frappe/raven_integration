@@ -561,7 +561,7 @@ class TestComputeRuleDiff(FrappeTestCase):
 				name=self.channel_name,
 				new_rules={"conjunctions": [], "conditions": []},
 			)
-		self.assertEqual(result, {"added": 0, "removed": 0, "removed_users": []})
+		self.assertEqual(result, {"added": 0, "removed": 0, "removed_users": [], "unknown": False})
 
 	def test_counts_against_actual_members_not_the_rule_population(self):
 		"""Sync diffs against who is *actually* rule-managed, so the preview does too.
@@ -2250,6 +2250,191 @@ class TestIsSetupHonoursDisabledApps(FrappeTestCase):
 		self.assertFalse(
 			is_setup()["raven"],
 			"a disabled app cannot sync, so the Settings gate must not open on it",
+		)
+
+
+class TestComputeRuleDiffMirrorsSync(FrappeTestCase):
+	"""compute_rule_diff drives a confirmation dialog, so its answer has to be the
+	one _sync_rule_managed_members will actually reach — including every case where
+	the sync moves nobody at all."""
+
+	def setUp(self):
+		if "raven" not in frappe.get_installed_apps():
+			self.skipTest("Raven not installed")
+		self._suffix = frappe.generate_hash(length=6)
+
+		# Someone the FAKE provider does not match, so "removes everyone" and
+		# "removes nobody" are different answers.
+		self.member = frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": f"rv-mirror-{self._suffix}@example.com",
+				"first_name": "MirrorMember",
+				"send_welcome_email": 0,
+			}
+		).insert()
+
+		rw = frappe.get_doc(
+			{
+				"doctype": "Raven Workspace",
+				"workspace_name": f"RI Mirror WS {self._suffix}",
+				"type": "Private",
+			}
+		).insert(ignore_permissions=True)
+		self.raven_ws = rw.name
+		rc = frappe.get_doc(
+			{
+				"doctype": "Raven Channel",
+				"channel_name": f"ri-mirror-ch-{self._suffix}",
+				"workspace": rw.name,
+				"type": "Private",
+			}
+		).insert(ignore_permissions=True)
+		self.raven_ch = rc.name
+
+		ws = frappe.new_doc("Raven Workspace Mapping")
+		ws.workspace_label = f"RI Mirror WS {self._suffix}"
+		ws.workspace_type = "Private"
+		ws.flags.skip_raven_create = True
+		ws.insert()
+		frappe.db.set_value("Raven Workspace Mapping", ws.name, "raven_workspace", self.raven_ws)
+		self.ws_map = ws.name
+
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			ch = frappe.new_doc("Raven Channel Mapping")
+			ch.channel_label = f"RI Mirror CH {self._suffix}"
+			ch.workspace = self.ws_map
+			ch.channel_type = "Private"
+			ch.flags.skip_raven_create = True
+			ch.member_rules_json = frappe.as_json(self._tree())
+			ch.insert()
+		frappe.db.set_value("Raven Channel Mapping", ch.name, "raven_channel", self.raven_ch)
+		self.ch_map = ch.name
+
+		from raven_integration.sync_service import ensure_raven_user
+
+		ensure_raven_user(self.member.name)
+		frappe.get_doc(
+			{
+				"doctype": "Raven Channel Member",
+				"channel_id": self.raven_ch,
+				"user_id": self.member.name,
+				"added_by_rule": 1,
+			}
+		).insert(ignore_permissions=True)
+
+		self.addCleanup(self._cleanup)
+
+	def _cleanup(self):
+		frappe.set_user("Administrator")
+		for doctype, name in (
+			("Raven Channel Mapping", self.ch_map),
+			("Raven Workspace Mapping", self.ws_map),
+		):
+			if frappe.db.exists(doctype, name):
+				frappe.delete_doc(doctype, name, force=True, ignore_permissions=True, ignore_missing=True)
+		# frappe.db.delete bypasses Raven's on_trash guards during teardown.
+		frappe.db.delete("Raven Channel Member", {"channel_id": self.raven_ch})
+		frappe.db.delete("Raven Channel", {"name": self.raven_ch})
+		frappe.db.delete("Raven Workspace Member", {"workspace": self.raven_ws})
+		frappe.db.delete("Raven Workspace", {"name": self.raven_ws})
+		frappe.db.delete("Raven User", {"user": self.member.name})
+		frappe.db.delete("User", {"name": self.member.name})
+
+	def _tree(self):
+		return {"conjunctions": [], "conditions": [_leaf("Mirror Rule", rule_type="always-a")]}
+
+	def _diff(self, provider_paths):
+		from raven_integration.api import compute_rule_diff
+
+		with patch.object(registry, "_provider_paths", return_value=provider_paths):
+			return compute_rule_diff(
+				target_doctype="Raven Channel Mapping",
+				name=self.ch_map,
+				new_rules=self._tree(),
+			)
+
+	def test_a_rule_the_provider_answers_still_reports_its_removals(self):
+		"""The guards below must not blanket-suppress a real removal."""
+		result = self._diff(_FAKE)
+		self.assertEqual(result["removed"], 1)
+		self.assertEqual(result["removed_users"], [self.member.name])
+		self.assertFalse(result["unknown"])
+
+	def test_a_tree_nothing_can_evaluate_is_reported_as_unknown_not_as_a_purge(self):
+		"""No provider registered — the provider's app is gone. evaluate_rules
+		answers set() for that exactly as it does for "matches nobody", so the
+		dialog used to announce every rule-managed member was about to go. The
+		real sync runs strict: it raises and removes nobody."""
+		result = self._diff([])
+		self.assertTrue(result["unknown"], "an unevaluable tree is not a tree that matches nobody")
+		self.assertEqual(result["removed"], 0)
+		self.assertEqual(result["removed_users"], [])
+		self.assertEqual(result["added"], 0)
+
+	def test_a_switched_off_channel_reports_no_change(self):
+		"""_sync_rule_managed_members returns skipped/disabled before reading a
+		rule, so confirming this change would move nobody."""
+		frappe.db.set_value("Raven Channel Mapping", self.ch_map, "enabled", 0)
+		result = self._diff(_FAKE)
+		self.assertEqual(result["removed"], 0)
+		self.assertEqual(result["added"], 0)
+		self.assertFalse(result["unknown"])
+
+	def test_a_stale_mapping_reports_no_change(self):
+		"""The Raven channel is gone; the sync returns skipped/raven_record_deleted."""
+		frappe.db.set_value("Raven Channel Mapping", self.ch_map, "stale", 1)
+		result = self._diff(_FAKE)
+		self.assertEqual(result["removed"], 0)
+		self.assertEqual(result["added"], 0)
+
+
+class TestGetChannelMemberCount(FrappeTestCase):
+	"""get_channel's member_count had evaluate_rules' defect: a tree no provider
+	could evaluate counted as zero, which reads as "this channel matches nobody"."""
+
+	def setUp(self):
+		self._suffix = frappe.generate_hash(length=6)
+		ws = frappe.new_doc("Raven Workspace Mapping")
+		ws.workspace_label = f"RI Count WS {self._suffix}"
+		ws.workspace_type = "Private"
+		ws.flags.skip_raven_create = True
+		ws.insert()
+		self.ws_map = ws.name
+
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			ch = frappe.new_doc("Raven Channel Mapping")
+			ch.channel_label = f"RI Count CH {self._suffix}"
+			ch.workspace = self.ws_map
+			ch.channel_type = "Private"
+			ch.flags.skip_raven_create = True
+			ch.member_rules_json = frappe.as_json({"conjunctions": [], "conditions": [_leaf("Count Rule")]})
+			ch.insert()
+		self.ch_map = ch.name
+
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Workspace Mapping", self.ws_map, force=True, ignore_missing=True)
+		)
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Channel Mapping", self.ch_map, force=True, ignore_missing=True)
+		)
+
+	def _detail(self, provider_paths):
+		from raven_integration.api import get_channel
+
+		with patch.object(registry, "_provider_paths", return_value=provider_paths):
+			return get_channel(self.ch_map)
+
+	def test_a_count_the_providers_answered_is_not_flagged_unknown(self):
+		detail = self._detail(_FAKE)
+		self.assertEqual(detail["member_count"], 2)
+		self.assertFalse(detail["member_count_unknown"])
+
+	def test_a_count_nothing_could_evaluate_is_flagged_unknown(self):
+		detail = self._detail([])
+		self.assertTrue(
+			detail["member_count_unknown"],
+			"nobody could evaluate this tree, which is not the same as it matching nobody",
 		)
 
 

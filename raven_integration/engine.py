@@ -318,6 +318,24 @@ def evaluate_rules(tree, *, strict: bool = True) -> set[str]:
 	When strict is False, a rule the provider cannot evaluate is logged and skipped
 	instead of raising (read/display path); the sync path keeps the default
 	strict=True so unexpected data fails loud.
+
+	A tree that yielded no opinion at all reads as the empty set here, deliberately:
+	these callers are asking who to hold membership open for, and every one of them
+	wants "nobody" for a tree that says nothing. A caller that must tell "matches
+	nobody" from "could not be evaluated" — a diff preview, where the difference is
+	between removing nobody and removing everyone — calls evaluate_rules_or_unknown.
+	"""
+	result = evaluate_rules_or_unknown(tree, strict=strict)
+	return result if result is not None else set()
+
+
+def evaluate_rules_or_unknown(tree, *, strict: bool = False) -> "set[str] | None":
+	"""Population of a whole condition tree, or None when it yielded no opinion.
+
+	None is what _evaluate_node calls absent: every leaf paused, skipped on the
+	lenient path, or no leaves at all. It is not the empty set, which is a tree that
+	was evaluated and honestly matches nobody. Lenient by default, because a caller
+	that wanted a raise would have no use for the distinction.
 	"""
 	skipped: dict = {}
 	result = _evaluate_node(parse_tree(tree), [], strict=strict, skipped=skipped)
@@ -326,7 +344,7 @@ def evaluate_rules(tree, *, strict: bool = True) -> set[str]:
 		title="Raven Integration: skipped rules the provider could not evaluate",
 		consequence="Skipped in read-path evaluation.",
 	)
-	return result if result is not None else set()
+	return result
 
 
 def expected_channel_members(

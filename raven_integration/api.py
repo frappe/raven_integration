@@ -976,9 +976,15 @@ def get_channel(name: str) -> dict:
 	"""Full channel detail, incl. the condition tree the rules panel edits."""
 	_require_manager()
 	name = _str(name, "name")
-	from raven_integration.engine import expected_channel_members
+	from raven_integration.engine import evaluate_rules_or_unknown
 
 	doc = frappe.get_doc("Raven Channel Mapping", name)
+	# Not expected_channel_members: it folds "no provider could answer" into the
+	# empty set, and len(set()) reads on screen as "this channel matches nobody"
+	# — the one thing an unevaluable tree does not say. member_count stays an int
+	# (the rules panel renders it straight into "{0} members" with no null guard),
+	# and the flag beside it carries the distinction.
+	members = evaluate_rules_or_unknown(doc.member_rules_json, strict=False)
 	return {
 		"name": doc.name,
 		"channel_label": doc.channel_label,
@@ -987,7 +993,8 @@ def get_channel(name: str) -> dict:
 		"enabled": doc.enabled,
 		"stale": doc.stale,
 		"raven_channel": doc.raven_channel,
-		"member_count": len(expected_channel_members(name, strict=False)),
+		"member_count": len(members) if members is not None else 0,
+		"member_count_unknown": members is None,
 		"rules": _serialize_tree_for_ui(doc.member_rules_json),
 	}
 
@@ -1201,7 +1208,14 @@ def compute_rule_diff(
 	name: str,
 	new_rules: "dict | None" = None,
 ) -> dict:
-	"""Return { added, removed, removed_users } for a proposed change.
+	"""Return { added, removed, removed_users, unknown } for a proposed change.
+
+	``unknown`` is true when no provider could evaluate the proposed tree at all —
+	the counts are then both zero, which is what the sync really does, but zero
+	there means "nothing can be worked out", not "nothing matches". It is a new
+	field rather than a new shape for ``removed``: the three original keys are what
+	the rules panel reads, and a consumer that ignores ``unknown`` still sees counts
+	that agree with the sync.
 
 	Channels only. A workspace has no rules to propose a change to — the way to move
 	its membership is to change a channel's, and this endpoint reports that already."""
@@ -1220,33 +1234,44 @@ def compute_rule_diff(
 
 	from raven_integration.engine import (
 		disabled_rule_members,
-		evaluate_rules,
+		evaluate_rules_or_unknown,
 		has_active_rules,
 	)
 
 	# Mirror sync_service exactly, or the confirmation lies. It compares the rules
 	# against who is *actually* rule-managed right now, not against the population
-	# the old rules would produce, and it honours the same two guards: a rule set
-	# with nothing active is skipped wholesale, and disabled rules freeze rather
-	# than evict. Both of those mean "no removals", which a naive set difference
-	# over the rules alone reports as removing everyone.
+	# the old rules would produce, and it honours the same guards: a channel that is
+	# switched off or whose Raven channel was deleted is skipped before any rule is
+	# read, a rule set with nothing active is skipped wholesale, and disabled rules
+	# freeze rather than evict. Every one of those means "nobody moves", which a
+	# naive set difference over the rules alone reports as removing everyone.
+	no_change = {"added": 0, "removed": 0, "removed_users": [], "unknown": False}
+	mapping = frappe.db.get_value(target_doctype, name, ["enabled", "stale", "raven_channel"], as_dict=True)
+	if not mapping.enabled or mapping.stale:
+		return no_change
 	if not has_active_rules(new_tree):
-		return {"added": 0, "removed": 0, "removed_users": []}
+		return no_change
 
-	raven_link = frappe.db.get_value(target_doctype, name, "raven_channel")
 	current = (
 		set(
 			frappe.get_all(
 				"Raven Channel Member",
-				filters={"channel_id": raven_link, "added_by_rule": 1},
+				filters={"channel_id": mapping.raven_channel, "added_by_rule": 1},
 				pluck="user_id",
 			)
 		)
-		if raven_link
+		if mapping.raven_channel
 		else set()
 	)
 
-	new_set = evaluate_rules(new_tree, strict=False)
+	new_set = evaluate_rules_or_unknown(new_tree, strict=False)
+	if new_set is None:
+		# Nothing in the tree could be evaluated — the provider's app is gone, say.
+		# The sync runs strict, so it raises and moves nobody; treating the empty
+		# lenient answer as authoritative would announce that every rule-managed
+		# member is about to be removed by a sync that will not remove one of them.
+		return {"added": 0, "removed": 0, "removed_users": [], "unknown": True}
+
 	frozen = current & disabled_rule_members(new_tree, strict=False)
 	added = new_set - current
 	removed = current - new_set - frozen
@@ -1255,6 +1280,7 @@ def compute_rule_diff(
 		"added": len(added),
 		"removed": len(removed),
 		"removed_users": sorted(removed)[:10],
+		"unknown": False,
 	}
 
 

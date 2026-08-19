@@ -277,6 +277,55 @@ def _edge_rule(rule_type, status="Active"):
 	return {"provider": "EDGE", "rule_type": rule_type, "config": {}, "status": status}
 
 
+class TestUnevaluableIsNotNobody(FrappeTestCase):
+	"""A tree nothing could evaluate must not read as a tree that matches nobody.
+
+	The two answers are opposite instructions to a caller diffing membership:
+	"matches nobody" removes every rule-managed member, "could not be evaluated"
+	removes none of them and is what the strict sync path raises over.
+	"""
+
+	def setUp(self):
+		self._patch = patch.object(registry, "_provider_paths", lambda: [*_FAKE, _EDGE])
+		self._patch.start()
+		self.addCleanup(self._patch.stop)
+		self._log = patch("raven_integration.engine.frappe.log_error")
+		self._log.start()
+		self.addCleanup(self._log.stop)
+		frappe.clear_messages()
+		self.addCleanup(frappe.clear_messages)
+
+	def test_a_tree_no_provider_could_evaluate_is_unknown(self):
+		self.assertIsNone(engine.evaluate_rules_or_unknown(_tree(_rule("no-such-rule-type"))))
+
+	def test_a_tree_that_honestly_matches_nobody_is_an_empty_set(self):
+		self.assertEqual(engine.evaluate_rules_or_unknown(_tree(_edge_rule("nobody"))), set())
+
+	def test_a_tree_of_only_paused_rules_is_unknown(self):
+		self.assertIsNone(engine.evaluate_rules_or_unknown(_tree(_rule("always-a", status="Paused"))))
+
+	def test_no_tree_at_all_is_unknown(self):
+		self.assertIsNone(engine.evaluate_rules_or_unknown(None))
+		self.assertIsNone(engine.evaluate_rules_or_unknown(_tree()))
+
+	def test_what_could_be_evaluated_is_still_answered(self):
+		tree = _tree(_rule("no-such-rule-type"), _rule("always-a"), joiner="or")
+		self.assertEqual(engine.evaluate_rules_or_unknown(tree), {"a@example.com"})
+
+	def test_it_is_lenient_by_default_and_strict_on_request(self):
+		tree = _tree(_rule("no-such-rule-type"))
+		self.assertIsNone(engine.evaluate_rules_or_unknown(tree))
+		with self.assertRaises(frappe.ValidationError):
+			engine.evaluate_rules_or_unknown(tree, strict=True)
+
+	def test_evaluate_rules_still_flattens_unknown_to_nobody(self):
+		# Its callers act on the answer, and they have always wanted an empty set for
+		# a tree that says nothing. Changing that would change every one of them.
+		self.assertEqual(engine.evaluate_rules(_tree(_rule("no-such-rule-type")), strict=False), set())
+		self.assertEqual(engine.evaluate_rules(None), set())
+		self.assertEqual(engine.evaluate_rules(_tree(_rule("always-a"))), {"a@example.com"})
+
+
 class TestSwallowedRuleErrorsStayQuiet(FrappeTestCase):
 	def setUp(self):
 		self._patch = patch.object(registry, "_provider_paths", lambda: [*_FAKE, _EDGE])
