@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import frappe
+from frappe.database import savepoint
 
 from raven_integration.exceptions import RavenAPIError, RavenNotInstalledError
 from raven_integration.utils import raven_installed
@@ -65,11 +66,13 @@ def _adopt_existing_member(member_doctype: str, filters: dict) -> None:
 		frappe.db.set_value(member_doctype, name, "added_by_rule", 1)
 
 
-def _remove_rule_managed_member(member_doctype: str, filters: dict) -> None:
-	"""Delete the member row only if this app added it; manual rows are left alone."""
+def _remove_rule_managed_member(member_doctype: str, filters: dict) -> int:
+	"""Delete the member row only if this app added it; manual rows are left alone.
+
+	Returns how many rows went, so a caller counting removals counts writes rather
+	than intentions."""
 	name = frappe.db.exists(member_doctype, {**filters, "added_by_rule": 1})
-	if name:
-		_delete_member_rows(member_doctype, [name])
+	return _delete_member_rows(member_doctype, [name]) if name else 0
 
 
 def _would_leave_the_workspace_without_an_admin(name: str) -> bool:
@@ -257,11 +260,13 @@ def add_channel_member(channel: str, user: str) -> None:
 		_adopt_existing_member("Raven Channel Member", {"channel_id": channel, "user_id": user})
 
 
-def remove_channel_member(channel: str, user: str) -> None:
-	"""Remove a rule-managed channel member row; leaves manually-added rows untouched."""
+def remove_channel_member(channel: str, user: str) -> int:
+	"""Remove a rule-managed channel member row; leaves manually-added rows untouched.
+
+	Returns how many rows went."""
 	if not raven_installed():
-		return
-	_remove_rule_managed_member("Raven Channel Member", {"channel_id": channel, "user_id": user})
+		return 0
+	return _remove_rule_managed_member("Raven Channel Member", {"channel_id": channel, "user_id": user})
 
 
 def add_workspace_member(workspace: str, user: str) -> None:
@@ -286,11 +291,35 @@ def add_workspace_member(workspace: str, user: str) -> None:
 		return
 
 
-def remove_workspace_member(workspace: str, user: str) -> None:
-	"""Remove a rule-managed workspace member row; leaves manually-added rows untouched."""
-	if not raven_installed():
-		return
-	_remove_rule_managed_member("Raven Workspace Member", {"workspace": workspace, "user": user})
+def _apply_one_member(action, raven_record: str, user: str, member_doctype: str, verb: str) -> bool:
+	"""Run one member's add or remove in its own savepoint. True if a row was written.
+
+	One member the site cannot write is not a reason to abandon the rest of a diff.
+	ensure_raven_user leaves a disabled user without a Raven User deliberately, and
+	the member row's user link is reqd, so their insert throws LinkValidationError —
+	which is a ValidationError, not the NameError the duplicate catch covers. It used
+	to escape this loop with every later add and the whole removal pass still
+	pending, on every sweep, silently. The savepoint is what makes carrying on safe:
+	a bare except would leave whatever the failed member had already written (its
+	workspace row, from add_channel_member) sitting in the transaction. The log is
+	written after the rollback, or it would be rolled back with it.
+	"""
+	failure = None
+	with savepoint(catch=Exception):
+		try:
+			written = action(raven_record, user)
+		except Exception as e:
+			failure = f"{type(e).__name__}: {e}\n\n{frappe.get_traceback()}"
+			raise
+		# The removers report how many rows went; the adders report nothing.
+		return written is None or bool(written)
+	frappe.log_error(
+		# Error Log.method is a 140-char Data field and a Raven channel name is a
+		# whole course title; the log itself must not become the thing that throws.
+		title=f"Raven member {verb} skipped: {user} on {member_doctype} {raven_record}"[:140],
+		message=failure,
+	)
+	return False
 
 
 def _sync_rule_managed_members(
@@ -364,15 +393,20 @@ def _sync_rule_managed_members(
 	)
 	to_add = expected - already_there
 	to_remove = current_rule_managed - expected - frozen
+	added = removed = 0
 	for u in to_add:
-		add(raven_record, u)
+		if not _apply_one_member(add, raven_record, u, member_doctype, "add"):
+			continue
+		added += 1
 		if after_synced:
 			after_synced(raven_record, u, "added", "event")
 	for u in to_remove:
-		remove(raven_record, u)
+		if not _apply_one_member(remove, raven_record, u, member_doctype, "remove"):
+			continue
+		removed += 1
 		if after_synced:
 			after_synced(raven_record, u, "removed", "event")
-	return {"added": len(to_add), "removed": len(to_remove)}
+	return {"added": added, "removed": removed}
 
 
 def sync_channel_members(channel_name: str, *, cache: dict | None = None) -> dict:

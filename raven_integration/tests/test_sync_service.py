@@ -221,24 +221,28 @@ class TestConcurrentAdd(_RavenFixtureMixin, FrappeTestCase):
 		self.assertEqual(count, 1)
 
 
-class TestSyncChannelMembers(_RavenFixtureMixin, FrappeTestCase):
-	"""sync_channel_members diff-apply + manual-add protection (provider-agnostic)."""
+class _SyncedChannelMixin(_RavenFixtureMixin):
+	"""A channel mapping carrying one active rule, over the fixture Raven records.
 
-	def setUp(self):
-		if "raven" not in frappe.get_installed_apps():
-			self.skipTest("Raven not installed")
+	The rule's population is irrelevant (these tests mock the engine) but its
+	presence is what makes the sync authoritative — a rule-less mapping is correctly
+	a no-op.
+	"""
 
+	def _setUp_synced_channel(self):
 		self._setUp_raven_fixtures()
 
 		# The fake provider must be resolvable while the fixture's rules are saved
-		# (Raven Membership Rule.validate calls validate_rule_config).
+		# (Raven Channel Mapping.validate calls validate_member_rules, which resolves
+		# every leaf's provider through the registry).
 		self._reg_patch = patch.object(
 			registry, "_provider_paths", lambda: ["raven_integration.tests.fake_provider.get_provider"]
 		)
 		self._reg_patch.start()
 		self.addCleanup(self._reg_patch.stop)
 
-		suffix = frappe.generate_hash(length=6)
+		self.suffix = frappe.generate_hash(length=6)
+		suffix = self.suffix
 
 		# Raven Workspace Mapping — skip_raven_create; point at fixture workspace.
 		self.ws_map = frappe.new_doc("Raven Workspace Mapping")
@@ -256,9 +260,6 @@ class TestSyncChannelMembers(_RavenFixtureMixin, FrappeTestCase):
 		self.ch_map.workspace = self.ws_map.name
 		self.ch_map.channel_type = "Private"
 		self.ch_map.flags.skip_raven_create = True
-		# An active rule, so the mapping is genuinely rule-managed. Its population is
-		# irrelevant (these tests mock the engine) but its presence is what makes the
-		# sync authoritative — a rule-less mapping is correctly a no-op.
 		self.ch_map.member_rules_json = frappe.as_json(
 			{
 				"conjunctions": [],
@@ -278,7 +279,7 @@ class TestSyncChannelMembers(_RavenFixtureMixin, FrappeTestCase):
 			"Raven Channel Mapping", self.ch_map.name, "raven_channel", self.raven_channel.name
 		)
 
-	def tearDown(self):
+	def _tearDown_synced_channel(self):
 		if frappe.db.exists("Raven Channel Mapping", self.ch_map.name):
 			frappe.delete_doc("Raven Channel Mapping", self.ch_map.name, force=True, ignore_permissions=True)
 		if frappe.db.exists("Raven Workspace Mapping", self.ws_map.name):
@@ -292,6 +293,50 @@ class TestSyncChannelMembers(_RavenFixtureMixin, FrappeTestCase):
 		if rule_flag is not None:
 			filters["added_by_rule"] = rule_flag
 		return bool(frappe.db.exists("Raven Channel Member", filters))
+
+	def _member_user(self, tag: str, *, enabled: bool = True) -> str:
+		"""Another user for the fixture channel. Disabled ones get no Raven User.
+
+		A user with no roles is a Website User, so Raven's own auto_add_system_users
+		never provisions them either — which is what leaves the reqd user link with
+		nothing to resolve.
+		"""
+		user = frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": f"ri-sync-{tag}-{self.suffix}@example.com",
+				"first_name": f"Sync {tag}",
+				"send_welcome_email": 0,
+			}
+		).insert()
+		self.addCleanup(lambda: frappe.db.delete("User", {"name": user.name}))
+		self.addCleanup(lambda: frappe.db.delete("Raven User", {"user": user.name}))
+		if not enabled:
+			user.enabled = 0
+			user.save()
+		return user.name
+
+	def _rule_managed_row(self, user: str) -> None:
+		"""A channel member row this app's rules could have written."""
+		ensure_raven_user(user)
+		frappe.get_doc(
+			{
+				"doctype": "Raven Channel Member",
+				"channel_id": self.raven_channel.name,
+				"user_id": user,
+				"added_by_rule": 1,
+			}
+		).insert(ignore_permissions=True)
+
+
+class TestSyncChannelMembers(_SyncedChannelMixin, FrappeTestCase):
+	"""sync_channel_members diff-apply + manual-add protection (provider-agnostic)."""
+
+	def setUp(self):
+		self._setUp_synced_channel()
+
+	def tearDown(self):
+		self._tearDown_synced_channel()
 
 	def test_adds_missing_members(self):
 		"""sync_channel_members adds users returned by the engine with added_by_rule=1."""
@@ -346,6 +391,82 @@ class TestSyncChannelMembers(_RavenFixtureMixin, FrappeTestCase):
 			{"channel_id": self.raven_channel.name, "user_id": self.user.name, "added_by_rule": 1},
 		)
 		self.assertEqual(count, 1)
+
+
+class TestOneBadMemberDoesNotAbortTheDiff(_SyncedChannelMixin, FrappeTestCase):
+	"""Regression: one un-insertable user used to abort a channel's whole diff.
+
+	ensure_raven_user leaves a disabled user without a Raven User on purpose, so the
+	reqd user_id link throws LinkValidationError. That is a ValidationError, and
+	add_channel_member only caught the duplicate pair (UniqueValidationError and
+	DuplicateEntryError, which is a NameError), so it escaped the add loop and the
+	removal loop below it never ran — silently, on every sweep, for as long as the
+	disabled user stayed enrolled.
+	"""
+
+	def setUp(self):
+		self._setUp_synced_channel()
+		self.good = self._member_user("good")
+		self.blocked = self._member_user("blocked", enabled=False)
+		self.stale = self._member_user("stale")
+		self._rule_managed_row(self.stale)
+
+	def tearDown(self):
+		self._tearDown_synced_channel()
+
+	def test_the_rest_of_the_sweep_still_runs(self):
+		with patch(
+			"raven_integration.engine.expected_channel_members", return_value={self.good, self.blocked}
+		):
+			result = sync_channel_members(self.ch_map.name)
+
+		self.assertTrue(self._channel_member_exists(self.good, rule_flag=1))
+		self.assertFalse(
+			self._channel_member_exists(self.stale),
+			"the removal pass runs whatever the add pass could not write",
+		)
+		self.assertEqual(result, {"added": 1, "removed": 1})
+
+	def test_the_member_it_could_not_write_is_logged(self):
+		with (
+			patch("raven_integration.engine.expected_channel_members", return_value={self.blocked}),
+			patch("raven_integration.sync_service.frappe.log_error") as log,
+		):
+			sync_channel_members(self.ch_map.name)
+
+		titles = [call.kwargs.get("title", "") for call in log.call_args_list]
+		self.assertTrue(any(self.blocked in title for title in titles), titles)
+
+	def test_the_member_it_could_not_write_is_not_counted(self):
+		with patch("raven_integration.engine.expected_channel_members", return_value={self.blocked}):
+			result = sync_channel_members(self.ch_map.name)
+
+		self.assertEqual(result["added"], 0, "the count is rows written, not members proposed")
+		self.assertFalse(self._channel_member_exists(self.blocked))
+
+	def test_a_half_written_member_is_rolled_back(self):
+		"""The savepoint, not a bare except: what the failed add wrote has to go too.
+
+		add_channel_member joins the parent workspace before the channel, so a member
+		whose channel row throws has already written a workspace row by then.
+		"""
+
+		def add_then_fail(channel, user):
+			add_workspace_member(self.raven_workspace.name, user)
+			frappe.throw("Could not find Raven User", frappe.LinkValidationError)
+
+		with (
+			patch("raven_integration.engine.expected_channel_members", return_value={self.good}),
+			patch("raven_integration.sync_service.add_channel_member", add_then_fail),
+		):
+			result = sync_channel_members(self.ch_map.name)
+
+		self.assertFalse(
+			frappe.db.exists(
+				"Raven Workspace Member", {"workspace": self.raven_workspace.name, "user": self.good}
+			)
+		)
+		self.assertEqual(result, {"added": 0, "removed": 1})
 
 
 class TestErrorDistinction(unittest.TestCase):
