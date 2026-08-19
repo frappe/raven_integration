@@ -492,6 +492,12 @@ def _create_mapping(
 	tried: set[str] = set()
 	for _attempt in range(5):
 		chosen = label if explicit else _next_default_label(doctype, base, skip=tried)
+		# before_insert creates the backing Raven workspace/channel, and it runs
+		# before set_new_name, where a docname another session has just claimed
+		# raises DuplicateEntryError. Without this rollback the Raven record the
+		# losing attempt created commits alongside the winning one, as a workspace
+		# no mapping manages and list_unmapped_workspaces offers forever.
+		frappe.db.savepoint("ri_create_mapping")
 		doc = frappe.new_doc(doctype)
 		doc.set(_MAPPING_LABEL_FIELDS[doctype], chosen)
 		doc.update(fields)
@@ -501,8 +507,13 @@ def _create_mapping(
 			doc.insert()
 			return doc.name
 		except frappe.DuplicateEntryError:
+			frappe.db.rollback(save_point="ri_create_mapping")
 			if explicit:
 				raise  # caller-chosen name already exists
+			# db_insert msgprints "… already exists" (title "Duplicate Name", red)
+			# before raising, so a retry that then succeeds would still hand the
+			# user that dialog for a name they never chose and never saw.
+			frappe.clear_last_message()
 			tried.add(chosen)
 	frappe.throw(title=alloc_title, msg=alloc_msg)
 

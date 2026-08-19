@@ -2438,6 +2438,79 @@ class TestGetChannelMemberCount(FrappeTestCase):
 		)
 
 
+class TestCreateMappingRollsBackALostRace(FrappeTestCase):
+	"""_create_mapping retries after a docname collision. before_insert has already
+	created the backing Raven record by then, so an attempt that is not rolled back
+	leaves it behind, unmanaged, and list_unmapped_workspaces offers it forever."""
+
+	def setUp(self):
+		if "raven" not in frappe.get_installed_apps():
+			self.skipTest("Raven not installed")
+		self._suffix = frappe.generate_hash(length=6)
+		self.taken_label = f"RI Race Taken {self._suffix}"
+		self.free_label = f"RI Race Free {self._suffix}"
+		self.created = None
+
+		# Stands in for the mapping the winning session inserted a moment earlier.
+		existing = frappe.new_doc("Raven Workspace Mapping")
+		existing.workspace_label = self.taken_label
+		existing.workspace_type = "Private"
+		existing.flags.skip_raven_create = True
+		existing.insert()
+		self.existing = existing.name
+		self.addCleanup(self._cleanup)
+
+	def _cleanup(self):
+		frappe.set_user("Administrator")
+		for name in (self.existing, self.created):
+			if name and frappe.db.exists("Raven Workspace Mapping", name):
+				frappe.delete_doc(
+					"Raven Workspace Mapping",
+					name,
+					force=True,
+					ignore_permissions=True,
+					ignore_missing=True,
+				)
+		for label in (self.taken_label, self.free_label):
+			frappe.db.delete("Raven Workspace Member", {"workspace": label})
+			frappe.db.delete("Raven Workspace", {"name": label})
+
+	def _create_losing_the_first_name(self):
+		from raven_integration.api import create_workspace
+
+		with (
+			patch(
+				"raven_integration.api._next_default_label",
+				side_effect=[self.taken_label, self.free_label],
+			),
+			patch.object(registry, "_provider_paths", return_value=[]),
+		):
+			self.created = create_workspace()
+		return self.created
+
+	def test_a_lost_docname_race_leaves_no_orphan_raven_workspace(self):
+		before = frappe.db.count("Raven Workspace")
+		self._create_losing_the_first_name()
+		self.assertEqual(
+			frappe.db.count("Raven Workspace") - before,
+			1,
+			"only the attempt that inserted a mapping may leave a Raven Workspace behind",
+		)
+		self.assertFalse(
+			frappe.db.exists("Raven Workspace", self.taken_label),
+			"the Raven Workspace of the failed attempt must be rolled back",
+		)
+
+	def test_a_retried_create_does_not_return_a_duplicate_name_dialog(self):
+		"""db_insert msgprints a red "Duplicate Name" before raising, so without
+		clear_last_message a create that then succeeded still popped that dialog —
+		naming a default the user never chose and never saw."""
+		frappe.clear_messages()
+		self._create_losing_the_first_name()
+		titles = [message.get("title") for message in frappe.get_message_log()]
+		self.assertNotIn("Duplicate Name", titles)
+
+
 class TestPreviewRuleValidatesItsInput(FrappeTestCase):
 	"""preview_rule is whitelisted and its three fields reach a dict lookup, a bare
 	json.loads and an attribute access. Unvalidated, each is a 500 with a traceback."""
