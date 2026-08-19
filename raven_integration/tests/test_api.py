@@ -2566,6 +2566,69 @@ class TestPreviewRuleValidatesItsInput(FrappeTestCase):
 				preview_rule({"provider": "REQCFG2", "rule_type": "needs-batch", "config": [1]})
 
 
+class TestMutatingEndpointsAreNotReachableByGet(FrappeTestCase):
+	"""Hardening, not a live hole: frappe already rolls back a non-unsafe method
+	and every enqueue here is enqueue_after_commit. But a bare @frappe.whitelist()
+	allows GET, and CSRF is skipped for non-unsafe methods — so the declaration is
+	the only thing saying these change state. frappe.client does the same."""
+
+	_STATE_CHANGING = (
+		"enable_integration",
+		"create_workspace",
+		"update_workspace",
+		"delete_workspace",
+		"recreate_workspace",
+		"set_workspace_type",
+		"set_workspace_label",
+		"create_channel",
+		"update_channel",
+		"delete_channel",
+		"recreate_channel",
+		"set_channel_enabled",
+		"set_channel_type",
+		"set_channel_label",
+		"set_channel_rule_status",
+		"reconcile_now",
+		"link_workspace",
+		"link_channel",
+	)
+
+	_READ_ONLY = (
+		"is_setup",
+		"list_providers",
+		"list_workspaces",
+		"get_workspace",
+		"list_workspace_members",
+		"list_channels",
+		"get_channel",
+		"preview_rule",
+		"compute_rule_diff",
+		"list_unmapped_workspaces",
+		"list_unmapped_channels",
+	)
+
+	def _methods(self, name: str):
+		from raven_integration import api
+
+		return frappe.allowed_http_methods_for_whitelisted_func[getattr(api, name)]
+
+	def test_every_state_changing_endpoint_refuses_get(self):
+		for name in self._STATE_CHANGING:
+			with self.subTest(endpoint=name):
+				self.assertNotIn("GET", self._methods(name))
+				self.assertIn("POST", self._methods(name))
+
+	def test_the_delete_endpoints_also_accept_delete(self):
+		for name in ("delete_workspace", "delete_channel"):
+			with self.subTest(endpoint=name):
+				self.assertIn("DELETE", self._methods(name))
+
+	def test_read_only_endpoints_stay_reachable_by_get(self):
+		for name in self._READ_ONLY:
+			with self.subTest(endpoint=name):
+				self.assertIn("GET", self._methods(name))
+
+
 class TestCaseOnlyNameCollision(FrappeTestCase):
 	"""The docname column collates utf8mb4_unicode_ci, so two mappings whose labels
 	differ only in case cannot both exist. db.exists is case-insensitive for the

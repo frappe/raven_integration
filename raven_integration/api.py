@@ -694,7 +694,7 @@ def is_setup() -> dict:
 	}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def enable_integration() -> dict:
 	"""Enable membership sync (one-way — there is no disable). Triggers an initial reconcile."""
 	_require_manager()
@@ -849,7 +849,7 @@ def list_workspace_members(name: str) -> list[dict]:
 	return sorted(members.values(), key=lambda m: m["full_name"].lower())
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def create_workspace(label: "str | None" = None, type: str = "Private") -> str:
 	"""Create a Raven Workspace Mapping. With no label, auto-names 'Workspace N'
 	(next free number) so the UI can add a row in one click."""
@@ -868,7 +868,7 @@ def create_workspace(label: "str | None" = None, type: str = "Private") -> str:
 	)
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def update_workspace(name: str, label: str, type: str) -> str:
 	"""Update a Raven Workspace Mapping. Returns the docname, which changes when
 	the label changes (the docname is derived from the label)."""
@@ -890,7 +890,7 @@ def update_workspace(name: str, label: str, type: str) -> str:
 	)
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["DELETE", "POST"])
 def delete_workspace(name: str) -> None:
 	"""Delete the Raven Workspace Mapping, its child channel mappings, and the
 	membership their rules had granted.
@@ -907,7 +907,7 @@ def delete_workspace(name: str) -> None:
 	frappe.get_doc("Raven Workspace Mapping", name).delete()
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def recreate_workspace(name: str) -> str:
 	"""Give a stale Raven Workspace Mapping a fresh backing Raven Workspace."""
 	_require_manager()
@@ -928,7 +928,7 @@ def recreate_workspace(name: str) -> str:
 	return doc.raven_workspace
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def set_workspace_type(name: str, type: str) -> dict:
 	"""Change a Raven Workspace Mapping's visibility (Public/Private)."""
 	_require_manager()
@@ -937,7 +937,7 @@ def set_workspace_type(name: str, type: str) -> dict:
 	return _set_mapping_type("Raven Workspace Mapping", "workspace_type", name, type_)
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def set_workspace_label(name: str, label: str) -> dict:
 	"""Rename a Raven Workspace Mapping and its backing Raven Workspace (inline edit)."""
 	_require_manager()
@@ -1017,7 +1017,7 @@ def get_channel(name: str) -> dict:
 	}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def create_channel(
 	workspace: str,
 	label: "str | None" = None,
@@ -1053,7 +1053,7 @@ def create_channel(
 	)
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def update_channel(
 	name: str,
 	label: str,
@@ -1086,7 +1086,7 @@ def update_channel(
 	)
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["DELETE", "POST"])
 def delete_channel(name: str) -> None:
 	"""Delete the Raven Channel Mapping and the membership its rules had granted.
 
@@ -1100,7 +1100,7 @@ def delete_channel(name: str) -> None:
 	frappe.get_doc("Raven Channel Mapping", name).delete()
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def recreate_channel(name: str) -> str:
 	"""Give a stale Raven Channel Mapping a fresh backing Raven Channel."""
 	_require_manager()
@@ -1132,7 +1132,7 @@ def recreate_channel(name: str) -> str:
 	return doc.raven_channel
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def set_channel_enabled(name: str, enabled: bool) -> dict:
 	"""Enable/disable membership sync for a single Raven Channel Mapping.
 
@@ -1150,7 +1150,7 @@ def set_channel_enabled(name: str, enabled: bool) -> dict:
 	return {"enabled": enabled}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def set_channel_type(name: str, type: str) -> dict:
 	"""Change a Raven Channel Mapping's visibility (Public/Private/Open)."""
 	_require_manager()
@@ -1159,7 +1159,7 @@ def set_channel_type(name: str, type: str) -> dict:
 	return _set_mapping_type("Raven Channel Mapping", "channel_type", name, type_)
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def set_channel_label(name: str, label: str) -> dict:
 	"""Rename a Raven Channel Mapping and its backing Raven Channel (inline edit)."""
 	_require_manager()
@@ -1170,14 +1170,14 @@ def set_channel_label(name: str, label: str) -> dict:
 	)
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def set_channel_rule_status(name: str, path: Any, status: str) -> dict:
 	"""Pause/resume one condition of a Raven Channel Mapping, addressed by its path."""
 	_require_manager()
 	return _set_rule_status("Raven Channel Mapping", name, path, status)
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def reconcile_now(target_doctype: str, name: str) -> dict:
 	"""Queue a full member re-sync for one mapping."""
 	_require_manager()
@@ -1333,7 +1333,7 @@ def list_unmapped_workspaces() -> list[dict]:
 	)
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def link_workspace(raven_workspace: str) -> str:
 	"""Adopt an existing Raven Workspace into a new Raven Workspace Mapping.
 
@@ -1406,7 +1406,7 @@ def list_unmapped_channels(workspace: str) -> list[dict]:
 	)
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def link_channel(
 	workspace: str,
 	raven_channel: str,
