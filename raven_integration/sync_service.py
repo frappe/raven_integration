@@ -408,6 +408,14 @@ def _sync_rule_managed_members(
 	"""
 	if not raven_installed():
 		return {"skipped": True, "reason": "raven_not_installed"}
+	# Imported late: events imports this module. The global kill switch has to be read
+	# here as well as in events.notify_change and scheduler.reconcile_all, because
+	# api._enqueue_member_sync queues sync_channel_members straight — so an admin who
+	# switched the integration off was still getting adds and removals from it.
+	from raven_integration.events import is_active
+
+	if not is_active():
+		return {"skipped": True, "reason": "integration_disabled"}
 	if enabled_gated and not frappe.db.get_value(mapping_doctype, mapping_name, "enabled"):
 		return {"skipped": True, "reason": "disabled"}
 	from raven_integration.engine import disabled_rule_members, has_active_rules

@@ -469,6 +469,46 @@ class TestOneBadMemberDoesNotAbortTheDiff(_SyncedChannelMixin, FrappeTestCase):
 		self.assertEqual(result, {"added": 0, "removed": 1})
 
 
+class TestTheKillSwitchReachesTheSyncPath(_SyncedChannelMixin, FrappeTestCase):
+	"""Raven Membership Settings.enabled is the admin's one switch for all of this.
+
+	events.notify_change and scheduler.reconcile_all read it, but api's
+	_enqueue_member_sync queues sync_channel_members directly, so a mapping saved
+	after the switch went off still added and removed members.
+	"""
+
+	def setUp(self):
+		self._setUp_synced_channel()
+		prev = frappe.db.get_single_value("Raven Membership Settings", "enabled")
+		self.addCleanup(lambda: frappe.db.set_single_value("Raven Membership Settings", "enabled", prev))
+		frappe.db.set_single_value("Raven Membership Settings", "enabled", 0)
+
+	def tearDown(self):
+		self._tearDown_synced_channel()
+
+	def test_a_disabled_integration_adds_nobody(self):
+		with patch("raven_integration.engine.expected_channel_members", return_value={self.user.name}):
+			result = sync_channel_members(self.ch_map.name)
+
+		self.assertEqual(result, {"skipped": True, "reason": "integration_disabled"})
+		self.assertFalse(self._channel_member_exists(self.user.name))
+
+	def test_a_disabled_integration_removes_nobody(self):
+		self._rule_managed_row(self.user.name)
+
+		with patch("raven_integration.engine.expected_channel_members", return_value=set()):
+			result = sync_channel_members(self.ch_map.name)
+
+		self.assertEqual(result, {"skipped": True, "reason": "integration_disabled"})
+		self.assertTrue(self._channel_member_exists(self.user.name))
+
+	def test_the_workspace_pass_is_gated_too(self):
+		self.assertEqual(
+			sync_workspace_members(self.ws_map.name),
+			{"skipped": True, "reason": "integration_disabled"},
+		)
+
+
 class TestWorkspaceMemberAddFailures(_RavenFixtureMixin, FrappeTestCase):
 	"""add_workspace_member read every ValidationError as "already a member".
 
@@ -571,6 +611,7 @@ class TestNoActiveRulesIsNotAuthoritative(unittest.TestCase):
 		)
 		with (
 			patch("raven_integration.sync_service.raven_installed", return_value=True),
+			patch("raven_integration.events.is_active", return_value=True),
 			patch(
 				"raven_integration.sync_service.frappe.db.get_value", side_effect=lambda dt, n, f: values[f]
 			),
@@ -615,6 +656,7 @@ class TestDerivedWorkspaceSync(unittest.TestCase):
 		values = {"raven_workspace": "RW-1"}
 		with (
 			patch("raven_integration.sync_service.raven_installed", return_value=True),
+			patch("raven_integration.events.is_active", return_value=True),
 			patch(
 				"raven_integration.sync_service.frappe.db.get_value", side_effect=lambda dt, n, f: values[f]
 			),
