@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 
 import frappe
 from frappe import _
@@ -9,7 +10,6 @@ from frappe.utils import escape_html
 from raven_integration.exceptions import ProviderDataError
 
 _REQUIRED_PROVIDER_KEYS = ("name", "evaluate", "rule_types")
-_MEMBER_COLLECTIONS = (set, frozenset, list, tuple)
 
 
 def _provider_paths() -> list[str]:
@@ -73,6 +73,108 @@ def _validate_provider_declaration(provider, path: str) -> None:
 				type(provider["rule_types"]).__name__,
 			),
 		)
+
+	_validate_rule_types(provider["name"], provider["rule_types"], path)
+
+
+def _throw_declaration(provider: str, path: str, msg: str) -> None:
+	frappe.throw(
+		title=_("Invalid membership provider"),
+		msg=_(
+			"The membership provider <b>{0}</b> declared by <b>{1}</b> {2} Fix it in the app that registers this hook, then reload."
+		).format(escape_html(provider), escape_html(path), msg),
+	)
+
+
+def _validate_rule_types(provider: str, rule_types: list, path: str) -> None:
+	"""Reject a rule-type declaration the registry or the rule builder cannot use.
+
+	`fields` is a schema two sides read — `validate_rule_config` here and the host's
+	form renderer there — so a key either side dereferences is checked once, at load,
+	where the message can name the hook that produced it. `depends_on` is the one that
+	most needs it: it is dereferenced as a dict, and a fieldname it names that the
+	rule type does not declare hides that field on every row, forever, with nothing
+	said. Both used to be discovered as an AttributeError out of a channel save.
+	"""
+	for rt in rule_types:
+		if not isinstance(rt, dict):
+			_throw_declaration(
+				provider, path, _("declares a rule type of {0} instead of a dict.").format(type(rt).__name__)
+			)
+		type_name = rt.get("type")
+		if not isinstance(type_name, str) or not type_name.strip():
+			_throw_declaration(
+				provider,
+				path,
+				_(
+					"declares a rule type whose <b>type</b> is {0}. It must be a non-empty string — it is what rules are stored against."
+				).format(type(type_name).__name__),
+			)
+		fields = rt.get("fields") or []
+		if not isinstance(fields, list):
+			_throw_declaration(
+				provider,
+				path,
+				_(
+					"declares rule type <b>{0}</b> with <b>fields</b> of {1}. It must be a list of field declarations."
+				).format(escape_html(type_name), type(fields).__name__),
+			)
+		fieldnames = set()
+		for f in fields:
+			if not isinstance(f, dict):
+				_throw_declaration(
+					provider,
+					path,
+					_("declares a field of {0} on rule type <b>{1}</b> instead of a dict.").format(
+						type(f).__name__, escape_html(type_name)
+					),
+				)
+			fieldname = f.get("fieldname")
+			if not isinstance(fieldname, str) or not fieldname.strip():
+				_throw_declaration(
+					provider,
+					path,
+					_(
+						"declares a field on rule type <b>{0}</b> whose <b>fieldname</b> is {1}. It must be a non-empty string — it is the key the rule's config is stored under."
+					).format(escape_html(type_name), type(fieldname).__name__),
+				)
+			fieldnames.add(fieldname)
+		for f in fields:
+			dep = f.get("depends_on")
+			if dep is None:
+				continue
+			if not isinstance(dep, dict):
+				_throw_declaration(
+					provider,
+					path,
+					_(
+						"declares <b>depends_on</b> as {0} on field <b>{1}</b> of rule type <b>{2}</b>. It must be a dict carrying a <b>field</b> key and a <b>value</b> key; the <code>eval:</code> string form Frappe accepts on a DocField is not supported here."
+					).format(type(dep).__name__, escape_html(f["fieldname"]), escape_html(type_name)),
+				)
+			if dep.get("field") not in fieldnames:
+				_throw_declaration(
+					provider,
+					path,
+					_(
+						"declares <b>depends_on.field</b> of {0} on field <b>{1}</b> of rule type <b>{2}</b>, which that rule type does not declare. The field would be hidden on every rule and never rendered."
+					).format(
+						escape_html(str(dep.get("field"))),
+						escape_html(f["fieldname"]),
+						escape_html(type_name),
+					),
+				)
+			if "value" not in dep:
+				_throw_declaration(
+					provider,
+					path,
+					_(
+						"declares <b>depends_on</b> with no <b>value</b> on field <b>{0}</b> of rule type <b>{1}</b>. Name the value of <b>{2}</b> that this field applies to."
+					).format(
+						escape_html(f["fieldname"]),
+						escape_html(type_name),
+						escape_html(str(dep.get("field"))),
+					),
+				)
 
 
 def _throw_duplicate_provider(name: str, first_path: str, second_path: str) -> None:
@@ -155,21 +257,39 @@ def _members_returned(value, provider: str, rule_type: str) -> set[str]:
 	None raises TypeError, which the engine's lenient handler does not catch, so a
 	read of the channel page 500s. ProviderDataError instead, because both the strict
 	sync path and the lenient read path already know what to do with it.
+
+	Any iterable is accepted, as the contract in the README promises: a provider that
+	answers with a generator, a ``dict_keys`` or a QueryBuilder result is returning
+	users, and narrowing this to four concrete collections would stop its channels
+	syncing over the shape of the container. ``str`` and ``bytes`` are the two
+	iterables that are excluded, because they are the ones that iterate into
+	characters rather than into users.
 	"""
-	if not isinstance(value, _MEMBER_COLLECTIONS):
+	if value is None or isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
 		raise ProviderDataError(
 			f"Membership provider {provider!r} returned {type(value).__name__} for rule type "
-			f"{rule_type!r}. evaluate(rule_type, config) must return a set, frozenset, list or "
-			f"tuple of user IDs. Fix that provider in the app that registers it."
+			f"{rule_type!r}. evaluate(rule_type, config) must return an iterable of user IDs "
+			f"(a set, list, tuple or generator — not a string). Fix that provider in the app "
+			f"that registers it."
 		)
-	for user in value:
+	# Drained once, before the check below: a generator is consumed by iterating it,
+	# so validating first and converting after would hand back an empty set.
+	try:
+		members = set(value)
+	except TypeError as e:
+		raise ProviderDataError(
+			f"Membership provider {provider!r} returned unhashable entries among the users "
+			f"matching rule type {rule_type!r} ({e}). Every entry must be a user ID string. "
+			f"Fix that provider in the app that registers it."
+		) from e
+	for user in members:
 		if not isinstance(user, str) or not user.strip():
 			raise ProviderDataError(
 				f"Membership provider {provider!r} returned {user!r} among the users matching "
 				f"rule type {rule_type!r}. Every entry must be a non-empty user ID string. "
 				f"Fix that provider in the app that registers it."
 			)
-	return set(value)
+	return members
 
 
 def evaluate(provider: str, rule_type: str, config: dict) -> set[str]:

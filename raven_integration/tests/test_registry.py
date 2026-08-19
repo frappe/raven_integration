@@ -20,7 +20,19 @@ _SLOPPY_RETURNS = {
 	"a-frozenset": frozenset({"a@example.com"}),
 	"a-number-among-the-users": ["a@example.com", 7],
 	"a-blank-among-the-users": ["a@example.com", "   "],
+	# Perfectly ordinary answers a provider gives when it does not go out of its way
+	# to build a set: a query generator, and the keys of a dict it grouped by. The
+	# generator is behind a callable because a generator is consumed by being read,
+	# and a module-level one would be empty for every test after the first.
+	"a-generator": lambda: (u for u in ("a@example.com", "b@example.com")),
+	"dict-keys": {"a@example.com": 1, "b@example.com": 2}.keys(),
+	"unhashable-entries": [["a@example.com"]],
 }
+
+
+def _sloppy_return(rule_type):
+	value = _SLOPPY_RETURNS[rule_type]
+	return value() if callable(value) else value
 
 
 def get_sloppy_provider():
@@ -32,7 +44,7 @@ def get_sloppy_provider():
 		"name": "SLOPPY",
 		"label": "Sloppy",
 		"rule_types": [{"type": t, "label": t, "fields": []} for t in _SLOPPY_RETURNS],
-		"evaluate": lambda rule_type, config: _SLOPPY_RETURNS[rule_type],
+		"evaluate": lambda rule_type, config: _sloppy_return(rule_type),
 	}
 
 
@@ -174,3 +186,97 @@ class TestProviderReturnValue(FrappeTestCase):
 
 	def test_a_frozenset_of_users_is_accepted(self):
 		self.assertEqual(self._evaluate("a-frozenset"), {"a@example.com"})
+
+	def test_a_generator_of_users_is_accepted(self):
+		# The contract is "any iterable", and a provider that yields its users rather
+		# than materialising them is not making a mistake. Narrowing this to four
+		# concrete collection types stopped such a provider's channels syncing.
+		self.assertEqual(self._evaluate("a-generator"), {"a@example.com", "b@example.com"})
+
+	def test_a_dict_keys_view_of_users_is_accepted(self):
+		self.assertEqual(self._evaluate("dict-keys"), {"a@example.com", "b@example.com"})
+
+	def test_unhashable_entries_are_reported_as_provider_data(self):
+		# set() raises TypeError on these, which the engine's lenient handler does
+		# not catch — the same 500 a returned None used to cause.
+		with self.assertRaises(ProviderDataError):
+			self._evaluate("unhashable-entries")
+
+
+_BAD_DEP_PATH = "raven_integration.tests.test_registry.get_string_depends_on_provider"
+_UNKNOWN_DEP_PATH = "raven_integration.tests.test_registry.get_unknown_depends_on_provider"
+_NO_FIELDNAME_PATH = "raven_integration.tests.test_registry.get_unnamed_field_provider"
+
+
+def _one_rule_type(fields):
+	return {
+		"name": "BADDECL",
+		"label": "Bad declaration",
+		"rule_types": [{"type": "scoped", "label": "Scoped", "fields": fields}],
+		"evaluate": lambda rule_type, config: set(),
+	}
+
+
+def get_string_depends_on_provider():
+	"""A provider that writes `depends_on` the way a Frappe DocField does."""
+	return _one_rule_type(
+		[
+			{"fieldname": "mode", "fieldtype": "Select", "options": ["role"], "default": "role"},
+			{"fieldname": "courses", "fieldtype": "MultiSelect", "depends_on": "eval:doc.mode=='role'"},
+		]
+	)
+
+
+def get_unknown_depends_on_provider():
+	return _one_rule_type(
+		[
+			{"fieldname": "mode", "fieldtype": "Select", "options": ["role"], "default": "role"},
+			# `mdoe`, not `mode`.
+			{
+				"fieldname": "courses",
+				"fieldtype": "MultiSelect",
+				"depends_on": {"field": "mdoe", "value": "role"},
+			},
+		]
+	)
+
+
+def get_unnamed_field_provider():
+	return _one_rule_type([{"fieldtype": "Select", "label": "Mode", "options": ["role"]}])
+
+
+class TestDeclarationValidation(FrappeTestCase):
+	"""A rule-type declaration is a schema two sides dereference, so it is checked once.
+
+	`validate_rule_config` runs on every channel save. A declaration it cannot read
+	used to surface there as an AttributeError out of the save path — a 500 on the
+	settings page, naming neither the hook nor the app that produced it.
+	"""
+
+	def _evaluate_with(self, path):
+		with patch.object(registry, "_provider_paths", return_value=[path]):
+			registry.validate_rule_config("BADDECL", "scoped", {"mode": "role"})
+
+	def test_frappes_string_depends_on_is_refused_by_name(self):
+		with self.assertRaises(frappe.ValidationError) as cm:
+			self._evaluate_with(_BAD_DEP_PATH)
+		message = str(cm.exception)
+		self.assertIn("depends_on", message)
+		self.assertIn("courses", message)
+
+	def test_depends_on_naming_a_field_the_rule_type_does_not_declare_is_refused(self):
+		# Silently satisfied by nothing, so the field is hidden on every rule of this
+		# type forever and no row can ever be completed.
+		with self.assertRaises(frappe.ValidationError) as cm:
+			self._evaluate_with(_UNKNOWN_DEP_PATH)
+		self.assertIn("mdoe", str(cm.exception))
+
+	def test_a_field_with_no_fieldname_is_refused(self):
+		with self.assertRaises(frappe.ValidationError) as cm:
+			self._evaluate_with(_NO_FIELDNAME_PATH)
+		self.assertIn("fieldname", str(cm.exception))
+
+	def test_a_sound_conditional_declaration_still_loads(self):
+		# The guard above must not be reachable by the shape the LMS provider uses.
+		with patch.object(registry, "_provider_paths", return_value=[_CONDITIONAL_PATH]):
+			registry.validate_rule_config("CONDITIONAL", "scoped", {"mode": "role"})

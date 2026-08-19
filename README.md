@@ -216,11 +216,20 @@ def evaluate(rule_type: str, config: dict) -> set[str]:
 - **`label`** is optional; it falls back to `name`.
 - **`rule_types[].type`** is validated on every rule save and on every evaluation. Evaluating a rule
   whose `rule_type` is not declared here throws before `evaluate` is ever called.
-- **`rule_types[].fields`** — the core only reads `fieldname`, `reqd` and `label` from each entry, to
-  enforce required config keys when a rule is saved. Every other key (`fieldtype`, `options`, …) is
-  passed through untouched for the consuming app's form renderer.
-- **`evaluate(rule_type, config)`** returns any iterable of `User` names; the registry wraps it in a
-  `set()`. `config` is whatever the admin saved — the core never looks inside it. Raise
+- **`rule_types[].fields`** — the core reads `fieldname`, `reqd`, `label`, `default` and
+  `depends_on` from each entry, to enforce required config keys when a rule is saved. Every other key
+  (`fieldtype`, `options`, …) is passed through untouched for the consuming app's form renderer.
+- **`rule_types[].fields[].depends_on`** — `{"field": "other_fieldname", "value": "..."}`. The field
+  applies only while `other_fieldname` holds `value`; where it does not, it is not rendered, not
+  checked for `reqd` and not written. The value compared is the one the control *shows*, so a
+  `Select` with nothing stored counts as its `default`. Frappe's `eval:` string form is **not**
+  supported. `field` must name another field of the same rule type — the declaration is rejected at
+  load if it does not, because a field depending on a name nothing declares would be hidden on every
+  rule forever.
+- **`evaluate(rule_type, config)`** returns any iterable of `User` names — a set, list, tuple or
+  generator; the registry drains it into a `set()`. `str` and `bytes` are rejected, being the
+  iterables that would yield one "member" per character. `config` is whatever the admin saved — the
+  core never looks inside it. Raise
   `raven_integration.exceptions.ProviderDataError` (or `frappe.ValidationError`) when the config
   references something that no longer exists; read paths log and skip such a rule, sync paths fail
   loudly.
