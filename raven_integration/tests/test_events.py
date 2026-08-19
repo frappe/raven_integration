@@ -313,6 +313,16 @@ class TestTriggerDoctypeCache(FrappeTestCase):
 		cache = frappe.cache()
 		self.assertGreater(cache.ttl(cache.make_key(_TRIGGER_DOCTYPES_KEY)), 0)
 
+	def test_a_registry_that_blows_up_is_logged(self):
+		# Failing closed is right — but silently, this is a site-wide no-op: every save
+		# stops reaching notify_change() and nothing says why until the nightly sweep.
+		with (
+			patch.object(registry, "trigger_doctypes", side_effect=RuntimeError("boom")),
+			patch("raven_integration.events.frappe.log_error") as log,
+		):
+			self.assertEqual(_trigger_doctypes(), set())
+		log.assert_called_once()
+
 	def test_invalidation_is_wired_to_the_install_and_app_hooks(self):
 		if "raven_integration" not in frappe.get_installed_apps():
 			self.skipTest("raven_integration not installed on this site")

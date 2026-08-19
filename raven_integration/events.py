@@ -173,6 +173,13 @@ def _trigger_doctypes() -> set[str]:
 			cache.set_value(_TRIGGER_DOCTYPES_KEY, doctypes, expires_in_sec=_TRIGGER_DOCTYPES_TTL)
 		return set(doctypes)
 	except Exception:
+		# Fail closed, but never quietly: an app whose hooks.py raises on import, or a
+		# cache that is down, otherwise turns the change handler into a site-wide no-op
+		# and membership stops reacting to anything until the nightly reconcile.
+		frappe.log_error(
+			title="raven_integration trigger doctypes",
+			message=frappe.get_traceback(),
+		)
 		return set()
 
 
