@@ -195,23 +195,55 @@ def disabled_rule_members(tree, *, strict: bool = True) -> set[str]:
 	population, so dropping it would *add* people. See ``pausable``.
 	"""
 	out: set[str] = set()
+	skipped: dict = {}
 	for path, leaf in iter_leaves(parse_tree(tree)):
 		if not _is_paused(leaf):
 			continue
+		messages_before = len(frappe.message_log)
 		try:
 			out |= _evaluate_one(leaf)
-		except (ProviderDataError, frappe.ValidationError):
+		except (ProviderDataError, frappe.ValidationError) as e:
 			if strict:
 				raise
-			frappe.log_error(
-				title="Raven Integration: skipped disabled rule the provider could not evaluate",
-				message=(
-					f"Disabled rule at path {path} (provider={leaf.get('provider')!r}, "
-					f"rule_type={leaf.get('rule_type')!r}) could not be evaluated; its "
-					f"members are not frozen and may be removed by the next sync."
-				),
-			)
+			_record_skipped(skipped, path, leaf, e, messages_before)
+	_log_skipped(
+		skipped,
+		title="Raven Integration: skipped disabled rules the provider could not evaluate",
+		consequence="Their members are not frozen and may be removed by the next sync.",
+	)
 	return out
+
+
+def _record_skipped(skipped: dict, path: list, leaf: dict, error: Exception, messages_before: int) -> None:
+	"""Swallow one unevaluable leaf: unqueue its dialog, remember it for the log.
+
+	frappe.msgprint appends to frappe.message_log before frappe.throw raises, so
+	catching the exception without dropping the message returns HTTP 200 carrying
+	_server_messages and the settings page pops a red error dialog on a request that
+	succeeded. Only what this leaf queued is dropped — a ProviderDataError queues
+	nothing, and the caller's own messages are not ours to discard.
+	"""
+	while len(frappe.message_log) > messages_before:
+		frappe.clear_last_message()
+	skipped.setdefault((leaf.get("provider"), leaf.get("rule_type"), str(error)), []).append(path)
+
+
+def _log_skipped(skipped: dict, *, title: str, consequence: str) -> None:
+	"""One Error Log per call for everything it skipped, rather than one per leaf.
+
+	The lenient path serves a read endpoint over a tree that may hold MAX_TREE_NODES
+	leaves, so an uninstalled provider app used to insert an Error Log document per
+	leaf, on every reload. Leaves failing for the same provider, rule type and reason
+	are one finding; their paths are kept so each one can still be found.
+	"""
+	if not skipped:
+		return
+	blocks = [
+		f"provider={provider!r} rule_type={rule_type!r}: {error}\n"
+		f"{consequence}\nAffected rules ({len(paths)}) at: {paths}"
+		for (provider, rule_type, error), paths in skipped.items()
+	]
+	frappe.log_error(title=title, message="\n\n".join(blocks))
 
 
 def _evaluate_one(rule: dict) -> set[str]:
@@ -219,7 +251,7 @@ def _evaluate_one(rule: dict) -> set[str]:
 	return registry_evaluate(rule.get("provider"), rule.get("rule_type"), _parse_config(rule))
 
 
-def _evaluate_node(node, path: list, *, strict: bool) -> "set[str] | None":
+def _evaluate_node(node, path: list, *, strict: bool, skipped: dict) -> "set[str] | None":
 	"""One node's population, or None when the node contributes nothing at all.
 
 	Absent is not the same as empty. A paused leaf, a leaf the provider could not
@@ -229,26 +261,20 @@ def _evaluate_node(node, path: list, *, strict: bool) -> "set[str] | None":
 	honestly to no users is empty, and does narrow an ``and``.
 	"""
 	if is_group(node):
-		return _evaluate_group(node, path, strict=strict)
+		return _evaluate_group(node, path, strict=strict, skipped=skipped)
 	if not isinstance(node, dict) or _is_paused(node):
 		return None
+	messages_before = len(frappe.message_log)
 	try:
 		return _evaluate_one(node)
-	except (ProviderDataError, frappe.ValidationError):
+	except (ProviderDataError, frappe.ValidationError) as e:
 		if strict:
 			raise
-		frappe.log_error(
-			title="Raven Integration: skipped rule the provider could not evaluate",
-			message=(
-				f"Rule at path {path} (provider={node.get('provider')!r}, "
-				f"rule_type={node.get('rule_type')!r}) could not be evaluated; "
-				f"skipped in read-path evaluation."
-			),
-		)
+		_record_skipped(skipped, path, node, e, messages_before)
 		return None
 
 
-def _evaluate_group(group: dict, path: list, *, strict: bool) -> "set[str] | None":
+def _evaluate_group(group: dict, path: list, *, strict: bool, skipped: dict) -> "set[str] | None":
 	"""Fold a group's children by its conjunctions, or None if none survive.
 
 	The fold applies classic precedence — ``and`` binds tighter than ``or`` — so a
@@ -275,7 +301,7 @@ def _evaluate_group(group: dict, path: list, *, strict: bool) -> "set[str] | Non
 			if run is not None:
 				or_terms.append(run)
 			run = None
-		value = _evaluate_node(child, [*path, index], strict=strict)
+		value = _evaluate_node(child, [*path, index], strict=strict, skipped=skipped)
 		if value is None:
 			continue
 		run = value if run is None else run & value
@@ -293,7 +319,13 @@ def evaluate_rules(tree, *, strict: bool = True) -> set[str]:
 	instead of raising (read/display path); the sync path keeps the default
 	strict=True so unexpected data fails loud.
 	"""
-	result = _evaluate_node(parse_tree(tree), [], strict=strict)
+	skipped: dict = {}
+	result = _evaluate_node(parse_tree(tree), [], strict=strict, skipped=skipped)
+	_log_skipped(
+		skipped,
+		title="Raven Integration: skipped rules the provider could not evaluate",
+		consequence="Skipped in read-path evaluation.",
+	)
 	return result if result is not None else set()
 
 

@@ -6,6 +6,20 @@ from frappe.tests.utils import FrappeTestCase
 from raven_integration import engine, registry
 
 _FAKE = ["raven_integration.tests.fake_provider.get_provider"]
+_EDGE = "raven_integration.tests.test_engine.get_edge_provider"
+
+# The two answers the FAKE provider has no rule type for: a rule that evaluates
+# honestly to nobody, and one whose evaluate() does not return a population at all.
+_EDGE_RETURNS = {"nobody": set(), "not-a-population": None}
+
+
+def get_edge_provider():
+	return {
+		"name": "EDGE",
+		"label": "Edge",
+		"rule_types": [{"type": t, "label": t, "fields": []} for t in _EDGE_RETURNS],
+		"evaluate": lambda rule_type, config: _EDGE_RETURNS[rule_type],
+	}
 
 
 def _derived(members):
@@ -257,3 +271,79 @@ class TestPauseInvariant(FrappeTestCase):
 		self.assertFalse(engine.pausable(tree, [0]))
 		self.assertFalse(engine.pausable(tree, [1]))
 		self.assertFalse(engine.pausable(tree, [2]))
+
+
+def _edge_rule(rule_type, status="Active"):
+	return {"provider": "EDGE", "rule_type": rule_type, "config": {}, "status": status}
+
+
+class TestSwallowedRuleErrorsStayQuiet(FrappeTestCase):
+	def setUp(self):
+		self._patch = patch.object(registry, "_provider_paths", lambda: [*_FAKE, _EDGE])
+		self._patch.start()
+		self.addCleanup(self._patch.stop)
+		frappe.clear_messages()
+		self.addCleanup(frappe.clear_messages)
+
+	def test_a_skipped_rule_leaves_no_error_dialog_queued(self):
+		# frappe.throw queues its message before raising, so swallowing the exception
+		# without clearing it returns 200 carrying _server_messages and the settings
+		# page pops a red dialog on a request that succeeded.
+		tree = _tree(_rule("no-such-rule-type"), _rule("always-a"))
+		with patch("raven_integration.engine.frappe.log_error"):
+			engine.evaluate_rules(tree, strict=False)
+		self.assertEqual(list(frappe.message_log), [])
+
+	def test_a_strict_evaluation_still_shows_the_user_the_error(self):
+		tree = _tree(_rule("no-such-rule-type"))
+		with self.assertRaises(frappe.ValidationError):
+			engine.evaluate_rules(tree)
+		self.assertEqual(len(frappe.message_log), 1)
+
+	def test_one_unevaluable_provider_logs_once_not_once_per_rule(self):
+		# A tree may hold MAX_TREE_NODES leaves and this runs on a read endpoint, so
+		# one Error Log document per leaf per reload is the amplification being fixed.
+		tree = _tree(*[_rule("no-such-rule-type") for _ in range(5)])
+		with patch("raven_integration.engine.frappe.log_error") as log:
+			engine.evaluate_rules(tree, strict=False)
+		self.assertEqual(log.call_count, 1)
+
+	def test_the_one_log_still_names_the_provider_the_rule_type_and_the_paths(self):
+		tree = _tree(_rule("no-such-rule-type"), _rule("no-such-rule-type"))
+		with patch("raven_integration.engine.frappe.log_error") as log:
+			engine.evaluate_rules(tree, strict=False)
+		message = log.call_args.kwargs["message"]
+		self.assertIn("FAKE", message)
+		self.assertIn("no-such-rule-type", message)
+		self.assertIn("[0]", message)
+		self.assertIn("[1]", message)
+
+	def test_two_different_failures_are_both_reported_in_the_one_log(self):
+		# Deduplication is by what actually differs, so collapsing to one entry must
+		# not lose the second provider's problem.
+		tree = _tree(_rule("no-such-rule-type"), _edge_rule("not-a-population"))
+		with patch("raven_integration.engine.frappe.log_error") as log:
+			engine.evaluate_rules(tree, strict=False)
+		self.assertEqual(log.call_count, 1)
+		message = log.call_args.kwargs["message"]
+		self.assertIn("FAKE", message)
+		self.assertIn("EDGE", message)
+
+	def test_a_provider_returning_something_that_is_not_a_population_is_skipped(self):
+		# Before the registry validated its return, this was a TypeError from set(None)
+		# that escaped the lenient handler and 500ed the channel detail page.
+		tree = _tree(_edge_rule("not-a-population"), _rule("always-a"))
+		with patch("raven_integration.engine.frappe.log_error"):
+			self.assertEqual(engine.evaluate_rules(tree, strict=False), {"a@example.com"})
+
+	def test_skipped_disabled_rules_log_once_and_queue_no_dialog(self):
+		tree = _tree(*[_rule("no-such-rule-type", status="Paused") for _ in range(4)])
+		with patch("raven_integration.engine.frappe.log_error") as log:
+			self.assertEqual(engine.disabled_rule_members(tree, strict=False), set())
+		self.assertEqual(log.call_count, 1)
+		self.assertEqual(list(frappe.message_log), [])
+
+	def test_nothing_is_logged_when_every_rule_evaluated(self):
+		with patch("raven_integration.engine.frappe.log_error") as log:
+			engine.evaluate_rules(_tree(_rule("always-a")), strict=False)
+		log.assert_not_called()
