@@ -38,6 +38,41 @@ def _declared_roles() -> list[str]:
 	return [role for role in manager_roles() if role != "System Manager"]
 
 
+def _doctype_own_roles() -> set[str]:
+	"""Roles the managed doctypes' own DocPerms grant.
+
+	add_permission() copies these into Custom DocPerm the first time it touches a
+	doctype, so they sit alongside our grants and must never be dropped with them.
+	"""
+	roles: set[str] = set()
+	for doctype in MANAGED_DOCTYPES:
+		roles.update(frappe.get_all("DocPerm", filters={"parent": doctype}, pluck="role"))
+	return roles
+
+
+def _granted_roles() -> set[str]:
+	"""Roles holding a Custom DocPerm on a managed doctype because this app put it there.
+
+	Read off the rows rather than off the hook: the grant that most needs dropping
+	belongs to a role whose declaring app is already gone, and get_hooks resolves
+	active apps only, so by then nothing names it any more.
+	"""
+	granted: set[str] = set()
+	for doctype in MANAGED_DOCTYPES:
+		granted.update(frappe.get_all("Custom DocPerm", filters={"parent": doctype}, pluck="role"))
+	return granted - _doctype_own_roles()
+
+
+def _drop_docperms(roles: set[str]) -> None:
+	if not roles:
+		return
+	names = sorted(roles)
+	for doctype in MANAGED_DOCTYPES:
+		frappe.db.delete("Custom DocPerm", {"parent": doctype, "role": ("in", names)})
+		# db.delete writes no document, so nothing invalidates the doctype's cached meta.
+		frappe.clear_cache(doctype=doctype)
+
+
 def _set_permission_types(row: str, ptypes: tuple[str, ...]) -> None:
 	"""Turn on the ptypes a manager needs, addressing the row by name.
 
@@ -84,14 +119,34 @@ def sync_manager_docperms(app_name: str | None = None) -> None:
 				_set_permission_types(row, ptypes)
 
 
+def revoke_undeclared_manager_docperms(app_name: str | None = None) -> None:
+	"""Drop the grants of every role no active app declares any more.
+
+	Runs from after_app_uninstall only. Uninstalling the app that named a manager role
+	takes the role out of manager_roles(), so every endpoint starts rejecting it, but
+	the Custom DocPerm rows survive and keep the desk form and /api/resource open on the
+	mapping doctypes, where a delete evicts rule-managed members from a live Raven
+	channel.
+
+	The hook is the only source of truth for who manages this integration, so a grant on
+	a managed doctype that no hook backs goes even if a human added it by hand. That is
+	why this is not wired to after_migrate: nothing marks a grant as ours, so a migrate
+	pass would delete a hand-added permission with no uninstall to explain it. The cost
+	is a host app that was `disable-app`'d rather than uninstalled — that fires no hook
+	of ours, so its grants persist until it is uninstalled for real.
+
+	``app_name`` is ignored: the role could have been declared by any app, not only the
+	one being uninstalled.
+	"""
+	_drop_docperms(_granted_roles() - set(manager_roles()))
+
+
 def remove_manager_docperms() -> None:
-	"""Drop the Custom DocPerm rows sync_manager_docperms() created.
+	"""Drop every grant sync_manager_docperms() created.
 
 	Called from before_uninstall so uninstalling this app does not leave grants
-	pointing at doctypes that are about to disappear.
+	pointing at doctypes that are about to disappear. Computed from the rows and not
+	from _declared_roles(): the host app may have been uninstalled first, and its role
+	is then the one row nothing else will ever clean up.
 	"""
-	roles = _declared_roles()
-	if not roles:
-		return
-	for doctype in MANAGED_DOCTYPES:
-		frappe.db.delete("Custom DocPerm", {"parent": doctype, "role": ("in", roles)})
+	_drop_docperms(_granted_roles())

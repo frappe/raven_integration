@@ -18,6 +18,12 @@ after_migrate = [
 	"raven_integration.install.after_migrate",
 	"raven_integration.events.clear_trigger_doctypes_cache",
 ]
+# Deliberately NOT revoking here. The revoke cannot tell a grant this app made from
+# one a human added in Role Permission Manager — nothing marks ours — so running it
+# on every migrate would delete a hand-added permission with no uninstall to explain
+# where it went. Uninstall is the moment the grant provably has no declarer left.
+# The cost is a host app that was `disable-app`'d rather than uninstalled: that fires
+# no hook of ours, so its grants survive until it is uninstalled for real.
 before_uninstall = "raven_integration.install.before_uninstall"
 
 # daily_long, not daily: the hook key becomes the Scheduled Job Type frequency, and
@@ -140,7 +146,15 @@ after_app_install = [
 # Name of the app being uninstalled is passed as an argument
 
 # before_app_uninstall = "raven_integration.utils.before_app_uninstall"
-after_app_uninstall = ["raven_integration.events.clear_trigger_doctypes_cache"]
+#
+# The departing app may be the one that declared a manager role. Its DocPerms are ours
+# to drop: manager_roles() stops naming the role the moment the app goes, so every
+# endpoint rejects it while the Custom DocPerm rows keep the desk form and
+# /api/resource open — where a delete evicts rule-managed members from a live channel.
+after_app_uninstall = [
+	"raven_integration.events.clear_trigger_doctypes_cache",
+	"raven_integration.permissions.revoke_undeclared_manager_docperms",
+]
 
 # Build
 # ------------------

@@ -9,6 +9,7 @@ from raven_integration.permissions import (
 	manager_roles,
 	remove_manager_docperms,
 	require_manager,
+	revoke_undeclared_manager_docperms,
 	sync_manager_docperms,
 )
 
@@ -162,6 +163,18 @@ class TestSyncManagerDocperms(ManagerRoleTestCase):
 			remove_manager_docperms()
 		self.assertFalse(self.docperm_rows())
 
+	def test_remove_drops_a_grant_whose_declaring_app_is_already_gone(self):
+		# before_uninstall can run after the host app has been removed: get_hooks
+		# resolves active apps, so the role that needs cleaning up is exactly the one
+		# nothing names any more, and the row would be left pointing at a doctype that
+		# is about to be dropped.
+		with declared_roles(_ROLE):
+			sync_manager_docperms()
+			self.assertTrue(self.docperm_rows())
+		with declared_roles():
+			remove_manager_docperms()
+		self.assertFalse(self.docperm_rows())
+
 	def test_an_owner_only_rule_does_not_cancel_the_grant(self):
 		"""An "Apply Only to Owner" rule for the same role must not answer the probe.
 
@@ -189,6 +202,55 @@ class TestSyncManagerDocperms(ManagerRoleTestCase):
 		self.assertTrue(grant.read and grant.write and grant.create and grant.delete)
 		# The grant must land on the row it created, not on the admin's owner-only rule.
 		self.assertFalse(frappe.db.get_value("Custom DocPerm", owner_rule, "create"))
+
+
+class TestRevokeUndeclaredDocperms(ManagerRoleTestCase):
+	"""Grants outlive the app that asked for them.
+
+	manager_roles() reads the hook, which resolves from active apps, so uninstalling or
+	disabling the declaring app makes every endpoint reject the role while its Custom
+	DocPerm rows keep the desk form and /api/resource open on the mapping doctypes —
+	where a delete evicts rule-managed members from a live Raven channel.
+	"""
+
+	def setUp(self):
+		self.ensure_role()
+
+	def test_grants_stay_while_an_active_app_declares_the_role(self):
+		with declared_roles(_ROLE):
+			sync_manager_docperms()
+			revoke_undeclared_manager_docperms()
+			self.assertTrue(self.docperm_rows())
+
+	def test_grants_go_when_no_active_app_declares_the_role(self):
+		with declared_roles(_ROLE):
+			sync_manager_docperms()
+			self.assertTrue(self.docperm_rows())
+		with declared_roles():
+			revoke_undeclared_manager_docperms("lms")
+		self.assertFalse(self.docperm_rows())
+
+	def test_the_doctypes_own_roles_are_left_alone(self):
+		# add_permission() copies the doctype's JSON perms into Custom DocPerm on first
+		# touch. Those rows are not ours and must survive the revoke.
+		with declared_roles(_ROLE):
+			sync_manager_docperms()
+		with declared_roles():
+			revoke_undeclared_manager_docperms()
+		for doctype in MANAGED_DOCTYPES:
+			self.assertTrue(
+				frappe.db.exists("Custom DocPerm", {"parent": doctype, "role": "System Manager"}),
+				f"{doctype} must keep the System Manager row its JSON declares",
+			)
+
+	def test_uninstall_is_wired_to_the_revoke_and_migrate_is_not(self):
+		# Migrate deliberately does not revoke: nothing marks a grant as this app's,
+		# so a migrate pass would silently delete a permission a human added by hand.
+		from raven_integration import hooks
+
+		path = "raven_integration.permissions.revoke_undeclared_manager_docperms"
+		self.assertIn(path, hooks.after_app_uninstall)
+		self.assertNotIn(path, hooks.after_migrate)
 
 
 class TestManagerCanManageWorkspaces(ManagerRoleTestCase):
