@@ -1191,9 +1191,21 @@ def preview_rule(rule: dict) -> dict:
 	from raven_integration.registry import evaluate as _evaluate
 	from raven_integration.registry import validate_rule_config
 
-	provider = rule.get("provider")
-	rule_type = rule.get("rule_type")
+	# Typed here for the same reason _rule_leaf types the save path: nothing
+	# downstream rejects a provider that arrived as a list. Unvalidated, the three
+	# fields reach a dict lookup, a bare json.loads and an attribute access, and the
+	# user gets a traceback instead of a message naming the field.
+	provider = _str(rule.get("provider"), "provider")
+	rule_type = _str(rule.get("rule_type"), "rule_type")
 	config = rule.get("config") or {}
+	if not isinstance(config, dict):
+		frappe.throw(
+			title=_("Invalid rule settings"),
+			msg=_(
+				"The settings of this condition must be an object, but the request sent {0}. "
+				"Reload the page and try again."
+			).format(type(config).__name__),
+		)
 	validate_rule_config(provider, rule_type, config)
 	matched = _evaluate(provider, rule_type, config)
 	return {

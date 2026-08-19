@@ -2438,3 +2438,58 @@ class TestGetChannelMemberCount(FrappeTestCase):
 		)
 
 
+class TestPreviewRuleValidatesItsInput(FrappeTestCase):
+	"""preview_rule is whitelisted and its three fields reach a dict lookup, a bare
+	json.loads and an attribute access. Unvalidated, each is a 500 with a traceback."""
+
+	def _reqcfg_provider(self):
+		return {
+			"name": "REQCFG2",
+			"label": "Requires Config",
+			"rule_types": [
+				{
+					"type": "needs-batch",
+					"label": "Needs Batch",
+					"fields": [{"fieldname": "batch", "label": "Batch", "reqd": 1}],
+				}
+			],
+			"evaluate": lambda rule_type, config: {config["batch"]},
+			"triggers": [],
+		}
+
+	def test_rejects_a_provider_that_is_not_text(self):
+		"""A list provider reaches dict.get() and raises TypeError: unhashable."""
+		from raven_integration.api import preview_rule
+
+		with self.assertRaises(frappe.ValidationError) as cm:
+			preview_rule({"provider": ["x"], "rule_type": "always-ab", "config": {}})
+		self.assertIn("provider", str(cm.exception))
+
+	def test_rejects_a_rule_type_that_is_not_text(self):
+		"""Reported as a type error naming the field, not as "provider X has no
+		rule type 7" — the request never chose a rule type at all."""
+		from raven_integration.api import preview_rule
+
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			with self.assertRaises(frappe.ValidationError) as cm:
+				preview_rule({"provider": "FAKE", "rule_type": 7, "config": {}})
+		self.assertIn("must be text", str(cm.exception))
+
+	def test_rejects_a_config_that_is_not_an_object(self):
+		"""registry.validate_rule_config json.loads a string config with no guard,
+		so malformed text used to surface as a JSONDecodeError."""
+		from raven_integration.api import preview_rule
+
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			with self.assertRaises(frappe.ValidationError):
+				preview_rule({"provider": "FAKE", "rule_type": "always-ab", "config": "{"})
+
+	def test_rejects_a_config_that_is_a_list(self):
+		"""A list config reaches cfg.get() in the reqd-field loop -> AttributeError."""
+		from raven_integration.api import preview_rule
+
+		with patch.object(registry, "_load_providers", return_value={"REQCFG2": self._reqcfg_provider()}):
+			with self.assertRaises(frappe.ValidationError):
+				preview_rule({"provider": "REQCFG2", "rule_type": "needs-batch", "config": [1]})
+
+
