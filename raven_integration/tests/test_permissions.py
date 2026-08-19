@@ -327,3 +327,37 @@ class TestManagerCanManageWorkspaces(ManagerRoleTestCase):
 			frappe.set_user(plain.name)
 			with self.assertRaises(frappe.PermissionError):
 				create_workspace(label="E2E Should Not Exist", type="Private")
+
+
+class TestRevokeSurvivesTheUninstall(ManagerRoleTestCase):
+	"""after_app_uninstall is the one hook frappe runs after remove_app's last commit.
+
+	`bench uninstall-app` ends in frappe.destroy() -> db.close() with nothing
+	committed in between, so deletes made here are rolled back on the way out and
+	the stale grants this function exists to drop survive the uninstall.
+	"""
+
+	def setUp(self):
+		self.ensure_role()
+
+	def test_dropping_a_grant_commits_it(self):
+		with declared_roles(_ROLE):
+			sync_manager_docperms()
+		self.assertTrue(self.docperm_rows())
+		with declared_roles(), patch("raven_integration.permissions.frappe.db.commit") as commit:
+			revoke_undeclared_manager_docperms("lms")
+		# Both halves: the rows went, and the going was made durable.
+		self.assertFalse(self.docperm_rows())
+		commit.assert_called_once()
+
+	def test_a_run_that_drops_nothing_does_not_commit(self):
+		# after_app_uninstall fires for every app leaving the site, most of which
+		# declare no manager role. A commit on each one would flush whatever the
+		# uninstall had in flight at the time.
+		with (
+			declared_roles(_ROLE),
+			patch("raven_integration.permissions._granted_roles", return_value=set()),
+			patch("raven_integration.permissions.frappe.db.commit") as commit,
+		):
+			revoke_undeclared_manager_docperms("unrelated_app")
+		commit.assert_not_called()

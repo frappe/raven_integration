@@ -137,8 +137,19 @@ def revoke_undeclared_manager_docperms(app_name: str | None = None) -> None:
 
 	``app_name`` is ignored: the role could have been declared by any app, not only the
 	one being uninstalled.
+
+	Commits its own work. ``after_app_uninstall`` is the one hook frappe runs *after*
+	remove_app's last commit, and `bench uninstall-app` ends in frappe.destroy() —
+	db.close() with nothing committed in between — so these deletes are rolled back on
+	the way out and the stale grants survive the uninstall they exist to clean up.
+	(`remove_manager_docperms` on `before_uninstall` needs no such commit: it runs
+	before _delete_modules, whose DDL commits the transaction it sits in.)
 	"""
-	_drop_docperms(_granted_roles() - set(manager_roles()))
+	dropped = _granted_roles() - set(manager_roles())
+	if not dropped:
+		return
+	_drop_docperms(dropped)
+	frappe.db.commit()  # nosemgrep: frappe-manual-commit — see the docstring
 
 
 def remove_manager_docperms() -> None:
