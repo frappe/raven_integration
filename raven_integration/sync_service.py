@@ -311,6 +311,12 @@ def _still_in_a_channel_of(raven_workspace: str, user: str) -> bool:
 	existed. The locking read is what closes that window: it reads the latest
 	committed row rather than this transaction's snapshot, and holds the gap until
 	commit. It runs on the unique (channel_id, user_id) index Raven adds.
+
+	It matches nothing almost every time it runs — `to_remove` is built from people
+	who are in no channel — so what it takes on that index are gap locks rather than
+	row locks. They are the price of reading past the snapshot; what keeps them
+	affordable is that `events.resync_all` commits per mapping, so they live for one
+	mapping instead of for the whole nightly sweep.
 	"""
 	channels = frappe.get_all("Raven Channel", filters={"workspace": raven_workspace}, pluck="name")
 	if not channels:
@@ -351,6 +357,12 @@ def _apply_one_member(action, raven_record: str, user: str, member_doctype: str,
 	written after the rollback, or it would be rolled back with it.
 	"""
 	failure = None
+	# frappe.msgprint appends to frappe.message_log before frappe.throw raises, so
+	# swallowing the exception without dropping what it queued returns HTTP 200
+	# carrying _server_messages, and the settings page pops a red error dialog on a
+	# request that succeeded. Only what this member queued is dropped — the caller's
+	# own messages are not ours to discard. Same reasoning as engine._record_skipped.
+	messages_before = len(frappe.message_log)
 	with savepoint(catch=Exception):
 		try:
 			written = action(raven_record, user)
@@ -359,6 +371,8 @@ def _apply_one_member(action, raven_record: str, user: str, member_doctype: str,
 			raise
 		# The removers report how many rows went; the adders report nothing.
 		return written is None or bool(written)
+	while len(frappe.message_log) > messages_before:
+		frappe.clear_last_message()
 	frappe.log_error(
 		# Error Log.method is a 140-char Data field and a Raven channel name is a
 		# whole course title; the log itself must not become the thing that throws.

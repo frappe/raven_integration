@@ -7,6 +7,7 @@ from frappe.tests.utils import FrappeTestCase
 from raven_integration import registry
 from raven_integration.exceptions import RavenAPIError
 from raven_integration.sync_service import (
+	_apply_one_member,
 	_insert_unique_raven_doc,
 	add_channel_member,
 	add_workspace_member,
@@ -1210,4 +1211,43 @@ class TestWithdrawalLeavesTheChannelOpen(_ManagedPairMixin, FrappeTestCase):
 		self.assertEqual(
 			frappe.db.count("Raven Message", {"channel_id": self.raven_channel, "message_type": "System"}),
 			before + len(users),
+		)
+
+
+class TestFailedMemberLeavesNoDialogBehind(FrappeTestCase):
+	"""A member the site could not write must not turn a 200 into a red dialog.
+
+	frappe.msgprint appends to frappe.message_log before frappe.throw raises, so
+	swallowing the exception without dropping what it queued returns HTTP 200 carrying
+	_server_messages, and the settings page pops an error on a request that succeeded.
+	engine._record_skipped exists for exactly this; the member loop had the same hole.
+	"""
+
+	def _throwing_action(self, raven_record, user):
+		frappe.throw("Raven User is required", frappe.LinkValidationError)
+
+	def test_the_message_a_failed_member_queued_is_unqueued(self):
+		before = len(frappe.message_log)
+		with patch("raven_integration.sync_service.frappe.log_error"):
+			written = _apply_one_member(
+				self._throwing_action, "channel-1", "nobody@example.com", "Raven Channel Member", "add"
+			)
+		self.assertFalse(written)
+		self.assertEqual(len(frappe.message_log), before)
+
+	def test_a_message_the_caller_already_had_is_left_alone(self):
+		frappe.msgprint("something the caller said")
+		before = len(frappe.message_log)
+		with patch("raven_integration.sync_service.frappe.log_error"):
+			_apply_one_member(
+				self._throwing_action, "channel-1", "nobody@example.com", "Raven Channel Member", "add"
+			)
+		self.assertEqual(len(frappe.message_log), before)
+		frappe.clear_last_message()
+
+	def test_a_member_that_writes_is_still_reported_written(self):
+		self.assertTrue(
+			_apply_one_member(
+				lambda record, user: 1, "channel-1", "someone@example.com", "Raven Channel Member", "remove"
+			)
 		)
