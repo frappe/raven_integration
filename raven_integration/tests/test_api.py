@@ -2493,3 +2493,101 @@ class TestPreviewRuleValidatesItsInput(FrappeTestCase):
 				preview_rule({"provider": "REQCFG2", "rule_type": "needs-batch", "config": [1]})
 
 
+class TestLinkChannelValidatesTheChannel(FrappeTestCase):
+	"""link_channel adopted any Raven Channel id posted at it — list_unmapped_channels
+	filters DMs, threads and other workspaces, but the endpoint did not."""
+
+	def setUp(self):
+		if "raven" not in frappe.get_installed_apps():
+			self.skipTest("Raven not installed")
+		self._suffix = frappe.generate_hash(length=6)
+		self._raven_ws_names = set()
+		self._raven_ch_names = set()
+		self._mappings: list[tuple[str, str]] = []
+
+		self.raven_ws = self._raven_workspace(f"RI Adopt WS {self._suffix}")
+		self.other_ws = self._raven_workspace(f"RI Adopt Other {self._suffix}")
+		self.own_ch = self._raven_channel(f"ri-adopt-own-{self._suffix}", self.raven_ws)
+		self.foreign_ch = self._raven_channel(f"ri-adopt-foreign-{self._suffix}", self.other_ws)
+		self.dm_ch = self._raven_channel(f"ri-adopt-dm-{self._suffix}", self.raven_ws)
+		# Flipped directly, the way test_list_channels_excludes_dm_and_thread does:
+		# Raven's own DM creation path wants a canonical two-user channel_name.
+		frappe.db.set_value("Raven Channel", self.dm_ch, "is_direct_message", 1)
+
+		from raven_integration.api import link_workspace
+
+		self.ws_map = self._track("Raven Workspace Mapping", link_workspace(raven_workspace=self.raven_ws))
+		self.addCleanup(self._cleanup)
+
+	def _raven_workspace(self, name: str) -> str:
+		doc = frappe.get_doc(
+			{"doctype": "Raven Workspace", "workspace_name": name, "type": "Private"}
+		).insert(ignore_permissions=True)
+		self._raven_ws_names.add(doc.name)
+		return doc.name
+
+	def _raven_channel(self, name: str, workspace: str) -> str:
+		doc = frappe.get_doc(
+			{"doctype": "Raven Channel", "channel_name": name, "workspace": workspace, "type": "Private"}
+		).insert(ignore_permissions=True)
+		self._raven_ch_names.add(doc.name)
+		return doc.name
+
+	def _track(self, doctype: str, name: str) -> str:
+		self._mappings.append((doctype, name))
+		return name
+
+	def _cleanup(self):
+		frappe.set_user("Administrator")
+		for doctype, name in reversed(self._mappings):
+			if frappe.db.exists(doctype, name):
+				frappe.delete_doc(doctype, name, force=True, ignore_permissions=True, ignore_missing=True)
+		for name in self._raven_ch_names:
+			frappe.db.delete("Raven Channel Member", {"channel_id": name})
+			frappe.db.delete("Raven Channel", {"name": name})
+		for name in self._raven_ws_names:
+			frappe.db.delete("Raven Workspace Member", {"workspace": name})
+			frappe.db.delete("Raven Workspace", {"name": name})
+
+	def test_adopts_a_regular_channel_of_the_workspace(self):
+		from raven_integration.api import link_channel
+
+		name = self._track(
+			"Raven Channel Mapping", link_channel(workspace=self.ws_map, raven_channel=self.own_ch)
+		)
+		self.assertEqual(frappe.db.get_value("Raven Channel Mapping", name, "raven_channel"), self.own_ch)
+
+	def test_refuses_a_channel_from_another_raven_workspace(self):
+		"""Its members would be joined to this mapping's Raven workspace while
+		on_trash evicts them against the one the channel actually lives in."""
+		from raven_integration.api import link_channel
+
+		with self.assertRaises(frappe.ValidationError) as cm:
+			link_channel(workspace=self.ws_map, raven_channel=self.foreign_ch)
+		self.assertIn("lives in Raven workspace", str(cm.exception))
+		self.assertFalse(frappe.db.exists("Raven Channel Mapping", {"raven_channel": self.foreign_ch}))
+
+	def test_refuses_a_direct_message(self):
+		"""Rules would insert matched users into a two-person conversation."""
+		from raven_integration.api import link_channel
+
+		with self.assertRaises(frappe.ValidationError):
+			link_channel(workspace=self.ws_map, raven_channel=self.dm_ch)
+		self.assertFalse(frappe.db.exists("Raven Channel Mapping", {"raven_channel": self.dm_ch}))
+
+	def test_refuses_a_thread(self):
+		from raven_integration.api import link_channel
+
+		frappe.db.set_value("Raven Channel", self.own_ch, "is_thread", 1)
+		with self.assertRaises(frappe.ValidationError):
+			link_channel(workspace=self.ws_map, raven_channel=self.own_ch)
+		self.assertFalse(frappe.db.exists("Raven Channel Mapping", {"raven_channel": self.own_ch}))
+
+	def test_refuses_when_the_parent_mapping_has_no_raven_workspace(self):
+		"""Nothing can be adopted into a mapping with no Raven workspace behind it;
+		list_unmapped_channels returns an empty list for exactly this case."""
+		from raven_integration.api import link_channel
+
+		frappe.db.set_value("Raven Workspace Mapping", self.ws_map, "raven_workspace", None)
+		with self.assertRaises(frappe.ValidationError):
+			link_channel(workspace=self.ws_map, raven_channel=self.own_ch)
