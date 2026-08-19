@@ -2389,6 +2389,9 @@ class TestComputeRuleDiffMirrorsSync(FrappeTestCase):
 		self.assertEqual(result["added"], 0)
 
 
+_EMPTY_TREE = {"conjunctions": [], "conditions": []}
+
+
 class TestGetChannelMemberCount(FrappeTestCase):
 	"""get_channel's member_count had evaluate_rules' defect: a tree no provider
 	could evaluate counted as zero, which reads as "this channel matches nobody"."""
@@ -2436,6 +2439,33 @@ class TestGetChannelMemberCount(FrappeTestCase):
 			detail["member_count_unknown"],
 			"nobody could evaluate this tree, which is not the same as it matching nobody",
 		)
+
+	def test_an_empty_tree_matches_nobody_rather_than_being_unknown(self):
+		# Every channel is empty the moment it is created. The tree yielding no
+		# opinion answers None exactly as an unevaluable one does, so without the
+		# has_active_rules guard a brand new channel opened saying its own
+		# membership could not be worked out.
+		frappe.db.set_value(
+			"Raven Channel Mapping", self.ch_map, "member_rules_json", frappe.as_json(_EMPTY_TREE)
+		)
+		detail = self._detail(_FAKE)
+		self.assertEqual(detail["member_count"], 0)
+		self.assertFalse(detail["member_count_unknown"])
+
+	def test_a_tree_whose_every_rule_is_paused_matches_nobody(self):
+		# Same None, same reason: no rule offered an opinion. Pausing every rule is a
+		# thing the admin did on purpose, not a failure to evaluate.
+		paused = _leaf("Count Rule")
+		paused["status"] = "Paused"
+		frappe.db.set_value(
+			"Raven Channel Mapping",
+			self.ch_map,
+			"member_rules_json",
+			frappe.as_json({"conjunctions": [], "conditions": [paused]}),
+		)
+		detail = self._detail(_FAKE)
+		self.assertEqual(detail["member_count"], 0)
+		self.assertFalse(detail["member_count_unknown"])
 
 
 class TestCreateMappingRollsBackALostRace(FrappeTestCase):

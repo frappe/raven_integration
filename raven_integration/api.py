@@ -994,7 +994,7 @@ def get_channel(name: str) -> dict:
 	"""Full channel detail, incl. the condition tree the rules panel edits."""
 	_require_manager()
 	name = _str(name, "name")
-	from raven_integration.engine import evaluate_rules_or_unknown
+	from raven_integration.engine import evaluate_rules_or_unknown, has_active_rules
 
 	doc = frappe.get_doc("Raven Channel Mapping", name)
 	# Not expected_channel_members: it folds "no provider could answer" into the
@@ -1003,6 +1003,11 @@ def get_channel(name: str) -> dict:
 	# (the rules panel renders it straight into "{0} members" with no null guard),
 	# and the flag beside it carries the distinction.
 	members = evaluate_rules_or_unknown(doc.member_rules_json, strict=False)
+	# None also means "no opinion": an empty tree, which is every channel the moment
+	# it is created, and a tree whose every rule is paused. Those matched nobody
+	# honestly, so they read 0 with the flag down. Guarded exactly as compute_rule_diff
+	# guards it, or a new channel opens claiming its own membership is unknowable.
+	unknown = members is None and has_active_rules(doc.member_rules_json)
 	return {
 		"name": doc.name,
 		"channel_label": doc.channel_label,
@@ -1012,7 +1017,7 @@ def get_channel(name: str) -> dict:
 		"stale": doc.stale,
 		"raven_channel": doc.raven_channel,
 		"member_count": len(members) if members is not None else 0,
-		"member_count_unknown": members is None,
+		"member_count_unknown": unknown,
 		"rules": _serialize_tree_for_ui(doc.member_rules_json),
 	}
 
