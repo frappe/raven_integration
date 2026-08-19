@@ -6,7 +6,10 @@ import frappe
 from frappe import _
 from frappe.utils import escape_html
 
+from raven_integration.exceptions import ProviderDataError
+
 _REQUIRED_PROVIDER_KEYS = ("name", "evaluate", "rule_types")
+_MEMBER_COLLECTIONS = (set, frozenset, list, tuple)
 
 
 def _provider_paths() -> list[str]:
@@ -143,10 +146,36 @@ def list_rule_types(provider: str) -> list[dict]:
 	return _get_provider(provider).get("rule_types", [])
 
 
+def _members_returned(value, provider: str, rule_type: str) -> set[str]:
+	"""The users a provider's evaluate returned, or ProviderDataError naming who broke.
+
+	set() is not a type check, and a provider is another app's code. A returned
+	string becomes one member per character, which sync then adds one character at a
+	time until one of them fails — after earlier adds have already landed. A returned
+	None raises TypeError, which the engine's lenient handler does not catch, so a
+	read of the channel page 500s. ProviderDataError instead, because both the strict
+	sync path and the lenient read path already know what to do with it.
+	"""
+	if not isinstance(value, _MEMBER_COLLECTIONS):
+		raise ProviderDataError(
+			f"Membership provider {provider!r} returned {type(value).__name__} for rule type "
+			f"{rule_type!r}. evaluate(rule_type, config) must return a set, frozenset, list or "
+			f"tuple of user IDs. Fix that provider in the app that registers it."
+		)
+	for user in value:
+		if not isinstance(user, str) or not user.strip():
+			raise ProviderDataError(
+				f"Membership provider {provider!r} returned {user!r} among the users matching "
+				f"rule type {rule_type!r}. Every entry must be a non-empty user ID string. "
+				f"Fix that provider in the app that registers it."
+			)
+	return set(value)
+
+
 def evaluate(provider: str, rule_type: str, config: dict) -> set[str]:
 	p = _get_provider(provider)
 	_get_rule_type(p, provider, rule_type)
-	return set(p["evaluate"](rule_type, config or {}))
+	return _members_returned(p["evaluate"](rule_type, config or {}), provider, rule_type)
 
 
 def validate_rule_config(provider: str, rule_type: str, config) -> None:
