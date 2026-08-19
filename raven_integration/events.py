@@ -53,6 +53,16 @@ def resync_all() -> dict:
 	channel member joins the parent workspace before the channel, so removals must
 	run in the mirror order or a failed workspace pass would leave a channel member
 	who is not a member of the channel's own workspace.
+
+	One transaction per mapping, not one for the sweep. This runs only from background
+	jobs, and a whole-site sweep in a single transaction holds every lock it takes
+	until the end of the night — `remove_workspace_member`'s locking read matches
+	nothing by construction, so what it takes are gap locks on Raven Channel Member,
+	one per removal, which block Raven's own joins and can deadlock against this
+	sweep's inserts. It also meant the `daily_long` timeout the queue choice above
+	guards against would roll back the entire night's work, stale flags included.
+	Applying a diff is idempotent, so a sweep that stops half way leaves the mappings
+	it finished correct and the next pass finishes the rest.
 	"""
 	# Every workspace mapping, unfiltered: a workspace has no on/off of its own.
 	# What can be switched off is a channel, and a workspace with every channel
@@ -61,6 +71,13 @@ def resync_all() -> dict:
 	channels, channels_skipped = _sweepable_channels(workspaces)
 	added = removed = errors = 0
 	cache: dict = {}
+
+	# Before the first mapping takes a lock, so the caller's own writes are durable
+	# rather than riding on a _rollback_step below. scheduler.reconcile_all marks
+	# dangling links stale immediately before calling this, and those flags are the
+	# run's most valuable output — they are what stops a mapping syncing against a
+	# Raven record that no longer exists.
+	_commit_step()
 
 	for kind, names, sync in (
 		("channel", channels, sync_channel_members),
@@ -73,16 +90,23 @@ def resync_all() -> dict:
 				removed += r.get("removed", 0)
 			except (RavenAPIError, ProviderDataError) as e:
 				errors += 1
+				# Before the log, or the log is rolled back with it — and before the
+				# next mapping, or that mapping's commit would adopt this one's
+				# half-applied diff. Drops only this mapping's work: everything
+				# earlier is already committed.
+				_rollback_step()
 				frappe.log_error(
 					title=f"Resync {type(e).__name__}: {kind} {name}",
 					message=f"{e}\n\n{frappe.get_traceback()}",
 				)
 			except Exception:
 				errors += 1
+				_rollback_step()
 				frappe.log_error(
 					title=f"Resync unexpected error: {kind} {name}",
 					message=frappe.get_traceback(),
 				)
+			_commit_step()
 
 	return {
 		"channels_processed": len(channels),
@@ -92,6 +116,23 @@ def resync_all() -> dict:
 		"removed": removed,
 		"errors": errors,
 	}
+
+
+def _commit_step() -> None:
+	"""End one mapping's transaction, keeping its work. See resync_all.
+
+	A named seam rather than a bare frappe.db.commit() so the sweep's own tests can
+	run the loop inside the one transaction their isolation depends on: a real commit
+	in a test would strand its fixtures on the site, and the matching _rollback_step
+	would destroy them. The tests patch both and assert where they were called, which
+	is the part that is worth pinning — the boundaries, not the SQL.
+	"""
+	frappe.db.commit()  # nosemgrep: frappe-manual-commit — see resync_all
+
+
+def _rollback_step() -> None:
+	"""Drop the current mapping's half-applied diff. See resync_all and _commit_step."""
+	frappe.db.rollback()
 
 
 def _bump_change_generation() -> None:

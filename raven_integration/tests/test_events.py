@@ -17,7 +17,8 @@ from raven_integration.events import (
 	resync_all,
 	run_resync,
 )
-from raven_integration.exceptions import RavenAPIError
+from raven_integration.exceptions import ProviderDataError, RavenAPIError
+from raven_integration.tests import hold_one_transaction
 from raven_integration.utils import raven_installed
 
 _FAKE_PROVIDER_PATH = "raven_integration.tests.fake_provider.get_provider"
@@ -67,6 +68,9 @@ class TestIsActive(FrappeTestCase):
 
 
 class TestResyncAll(FrappeTestCase):
+	def setUp(self):
+		hold_one_transaction(self)
+
 	def _get_all(self, channels, workspaces):
 		"""Fake frappe.get_all. ``channels`` is a list of (name, parent workspace) pairs."""
 
@@ -366,3 +370,116 @@ class TestOnProviderDocChange(FrappeTestCase):
 			on_provider_doc_change(doc)  # must not raise
 		notify.assert_not_called()
 		log.assert_called_once()
+
+
+class TestSweepTransactionBoundaries(FrappeTestCase):
+	"""Where resync_all ends one mapping's transaction and starts the next.
+
+	The sweep used to be one transaction for the whole site. Every lock it took was
+	held to the end of the night — including the gap locks remove_workspace_member's
+	locking read takes on Raven Channel Member, which match nothing by construction —
+	and a queue timeout rolled back the entire run, the stale flags scheduler.
+	reconcile_all had just set along with it.
+	"""
+
+	def _get_all(self, channels, workspaces):
+		def fake(doctype, **kw):
+			if doctype == "Raven Channel Mapping":
+				return [frappe._dict(name=c, workspace=w) for c, w in channels]
+			return list(workspaces)
+
+		return fake
+
+	def _sweep(self, *, channel_sync):
+		with (
+			patch(
+				"raven_integration.events.frappe.get_all",
+				side_effect=self._get_all([("c1", "w1"), ("c2", "w1")], ["w1"]),
+			),
+			patch("raven_integration.events.sync_channel_members", side_effect=channel_sync),
+			patch("raven_integration.events.sync_workspace_members", return_value={}),
+			patch("raven_integration.events.frappe.log_error"),
+			patch("raven_integration.events._commit_step") as commit,
+			patch("raven_integration.events._rollback_step") as rollback,
+		):
+			resync_all()
+		return commit, rollback
+
+	def test_every_mapping_gets_its_own_commit(self):
+		# Two channels and one workspace, plus the commit before the loop that makes
+		# the caller's own writes durable rather than rollback fodder.
+		commit, rollback = self._sweep(channel_sync=lambda name, **kw: {})
+		self.assertEqual(commit.call_count, 4)
+		rollback.assert_not_called()
+
+	def test_the_sweep_commits_before_it_takes_its_first_lock(self):
+		# scheduler.reconcile_all marks dangling links stale immediately before
+		# calling this, and a mapping that fails first would otherwise roll those
+		# flags back — the one output of the run that stops a mapping syncing
+		# against a Raven record that is gone.
+		calls = []
+		with (
+			patch(
+				"raven_integration.events.frappe.get_all",
+				side_effect=self._get_all([("c1", "w1")], ["w1"]),
+			),
+			patch(
+				"raven_integration.events.sync_channel_members",
+				side_effect=lambda name, **kw: (calls.append("sync"), {})[1],
+			),
+			patch("raven_integration.events.sync_workspace_members", return_value={}),
+			patch("raven_integration.events._commit_step", side_effect=lambda: calls.append("commit")),
+			patch("raven_integration.events._rollback_step"),
+		):
+			resync_all()
+		self.assertEqual(calls[0], "commit")
+
+	def test_a_failed_mapping_is_rolled_back_before_the_next_one_commits(self):
+		# Without the rollback the next mapping's commit adopts this one's
+		# half-applied diff, which is the state the per-member savepoints exist to
+		# keep out of the database.
+		order = []
+
+		def sync(name, **kw):
+			order.append(f"sync:{name}")
+			if name == "c1":
+				raise RavenAPIError("boom")
+			return {}
+
+		with (
+			patch(
+				"raven_integration.events.frappe.get_all",
+				side_effect=self._get_all([("c1", "w1"), ("c2", "w1")], ["w1"]),
+			),
+			patch("raven_integration.events.sync_channel_members", side_effect=sync),
+			patch("raven_integration.events.sync_workspace_members", return_value={}),
+			patch("raven_integration.events.frappe.log_error"),
+			patch("raven_integration.events._commit_step", side_effect=lambda: order.append("commit")),
+			patch("raven_integration.events._rollback_step", side_effect=lambda: order.append("rollback")),
+		):
+			resync_all()
+
+		self.assertEqual(order[:4], ["commit", "sync:c1", "rollback", "commit"])
+
+	def test_the_error_log_survives_the_rollback_that_precedes_it(self):
+		# log_error writes a document. Rolling back after it would discard the only
+		# record that the mapping failed at all.
+		order = []
+
+		with (
+			patch(
+				"raven_integration.events.frappe.get_all",
+				side_effect=self._get_all([("c1", "w1")], ["w1"]),
+			),
+			patch(
+				"raven_integration.events.sync_channel_members",
+				side_effect=ProviderDataError("no provider"),
+			),
+			patch("raven_integration.events.sync_workspace_members", return_value={}),
+			patch("raven_integration.events.frappe.log_error", side_effect=lambda **kw: order.append("log")),
+			patch("raven_integration.events._commit_step", side_effect=lambda: order.append("commit")),
+			patch("raven_integration.events._rollback_step", side_effect=lambda: order.append("rollback")),
+		):
+			resync_all()
+
+		self.assertEqual(order[1:4], ["rollback", "log", "commit"])

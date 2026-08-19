@@ -7,6 +7,7 @@ from frappe.tests.utils import FrappeTestCase
 
 from raven_integration import hooks
 from raven_integration.scheduler import detect_dangling_links, reconcile_all
+from raven_integration.tests import hold_one_transaction
 
 
 class TestReconcileSchedule(FrappeTestCase):
@@ -50,6 +51,9 @@ class TestReconcile(FrappeTestCase):
 	def setUp(self):
 		if "raven" not in frappe.get_installed_apps():
 			self.skipTest("Raven not installed")
+		# The sweep commits per mapping; inside a test that would strand this case's
+		# fixtures on the site and its rollback would destroy them.
+		hold_one_transaction(self)
 		# reconcile_all() now requires the integration to be enabled (is_active).
 		# Enable it for the sweep, snapshotting the shared single to restore after.
 		self._prev_enabled = frappe.db.get_single_value("Raven Membership Settings", "enabled")
