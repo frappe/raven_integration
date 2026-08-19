@@ -7,7 +7,12 @@ from raven_integration.utils import raven_installed
 
 
 def reconcile_all() -> dict:
-	"""Nightly reconcile: detect dangling links, then run the shared resync sweep."""
+	"""Nightly reconcile: detect dangling links, then run the shared resync sweep.
+
+	Sweeps every mapping on the site, so it is scheduled as `daily_long` and enqueued
+	from api.py with queue="long" — the 300s default queue timeout rolls the whole run
+	back, stale flags included.
+	"""
 	if not events.is_active():
 		return {"skipped": True, "reason": "inactive"}
 

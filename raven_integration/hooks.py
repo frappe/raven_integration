@@ -20,8 +20,14 @@ after_migrate = [
 ]
 before_uninstall = "raven_integration.install.before_uninstall"
 
+# daily_long, not daily: the hook key becomes the Scheduled Job Type frequency, and
+# get_queue_name() sends anything without "Long"/"Maintenance" in it to the `default`
+# queue, whose timeout is 300s against the long queue's 1500s. A reconcile is a
+# whole-site sweep — the same job api.py enqueues with queue="long" — and a timeout
+# rolls it back, discarding the night's adds, removes and the stale flags
+# detect_dangling_links just set, with no retry until tomorrow.
 scheduler_events = {
-	"daily": [
+	"daily_long": [
 		"raven_integration.scheduler.reconcile_all",
 	],
 }

@@ -5,7 +5,43 @@ from unittest.mock import MagicMock, patch
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
+from raven_integration import hooks
 from raven_integration.scheduler import detect_dangling_links, reconcile_all
+
+
+class TestReconcileSchedule(FrappeTestCase):
+	"""The nightly reconcile has to be queued somewhere it can finish.
+
+	A timeout rolls the job back, throwing away every add and remove of the sweep AND
+	the stale flags detect_dangling_links set, with no retry until the next night. The
+	scheduler picks the queue from the frequency alone, and the frequency comes from
+	the scheduler_events key.
+	"""
+
+	METHOD = "raven_integration.scheduler.reconcile_all"
+
+	def frequency(self) -> str:
+		keys = [
+			key
+			for key, methods in hooks.scheduler_events.items()
+			if not isinstance(methods, dict) and self.METHOD in methods
+		]
+		self.assertEqual(len(keys), 1, f"{self.METHOD} must be scheduled exactly once")
+		# What insert_event_jobs() makes of the hook key.
+		return keys[0].replace("_", " ").title()
+
+	def test_the_hook_key_names_a_frequency_this_frappe_version_has(self):
+		options = frappe.get_meta("Scheduled Job Type").get_field("frequency").options.split("\n")
+		self.assertIn(self.frequency(), options)
+
+	def test_reconcile_is_queued_where_it_has_time_to_finish(self):
+		from frappe.utils.background_jobs import get_queues_timeout
+
+		job = frappe.new_doc("Scheduled Job Type", method=self.METHOD, frequency=self.frequency())
+		queue = job.get_queue_name()
+		self.assertEqual(queue, "long", "a whole-site sweep does not fit the default queue")
+		timeouts = get_queues_timeout()
+		self.assertGreater(timeouts[queue], timeouts["default"])
 
 
 class TestReconcile(FrappeTestCase):
