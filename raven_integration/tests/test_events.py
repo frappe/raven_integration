@@ -18,14 +18,33 @@ from raven_integration.events import (
 	run_resync,
 )
 from raven_integration.exceptions import RavenAPIError
+from raven_integration.utils import raven_installed
 
 _FAKE_PROVIDER_PATH = "raven_integration.tests.fake_provider.get_provider"
+
+
+class TestRavenInstalled(FrappeTestCase):
+	def test_a_disabled_raven_does_not_count(self):
+		# `bench disable-app raven` leaves raven in get_installed_apps() with its tables
+		# intact, and takes it out of get_active_apps() — the list frappe itself uses to
+		# resolve hooks and to skip a disabled app's scheduled jobs. Reading the wrong
+		# one has the nightly sweep inserting and deleting member rows in an app the
+		# site has switched off.
+		with (
+			patch("raven_integration.utils.frappe.get_installed_apps", return_value=["raven"]),
+			patch("raven_integration.utils.frappe.get_active_apps", return_value=[]),
+		):
+			self.assertFalse(raven_installed())
+
+	def test_an_active_raven_counts(self):
+		with patch("raven_integration.utils.frappe.get_active_apps", return_value=["raven", "lms"]):
+			self.assertTrue(raven_installed())
 
 
 class TestIsActive(FrappeTestCase):
 	def test_active_only_when_enabled_and_raven_installed(self):
 		# is_active() is true ONLY when the integration is enabled AND "raven"
-		# is installed; false on either condition failing.
+		# is active; false on either condition failing.
 		cases = [
 			(True, ["raven"], True),
 			(True, ["raven", "lms"], True),
@@ -42,7 +61,7 @@ class TestIsActive(FrappeTestCase):
 					"raven_integration.events.frappe.db.get_single_value",
 					return_value=enabled,
 				),
-				patch("raven_integration.utils.frappe.get_installed_apps", return_value=apps),
+				patch("raven_integration.utils.frappe.get_active_apps", return_value=apps),
 			):
 				self.assertEqual(is_active(), expected, f"enabled={enabled} apps={apps}")
 

@@ -664,7 +664,11 @@ def is_setup() -> dict:
 	Managers only: the reply enumerates installed apps, and every action the Settings
 	panel offers already requires the same roles."""
 	_require_manager()
-	apps = frappe.get_installed_apps()
+	# Active, not installed: an app that has been disabled on this site is still in
+	# installed_apps, but its hooks do not load and its scheduled jobs do not run,
+	# so sync cannot work. Reporting it as present opens the Settings gate on an
+	# integration that will silently do nothing.
+	apps = frappe.get_active_apps()
 	return {
 		"raven": "raven" in apps,
 		"raven_integration": "raven_integration" in apps,

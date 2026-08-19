@@ -2208,3 +2208,48 @@ class TestLinkExisting(FrappeTestCase):
 			[c["raven_channel"] for c in rows],
 			"a direct-message channel must not appear as an adoptable row",
 		)
+
+
+def _clear_request_cache() -> None:
+	"""Drop frappe's per-request memo so a global written mid-test is read again.
+
+	get_active_apps / get_disabled_apps are @request_cache'd, and a test process
+	keeps one `frappe.local` for its whole run, so without this the second call
+	answers from the snapshot taken before the global changed.
+	"""
+	cache = getattr(frappe.local, "request_cache", None)
+	if cache is not None:
+		cache.clear()
+
+
+class TestIsSetupHonoursDisabledApps(FrappeTestCase):
+	"""`bench disable-app raven` leaves raven in installed_apps with its tables
+	intact, but frappe stops loading its hooks and running its jobs — so sync
+	cannot work. is_setup drives the Settings gate and must not say it can."""
+
+	def setUp(self):
+		if "raven" not in frappe.get_active_apps():
+			self.skipTest("Raven not installed or already disabled")
+		self._previous_disabled = frappe.db.get_global("disabled_apps")
+		self.addCleanup(self._restore)
+
+	def _restore(self):
+		frappe.db.set_global("disabled_apps", self._previous_disabled or "[]")
+		_clear_request_cache()
+		# The hook registry is keyed off the active apps and may have been rebuilt
+		# without raven's while it was disabled.
+		frappe.clear_cache()
+
+	def test_a_disabled_raven_is_reported_as_absent(self):
+		from raven_integration.api import is_setup
+
+		self.assertTrue(is_setup()["raven"], "raven is installed and enabled on this bench")
+
+		frappe.db.set_global("disabled_apps", frappe.as_json(["raven"]))
+		_clear_request_cache()
+		self.assertFalse(
+			is_setup()["raven"],
+			"a disabled app cannot sync, so the Settings gate must not open on it",
+		)
+
+
