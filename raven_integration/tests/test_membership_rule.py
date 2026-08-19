@@ -29,7 +29,7 @@ def get_provider_with_required_field() -> dict:
 	}
 
 
-class TestRavenMembershipRule(FrappeTestCase):
+class TestMemberRuleValidation(FrappeTestCase):
 	def _insert_under(self, doc, provider_paths: list[str]) -> None:
 		# insert() fires the wildcard after_insert -> on_provider_doc_change ->
 		# _trigger_doctypes(), which under the fake registry caches an empty trigger

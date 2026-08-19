@@ -6,8 +6,6 @@ import frappe
 # through the framework permission check (insert/save/rename/delete are not
 # ignore_permissions), so a role that passes require_manager() still needs DocPerms
 # or the endpoint fails half way through.
-#
-# Raven Membership Rule is a child table and inherits its parent's permissions.
 MANAGED_DOCTYPES: dict[str, tuple[str, ...]] = {
 	"Raven Membership Settings": ("read", "write"),
 	"Raven Workspace Mapping": ("read", "write", "create", "delete", "report", "export"),

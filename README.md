@@ -23,7 +23,8 @@ tickets. It asks a *provider* — another installed app that registers itself th
 
 - **No destructive writes against Raven.** The app never deletes a Raven workspace or channel —
   not on mapping delete, not on uninstall, not on any endpoint. The only records it deletes are its
-  own mappings and rules, and the member rows it added itself.
+  own mappings — the rules go with them, as a column on the mapping — and the member rows it added
+  itself.
 - No business logic of its own — that lives in the provider.
 - No messaging, no chat content, no conversation management.
 - No management UI, and no client library. This app is backend + whitelisted API; the screens
@@ -84,10 +85,13 @@ frappe.call("raven_integration.api.enable_integration")
 |---|---|---|
 | **Raven Workspace Mapping** | Document | A managed Raven workspace. `workspace_label`, `workspace_type` (Public/Private), `stale` (read-only), and a read-only `raven_workspace` link to the Raven workspace it created. Named `RWM-{workspace_label}`. Carries no `enabled`: its membership is derived from its channels, so switching those off is what stops it syncing. |
 | **Raven Channel Mapping** | Document | A managed channel inside a mapped workspace. `channel_label`, `workspace` (link to the workspace mapping), `channel_type` (Public/Private/Open), `enabled`, `stale` (read-only), `member_rules_json` (the condition tree), and a read-only `raven_channel` link. Named `RCM-{channel_label}`. |
-| **Raven Membership Rule** | Child table | One rule row: `label`, `provider`, `rule_type`, `status` (Active/Paused), and `config` (JSON, opaque to this app — only the provider interprets it). |
 | **Raven Membership Settings** | Single | One `enabled` switch that gates the whole integration. |
 
-All three non-child doctypes are System Manager-only.
+A rule is not a record. It is a node in the `member_rules_json` condition tree on a channel mapping,
+with `label`, `provider`, `rule_type`, `status` (Active/Paused) and `config` (JSON, opaque to this app
+— only the provider interprets it).
+
+All three doctypes are System Manager-only.
 
 Two flags stop a mapping from syncing, and they mean different things. A cleared `enabled` is an admin's
 choice — pause this channel; only a channel mapping carries it. `stale` is a fact the app discovered —

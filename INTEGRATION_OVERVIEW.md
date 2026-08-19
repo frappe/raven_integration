@@ -60,8 +60,9 @@ This separation is the whole point: the integration is **generic**. Any Frappe a
 - **Raven Channel Mapping** — `channel_label`, `channel_type` (Public/Private/Open), link to its parent Workspace Mapping, link to the real `Raven Channel`, `enabled`, a read-only `stale` flag, and `member_rules_json` holding the **condition tree**.
 
 A cleared `enabled` and a set `stale` both stop a mapping syncing, but they are not the same thing. `enabled` is the admin's switch — clearing it pauses the mapping on purpose. `stale` is the app recording a fact: the Raven record this mapping managed has been deleted. Admins set `enabled`; only the app sets and clears `stale`.
-- **Raven Membership Rule** (child rows) — `label`, `provider`, `rule_type`, `status` (Active/Paused), `config` (JSON the provider interprets).
 - **Raven Membership Settings** (single record) — one `enabled` switch that turns the whole integration on.
+
+A rule is not a record of its own. It is a leaf of the condition tree inside `member_rules_json` — `label`, `provider`, `rule_type`, `status` (Active/Paused), `config` (JSON the provider interprets) — so it is saved, validated and deleted with the channel mapping that holds it.
 
 ---
 
@@ -189,7 +190,7 @@ This is what makes the app reusable across LMS, CRM, or anything else.
 
 ## Safety guarantees (why it won't wreck your data)
 
-- **Never deletes a Raven workspace or channel.** Not when you delete a mapping, not when you uninstall the app, not through any endpoint. The only records it deletes are its own mappings and rules, plus the individual member rows it added — including on the way out, when a workspace mapping is deleted.
+- **Never deletes a Raven workspace or channel.** Not when you delete a mapping, not when you uninstall the app, not through any endpoint. The only records it deletes are its own mappings — the rules ride along on the mapping, so they go with it — plus the individual member rows it added, including on the way out, when a workspace mapping is deleted.
 - **Only removes what it added.** Every member the app adds is tagged `added_by_rule = 1`. Members added manually inside Raven are **never** touched. Removal only ever targets tagged rows.
 - **One-way enable.** No global off-switch that would mass-remove everyone. You disable individual mappings instead.
 - **Idempotent / race-safe.** Concurrent runs (nightly + event at once) can't double-add or crash — database uniqueness constraints catch the loser, and it's treated as already-done.
