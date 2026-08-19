@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from contextlib import suppress
+
 import frappe
+import redis
 
 from raven_integration.exceptions import ProviderDataError, RavenAPIError
 from raven_integration.sync_service import sync_channel_members, sync_workspace_members
@@ -8,6 +11,8 @@ from raven_integration.utils import raven_installed
 
 _DEBOUNCE_KEY = "raven_integration:pending_resync"
 _DEBOUNCE_SECONDS = 30
+_GENERATION_KEY = "raven_integration:change_generation"
+_GENERATION_TTL = 24 * 60 * 60
 _TRIGGER_DOCTYPES_KEY = "raven_integration:trigger_doctypes"
 _TRIGGER_DOCTYPES_TTL = 60 * 60
 
@@ -89,11 +94,38 @@ def resync_all() -> dict:
 	}
 
 
+def _bump_change_generation() -> None:
+	"""Move the change counter one on.
+
+	Raw INCR against the made key: it is atomic, so two workers cannot lose each
+	other's bump, and it stays out of the process-local dict get_value/set_value keep
+	in front of redis — a worker has to see a bump another process made. Swallows a
+	cache outage the way set_value and delete_value do; this runs on commit and must
+	not turn a saved document into a 500.
+	"""
+	cache = frappe.cache()
+	key = cache.make_key(_GENERATION_KEY)
+	with suppress(redis.exceptions.ConnectionError):
+		cache.incr(key)
+		cache.expire(key, _GENERATION_TTL)
+
+
+def _change_generation() -> bytes | None:
+	cache = frappe.cache()
+	with suppress(redis.exceptions.ConnectionError):
+		return cache.get(cache.make_key(_GENERATION_KEY))
+
+
 def notify_change() -> None:
 	"""Provider event entrypoint: a membership-relevant record changed somewhere."""
 	if not is_active():
 		return
 	cache = frappe.cache()
+	# Bumped on commit rather than here, so the counter moves only once this change is
+	# visible to a reader and a sweep that snapshotted before the commit can tell it
+	# read stale rows. Registered before the enqueue below, which is an after_commit
+	# callback too, so the bump is always in place before the job can start.
+	frappe.db.after_commit.add(_bump_change_generation)
 	if cache.get_value(_DEBOUNCE_KEY):
 		return
 	cache.set_value(_DEBOUNCE_KEY, "1", expires_in_sec=_DEBOUNCE_SECONDS)
@@ -110,8 +142,16 @@ def notify_change() -> None:
 
 def run_resync() -> None:
 	"""Background job target for the debounced event path."""
+	generation = _change_generation()
 	frappe.cache().delete_value(_DEBOUNCE_KEY)
 	resync_all()
+	# A change that arrived while the key above was still set queued nothing of its
+	# own, and this job is one transaction under REPEATABLE READ — its commit can land
+	# after the sweep read its rows and be missed by both. The counter having moved is
+	# the proof, and notify_change() coalesces the second pass with anything already
+	# scheduled.
+	if _change_generation() != generation:
+		notify_change()
 
 
 def _trigger_doctypes() -> set[str]:

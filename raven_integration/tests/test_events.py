@@ -228,6 +228,54 @@ class TestRunResync(FrappeTestCase):
 		self.assertIsNone(frappe.cache().get_value(_DEBOUNCE_KEY))
 
 
+class TestChangeDebouncedAgainstAnInFlightSweep(FrappeTestCase):
+	"""A change told "a sweep is already coming" must be covered by a sweep.
+
+	notify_change() returns without queuing anything while the debounce key is set, but
+	the sweep that key stands for is one transaction under REPEATABLE READ: rows
+	committed after it took its snapshot are invisible to it. So the very sweep the
+	change was debounced against can be the one that misses it, and nothing else runs
+	until an unrelated change or the nightly reconcile.
+	"""
+
+	def setUp(self):
+		frappe.cache().delete_value(_DEBOUNCE_KEY)
+		self.addCleanup(lambda: frappe.cache().delete_value(_DEBOUNCE_KEY))
+
+	def test_a_change_committing_mid_sweep_gets_a_sweep_of_its_own(self):
+		with (
+			patch("raven_integration.events.is_active", return_value=True),
+			patch("raven_integration.events.frappe.enqueue") as enq,
+		):
+			notify_change()  # first request: sets the key, queues the sweep
+			frappe.db.after_commit.run()  # ...and commits, so the sweep will see its rows
+			notify_change()  # second request: debounced, queues nothing of its own
+			enq.reset_mock()
+
+			def sweep(*args, **kwargs):
+				# The second request commits while the sweep is in flight, so its rows
+				# are not in the snapshot this sweep is reading.
+				frappe.db.after_commit.run()
+
+			with patch("raven_integration.events.resync_all", side_effect=sweep):
+				run_resync()
+
+			enq.assert_called_once()
+
+	def test_a_quiet_sweep_does_not_reschedule_itself(self):
+		# The re-check must not turn every sweep into an endless chain of sweeps.
+		with (
+			patch("raven_integration.events.is_active", return_value=True),
+			patch("raven_integration.events.frappe.enqueue") as enq,
+		):
+			notify_change()
+			frappe.db.after_commit.run()
+			enq.reset_mock()
+			with patch("raven_integration.events.resync_all"):
+				run_resync()
+			enq.assert_not_called()
+
+
 class TestTriggerDoctypes(FrappeTestCase):
 	def test_collects_triggers_from_registered_providers(self):
 		with patch.object(registry, "_provider_paths", return_value=[_FAKE_PROVIDER_PATH]):
