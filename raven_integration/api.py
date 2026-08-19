@@ -1346,6 +1346,9 @@ def link_workspace(raven_workspace: str) -> str:
 	try:
 		doc.insert()
 	except frappe.DuplicateEntryError:
+		# db_insert msgprints "… already exists" under a red "Duplicate Name" before
+		# raising; left in place the user gets that dialog as well as this one.
+		frappe.clear_last_message()
 		frappe.throw(
 			title=_("Workspace already managed"),
 			msg=_(
@@ -1455,6 +1458,8 @@ def link_channel(
 	try:
 		doc.insert()
 	except frappe.DuplicateEntryError:
+		# Same stale red "Duplicate Name" dialog as link_workspace clears.
+		frappe.clear_last_message()
 		frappe.throw(
 			title=_("Channel already managed"),
 			msg=_(
