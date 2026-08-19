@@ -162,6 +162,34 @@ class TestSyncManagerDocperms(ManagerRoleTestCase):
 			remove_manager_docperms()
 		self.assertFalse(self.docperm_rows())
 
+	def test_an_owner_only_rule_does_not_cancel_the_grant(self):
+		"""An "Apply Only to Owner" rule for the same role must not answer the probe.
+
+		If it does, migrate skips the grant, require_manager() still lets the role in,
+		and the endpoint's own insert() then raises PermissionError half way through —
+		the exact failure this module exists to prevent.
+		"""
+		from frappe.permissions import add_permission
+
+		doctype = "Raven Channel Mapping"
+		owner_rule = add_permission(doctype, _ROLE, 0)
+		self.assertTrue(owner_rule)
+		frappe.db.set_value("Custom DocPerm", owner_rule, "if_owner", 1)
+
+		with declared_roles(_ROLE):
+			sync_manager_docperms()
+
+		grant = frappe.db.get_value(
+			"Custom DocPerm",
+			{"parent": doctype, "role": _ROLE, "permlevel": 0, "if_owner": 0},
+			["read", "write", "create", "delete"],
+			as_dict=True,
+		)
+		self.assertTrue(grant, "the owner-only rule must not swallow the permlevel-0 grant")
+		self.assertTrue(grant.read and grant.write and grant.create and grant.delete)
+		# The grant must land on the row it created, not on the admin's owner-only rule.
+		self.assertFalse(frappe.db.get_value("Custom DocPerm", owner_rule, "create"))
+
 
 class TestManagerCanManageWorkspaces(ManagerRoleTestCase):
 	"""The DocPerm half of the fix.

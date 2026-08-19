@@ -38,6 +38,18 @@ def _declared_roles() -> list[str]:
 	return [role for role in manager_roles() if role != "System Manager"]
 
 
+def _set_permission_types(row: str, ptypes: tuple[str, ...]) -> None:
+	"""Turn on the ptypes a manager needs, addressing the row by name.
+
+	Not update_permission_property(): it looks a row up by (parent, role, permlevel)
+	without if_owner, so with an "Apply Only to Owner" rule in place for the same role
+	it can write the grant onto that row instead of the one just created.
+	"""
+	perm = frappe.get_doc("Custom DocPerm", row)
+	perm.update({ptype: 1 for ptype in ptypes})
+	perm.save(ignore_permissions=True)
+
+
 def sync_manager_docperms(app_name: str | None = None) -> None:
 	"""Grant every hook-declared manager role the DocPerms the API's writes need.
 
@@ -53,17 +65,23 @@ def sync_manager_docperms(app_name: str | None = None) -> None:
 	stop taking effect for it. That is the framework's only way to grant a role
 	declared by another app, and the same trade-off LMS makes for User and Event.
 	"""
-	from frappe.permissions import add_permission, update_permission_property
+	from frappe.permissions import add_permission
 
 	for role in _declared_roles():
 		if not frappe.db.exists("Role", role):
 			continue
 		for doctype, ptypes in MANAGED_DOCTYPES.items():
-			if frappe.db.exists("Custom DocPerm", {"parent": doctype, "role": role, "permlevel": 0}):
+			# if_owner, matching what add_permission itself probes for. Without it an
+			# admin's "Apply Only to Owner" rule for this role answers the probe, the
+			# grant is skipped, and require_manager() then passes for a role whose
+			# insert() raises PermissionError half way through the endpoint.
+			if frappe.db.exists(
+				"Custom DocPerm", {"parent": doctype, "role": role, "permlevel": 0, "if_owner": 0}
+			):
 				continue
-			add_permission(doctype, role, 0)
-			for ptype in ptypes:
-				update_permission_property(doctype, role, 0, ptype, 1)
+			row = add_permission(doctype, role, 0)
+			if row:
+				_set_permission_types(row, ptypes)
 
 
 def remove_manager_docperms() -> None:
