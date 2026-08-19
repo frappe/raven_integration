@@ -285,10 +285,20 @@ def add_workspace_member(workspace: str, user: str) -> None:
 		frappe.get_doc(
 			{"doctype": "Raven Workspace Member", "workspace": workspace, "user": user, "added_by_rule": 1}
 		).insert(ignore_permissions=True)
-	except (frappe.UniqueValidationError, frappe.ValidationError):
-		# Raven raises a bare ValidationError for its own duplicate-member check,
-		# so this catch is broader than the channel one.
+	except (frappe.UniqueValidationError, frappe.DuplicateEntryError):
 		return
+	except frappe.ValidationError as e:
+		# Raven raises a bare ValidationError for its own duplicate-member check, so
+		# the row itself, not the exception class, is what says this was a duplicate.
+		# Everything else a ValidationError can mean here — a user with no Raven User
+		# for the reqd link to resolve, a missing field — is a member this app failed
+		# to add, and used to be indistinguishable from one it already had.
+		if frappe.db.exists("Raven Workspace Member", {"workspace": workspace, "user": user}):
+			return
+		frappe.log_error(
+			title=f"{type(e).__name__}: Raven workspace member add failed for {user}",
+			message=f"workspace {workspace}: {e}\n\n{frappe.get_traceback()}",
+		)
 
 
 def _apply_one_member(action, raven_record: str, user: str, member_doctype: str, verb: str) -> bool:

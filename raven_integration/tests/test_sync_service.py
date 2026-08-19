@@ -469,6 +469,56 @@ class TestOneBadMemberDoesNotAbortTheDiff(_SyncedChannelMixin, FrappeTestCase):
 		self.assertEqual(result, {"added": 0, "removed": 1})
 
 
+class TestWorkspaceMemberAddFailures(_RavenFixtureMixin, FrappeTestCase):
+	"""add_workspace_member read every ValidationError as "already a member".
+
+	Raven does raise a bare ValidationError for its own duplicate check, but so does
+	a missing link and a missing field — and those are members this app failed to
+	add, reported as members it already had, with nothing written anywhere.
+	"""
+
+	def setUp(self):
+		self._setUp_raven_fixtures()
+
+	def tearDown(self):
+		self._tearDown_raven_fixtures()
+
+	def test_a_member_it_could_not_add_is_logged(self):
+		self.user.enabled = 0
+		self.user.save()  # no Raven User, so the reqd user link cannot resolve
+
+		with patch("raven_integration.sync_service.frappe.log_error") as log:
+			add_workspace_member(self.raven_workspace.name, self.user.name)
+
+		self.assertFalse(
+			frappe.db.exists(
+				"Raven Workspace Member", {"workspace": self.raven_workspace.name, "user": self.user.name}
+			)
+		)
+		titles = [call.kwargs.get("title", "") for call in log.call_args_list]
+		self.assertTrue(any(self.user.name in title for title in titles), titles)
+
+	def test_a_row_already_there_is_still_left_alone(self):
+		"""The behaviour the broad catch was there for, kept: a duplicate is silent."""
+		ensure_raven_user(self.user.name)
+		frappe.get_doc(
+			{
+				"doctype": "Raven Workspace Member",
+				"workspace": self.raven_workspace.name,
+				"user": self.user.name,
+				"added_by_rule": 0,
+			}
+		).insert(ignore_permissions=True)
+
+		with patch("raven_integration.sync_service.frappe.log_error") as log:
+			add_workspace_member(self.raven_workspace.name, self.user.name)
+
+		log.assert_not_called()
+		filters = {"workspace": self.raven_workspace.name, "user": self.user.name}
+		self.assertEqual(frappe.db.count("Raven Workspace Member", filters), 1)
+		self.assertEqual(frappe.db.get_value("Raven Workspace Member", filters, "added_by_rule"), 0)
+
+
 class TestErrorDistinction(unittest.TestCase):
 	"""create_raven_workspace_for wraps inner exceptions as RavenAPIError
 	and preserves the original exception class name in the message."""
