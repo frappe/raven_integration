@@ -2566,6 +2566,122 @@ class TestPreviewRuleValidatesItsInput(FrappeTestCase):
 				preview_rule({"provider": "REQCFG2", "rule_type": "needs-batch", "config": [1]})
 
 
+class TestCaseOnlyNameCollision(FrappeTestCase):
+	"""The docname column collates utf8mb4_unicode_ci, so two mappings whose labels
+	differ only in case cannot both exist. db.exists is case-insensitive for the
+	same reason, and comparing its answer to the *new* name let a different doc's
+	row through — the rename then died on the primary key."""
+
+	def setUp(self):
+		self._suffix = frappe.generate_hash(length=6)
+		ws = frappe.new_doc("Raven Workspace Mapping")
+		ws.workspace_label = f"RI Case WS {self._suffix}"
+		ws.workspace_type = "Private"
+		ws.flags.skip_raven_create = True
+		ws.insert()
+		self.ws_map = ws.name
+		self.general = self._channel(f"General {self._suffix}")
+		self.sales = self._channel(f"Sales {self._suffix}")
+		self.addCleanup(self._cleanup)
+
+	def _channel(self, label: str) -> str:
+		ch = frappe.new_doc("Raven Channel Mapping")
+		ch.channel_label = label
+		ch.workspace = self.ws_map
+		ch.channel_type = "Private"
+		ch.flags.skip_raven_create = True
+		ch.insert()
+		return ch.name
+
+	def _cleanup(self):
+		frappe.set_user("Administrator")
+		for name in frappe.get_all("Raven Channel Mapping", filters={"workspace": self.ws_map}, pluck="name"):
+			frappe.delete_doc(
+				"Raven Channel Mapping", name, force=True, ignore_permissions=True, ignore_missing=True
+			)
+		frappe.delete_doc(
+			"Raven Workspace Mapping",
+			self.ws_map,
+			force=True,
+			ignore_permissions=True,
+			ignore_missing=True,
+		)
+
+	def test_renaming_onto_another_mappings_name_in_another_case_is_refused(self):
+		from raven_integration.api import set_channel_label
+
+		with self.assertRaises(frappe.ValidationError) as cm:
+			set_channel_label(name=self.sales, label=f"general {self._suffix}")
+		self.assertIn("already called", str(cm.exception))
+		self.assertTrue(frappe.db.exists("Raven Channel Mapping", self.sales))
+
+	def test_re_casing_a_mappings_own_name_still_renames_it(self):
+		"""The reason the check is loose in the first place: rename_doc allows a
+		doc to be renamed to a different casing of its own name."""
+		from raven_integration.api import set_channel_label
+
+		result = set_channel_label(name=self.sales, label=f"sales {self._suffix}")
+		self.assertEqual(result["name"], f"RCM-sales {self._suffix}")
+		self.assertEqual(
+			frappe.db.get_value("Raven Channel Mapping", result["name"], "channel_label"),
+			f"sales {self._suffix}",
+		)
+
+
+class TestRavenWorkspaceCaseOnlyCollision(FrappeTestCase):
+	"""_rename_raven_workspace carried the same loose check against Raven Workspace,
+	whose docname *is* its display name."""
+
+	def setUp(self):
+		if "raven" not in frappe.get_installed_apps():
+			self.skipTest("Raven not installed")
+		self._suffix = frappe.generate_hash(length=6)
+		self._raven_ws_names = set()
+
+		self.other_ws = self._raven_workspace(f"RI WsCase Other {self._suffix}")
+		self.mine_ws = self._raven_workspace(f"RI WsCase Mine {self._suffix}")
+
+		ws_map = frappe.new_doc("Raven Workspace Mapping")
+		ws_map.workspace_label = self.mine_ws
+		ws_map.workspace_type = "Private"
+		ws_map.flags.skip_raven_create = True
+		ws_map.insert()
+		frappe.db.set_value("Raven Workspace Mapping", ws_map.name, "raven_workspace", self.mine_ws)
+		self.ws_map = ws_map.name
+		self.addCleanup(self._cleanup)
+
+	def _raven_workspace(self, name: str) -> str:
+		doc = frappe.get_doc(
+			{"doctype": "Raven Workspace", "workspace_name": name, "type": "Private"}
+		).insert(ignore_permissions=True)
+		self._raven_ws_names.add(doc.name)
+		return doc.name
+
+	def _cleanup(self):
+		frappe.set_user("Administrator")
+		if frappe.db.exists("Raven Workspace Mapping", self.ws_map):
+			frappe.delete_doc(
+				"Raven Workspace Mapping",
+				self.ws_map,
+				force=True,
+				ignore_permissions=True,
+				ignore_missing=True,
+			)
+		for name in self._raven_ws_names:
+			frappe.db.delete("Raven Workspace Member", {"workspace": name})
+			frappe.db.delete("Raven Workspace", {"name": name})
+
+	def test_renaming_onto_another_raven_workspace_in_another_case_is_refused(self):
+		from raven_integration.api import set_workspace_label
+
+		clashing = self.other_ws.lower()
+		self._raven_ws_names.add(clashing)
+		with self.assertRaises(frappe.ValidationError) as cm:
+			set_workspace_label(name=self.ws_map, label=clashing)
+		self.assertIn("already exists", str(cm.exception))
+		self.assertTrue(frappe.db.exists("Raven Workspace", self.mine_ws))
+
+
 class TestLinkChannelValidatesTheChannel(FrappeTestCase):
 	"""link_channel adopted any Raven Channel id posted at it — list_unmapped_channels
 	filters DMs, threads and other workspaces, but the endpoint did not."""

@@ -364,9 +364,14 @@ def _set_mapping_label(doctype: str, name: str, label: str) -> str:
 	permanently blocks that default name from being allocated again."""
 	new_name = _mapping_docname(doctype, label)
 	if new_name != name:
-		# db.exists() is case-insensitive and rename_doc allows case-only fix-ups,
-		# so only an exact-cased hit is a real collision.
-		if frappe.db.exists(doctype, new_name) == new_name:
+		# db.exists() is case-insensitive because the docname column collates
+		# case-insensitively (utf8mb4_unicode_ci), which is also why two docnames
+		# differing only in case cannot both exist. So a hit is a real collision
+		# unless it is this very doc being re-cased — the fix-up rename_doc allows.
+		# Comparing the hit to new_name instead lets a *different* doc through and
+		# the rename then dies on the primary key with a raw IntegrityError.
+		clash = frappe.db.exists(doctype, new_name)
+		if clash and clash != name:
 			frappe.throw(
 				title=_("Name already in use"),
 				msg=_(
@@ -394,9 +399,11 @@ def _rename_raven_workspace(mapping_name: str, label: str) -> None:
 		return
 	if row.raven_workspace == label:
 		return
-	# db.exists is case-insensitive and rename_doc permits case-only fix-ups, so
-	# only an exact-cased hit is a real collision.
-	if frappe.db.exists("Raven Workspace", label) == label:
+	# db.exists is case-insensitive because the docname collates that way, so a hit
+	# is a real collision unless it is this workspace being re-cased. See
+	# _set_mapping_label.
+	clash = frappe.db.exists("Raven Workspace", label)
+	if clash and clash != row.raven_workspace:
 		frappe.throw(
 			title=_("Name already in use"),
 			msg=_(
