@@ -54,8 +54,9 @@ tickets. It asks a *provider* — another installed app that registers itself th
   makes sync skip the mapping (`reason: "no_active_rules"`) rather than evicting everyone.
 - **Errors are isolated.** The wildcard document handler never raises into an unrelated save, and a
   failure on one mapping during a sweep does not abort the rest — both log instead.
-- **Admin-only.** Every management endpoint calls `frappe.only_for(["System Manager"])` and
-  type-checks its inputs.
+- **Admin-only.** Every whitelisted endpoint calls `_require_manager()` and type-checks its inputs.
+  That gate is `frappe.only_for(manager_roles())`: `System Manager` always, plus any role a host app
+  declares through the `raven_integration_manager_roles` hook.
 
 ## Requirements & installation
 
@@ -91,7 +92,9 @@ A rule is not a record. It is a node in the `member_rules_json` condition tree o
 with `label`, `provider`, `rule_type`, `status` (Active/Paused) and `config` (JSON, opaque to this app
 — only the provider interprets it).
 
-All three doctypes are System Manager-only.
+All three doctypes grant permissions to System Manager in their JSON; a role declared through
+`raven_integration_manager_roles` is granted the same permissions as `Custom DocPerm` rows (see
+[Who may manage the integration](#who-may-manage-the-integration)).
 
 Two flags stop a mapping from syncing, and they mean different things. A cleared `enabled` is an admin's
 choice — pause this channel; only a channel mapping carries it. `stale` is a fact the app discovered —
@@ -304,8 +307,8 @@ handlers after it. Accept `**kwargs` so a future keyword does not break your han
 
 ## API
 
-All endpoints live in `raven_integration.api`. Every one except `is_setup` requires the System
-Manager role.
+All endpoints live in `raven_integration.api`. Every one of them, `is_setup` included, requires a
+manager role (see [Who may manage the integration](#who-may-manage-the-integration)).
 
 | Endpoint | Purpose |
 |---|---|

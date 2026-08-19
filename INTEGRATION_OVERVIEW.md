@@ -56,10 +56,10 @@ This separation is the whole point: the integration is **generic**. Any Frappe a
 
 ## The data model (what gets stored)
 
-- **Raven Workspace Mapping** — `workspace_label`, `workspace_type` (Public/Private), link to the real `Raven Workspace`, an `enabled` switch and a read-only `stale` flag. No conditions of its own.
+- **Raven Workspace Mapping** — `workspace_label`, `workspace_type` (Public/Private), link to the real `Raven Workspace`, and a read-only `stale` flag. No conditions of its own, and no `enabled` switch: its membership is derived from its channels, so switching those off is what stops it syncing.
 - **Raven Channel Mapping** — `channel_label`, `channel_type` (Public/Private/Open), link to its parent Workspace Mapping, link to the real `Raven Channel`, `enabled`, a read-only `stale` flag, and `member_rules_json` holding the **condition tree**.
 
-A cleared `enabled` and a set `stale` both stop a mapping syncing, but they are not the same thing. `enabled` is the admin's switch — clearing it pauses the mapping on purpose. `stale` is the app recording a fact: the Raven record this mapping managed has been deleted. Admins set `enabled`; only the app sets and clears `stale`.
+A cleared `enabled` and a set `stale` both stop a mapping syncing, but they are not the same thing. `enabled` is the admin's switch — clearing it pauses the mapping on purpose, and only a channel mapping carries one. `stale` is the app recording a fact: the Raven record this mapping managed has been deleted. Admins set `enabled`; only the app sets and clears `stale`.
 - **Raven Membership Settings** (single record) — one `enabled` switch that turns the whole integration on.
 
 A rule is not a record of its own. It is a leaf of the condition tree inside `member_rules_json` — `label`, `provider`, `rule_type`, `status` (Active/Paused), `config` (JSON the provider interprets) — so it is saved, validated and deleted with the channel mapping that holds it.
@@ -146,7 +146,7 @@ Then the app compares expected vs. actual and applies the difference: add the mi
 
 ### 8. Stale mappings (someone deleted the Raven side directly)
 - An admin can delete a workspace/channel inside Raven directly. The app **allows** that — it deliberately does not block Raven's own delete.
-- The mapping now points at a record that is gone. The nightly reconcile detects this and **marks the mapping `stale = 1`** and logs it. The mapping itself is *not* deleted and stays `enabled`.
+- The mapping now points at a record that is gone. The nightly reconcile detects this and **marks the mapping `stale = 1`** and logs it. The mapping itself is *not* deleted, and the sweep touches nothing else — a channel mapping keeps whatever `enabled` the admin chose, because recreating the Raven record clears only `stale`.
 - A stale mapping stops syncing: `sync_workspace_members` / `sync_channel_members` return `{"skipped": True, "reason": "raven_record_deleted"}` and do nothing else. No crashes, no orphan syncs.
 - Everything the admin configured — the conditions, the label, the type — is still sitting there, intact.
 
