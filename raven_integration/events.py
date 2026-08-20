@@ -161,12 +161,26 @@ def notify_change() -> None:
 	"""Provider event entrypoint: a membership-relevant record changed somewhere."""
 	if not is_active():
 		return
-	cache = frappe.cache()
 	# Bumped on commit rather than here, so the counter moves only once this change is
 	# visible to a reader and a sweep that snapshotted before the commit can tell it
 	# read stale rows. Registered before the enqueue below, which is an after_commit
 	# callback too, so the bump is always in place before the job can start.
 	frappe.db.after_commit.add(_bump_change_generation)
+	_schedule_resync()
+
+
+def _schedule_resync() -> None:
+	"""Queue the debounced sweep, unless one is already coming.
+
+	Split from notify_change because run_resync's tail is not a change: the one it
+	reschedules for has already moved the counter, and moving it again for a sweep's
+	own bookkeeping makes a concurrent sweep that snapshotted before this job's commit
+	read a change that never happened, and sweep the whole site again for it.
+
+	is_active() is not re-checked; both callers have already established it — the
+	counter only moves from notify_change, which checks.
+	"""
+	cache = frappe.cache()
 	if cache.get_value(_DEBOUNCE_KEY):
 		return
 	cache.set_value(_DEBOUNCE_KEY, "1", expires_in_sec=_DEBOUNCE_SECONDS)
@@ -189,10 +203,10 @@ def run_resync() -> None:
 	# A change that arrived while the key above was still set queued nothing of its
 	# own, and this job is one transaction under REPEATABLE READ — its commit can land
 	# after the sweep read its rows and be missed by both. The counter having moved is
-	# the proof, and notify_change() coalesces the second pass with anything already
+	# the proof, and _schedule_resync() coalesces the second pass with anything already
 	# scheduled.
 	if _change_generation() != generation:
-		notify_change()
+		_schedule_resync()
 
 
 def _trigger_doctypes() -> set[str]:

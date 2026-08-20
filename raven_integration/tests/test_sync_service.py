@@ -1226,6 +1226,14 @@ class TestFailedMemberLeavesNoDialogBehind(FrappeTestCase):
 	def _throwing_action(self, raven_record, user):
 		frappe.throw("Raven User is required", frappe.LinkValidationError)
 
+	def _swallowing_action(self, raven_record, user):
+		"""The shape of add_workspace_member's duplicate catch: Raven msgprints on the
+		way to raising, the caller sees the row is already there and returns."""
+		try:
+			frappe.throw("User is already a member of the workspace")
+		except frappe.ValidationError:
+			return None
+
 	def test_the_message_a_failed_member_queued_is_unqueued(self):
 		before = len(frappe.message_log)
 		with patch("raven_integration.sync_service.frappe.log_error"):
@@ -1251,3 +1259,23 @@ class TestFailedMemberLeavesNoDialogBehind(FrappeTestCase):
 				lambda record, user: 1, "channel-1", "someone@example.com", "Raven Channel Member", "remove"
 			)
 		)
+
+	def test_the_message_a_swallowed_duplicate_queued_is_unqueued(self):
+		"""The commonest case, and the one the raising path never sees: add_channel_member
+		joins the parent workspace on every add, so anyone reaching their second channel
+		of a workspace queues Raven's "already a member" and the add still succeeds."""
+		before = len(frappe.message_log)
+		written = _apply_one_member(
+			self._swallowing_action, "channel-1", "someone@example.com", "Raven Channel Member", "add"
+		)
+		self.assertTrue(written)
+		self.assertEqual(len(frappe.message_log), before)
+
+	def test_a_message_the_caller_already_had_survives_a_written_member(self):
+		frappe.msgprint("something the caller said")
+		before = len(frappe.message_log)
+		_apply_one_member(
+			self._swallowing_action, "channel-1", "someone@example.com", "Raven Channel Member", "add"
+		)
+		self.assertEqual(len(frappe.message_log), before)
+		frappe.clear_last_message()

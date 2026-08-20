@@ -20,11 +20,6 @@ MAX_TREE_DEPTH = 4
 MAX_TREE_NODES = 200
 
 
-def _normalize_rule(rule) -> dict:
-	"""Convert a child Document row to a plain dict; pass dicts through unchanged."""
-	return rule if isinstance(rule, dict) else rule.as_dict()
-
-
 def _is_paused(rule: dict) -> bool:
 	"""True if this rule row is disabled (stored as status 'Paused')."""
 	return rule.get("status") == "Paused"

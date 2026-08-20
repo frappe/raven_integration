@@ -9,6 +9,7 @@ from raven_integration import registry
 from raven_integration.events import (
 	_DEBOUNCE_KEY,
 	_TRIGGER_DOCTYPES_KEY,
+	_change_generation,
 	_trigger_doctypes,
 	clear_trigger_doctypes_cache,
 	is_active,
@@ -265,6 +266,31 @@ class TestChangeDebouncedAgainstAnInFlightSweep(FrappeTestCase):
 				run_resync()
 
 			enq.assert_called_once()
+
+	def test_the_tail_reschedule_is_not_itself_a_change(self):
+		"""The sweep's own re-notify is bookkeeping, not a document change.
+
+		The change it reacts to has already moved the counter. Moving it a second time
+		for the reschedule makes a concurrent sweep that snapshotted before this job
+		commits read a change that never happened, and sweep the whole site again for
+		it."""
+		with (
+			patch("raven_integration.events.is_active", return_value=True),
+			patch("raven_integration.events.frappe.enqueue"),
+		):
+			notify_change()  # first request: sets the key, queues the sweep
+			frappe.db.after_commit.run()
+			notify_change()  # second request: debounced, so all it leaves is the bump
+
+			def sweep(*args, **kwargs):
+				# ...which commits mid-sweep, so the tail reschedules for it.
+				frappe.db.after_commit.run()
+
+			with patch("raven_integration.events.resync_all", side_effect=sweep):
+				run_resync()
+			after_the_sweep = _change_generation()
+			frappe.db.after_commit.run()  # the sweep job's own commit
+			self.assertEqual(_change_generation(), after_the_sweep)
 
 	def test_a_quiet_sweep_does_not_reschedule_itself(self):
 		# The re-check must not turn every sweep into an endless chain of sweeps.

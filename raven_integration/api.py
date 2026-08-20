@@ -1430,12 +1430,7 @@ def link_channel(
 	rule_tree = _rule_tree(rules)
 
 	_require_mapping("Raven Workspace Mapping", workspace)
-	ch = frappe.db.get_value(
-		"Raven Channel",
-		raven_channel,
-		["channel_name", "type", "workspace", "is_direct_message", "is_thread"],
-		as_dict=True,
-	)
+	ch = frappe.db.get_value("Raven Channel", raven_channel, ["channel_name", "type"], as_dict=True)
 	if not ch:
 		frappe.throw(
 			title=_("Channel not found"),
@@ -1444,32 +1439,10 @@ def link_channel(
 			).format(escape_html(raven_channel)),
 			exc=frappe.DoesNotExistError,
 		)
-	# The same two checks list_unmapped_channels applies to decide what is offered.
-	# Without them the id can be posted directly: a direct message adopted here has
-	# rule-matched strangers inserted into a two-person conversation, and a channel
-	# from another Raven workspace joins its members to this mapping's workspace
-	# while on_trash evicts them against the one the channel actually lives in.
-	if ch.is_direct_message or ch.is_thread:
-		frappe.throw(
-			title=_("This channel cannot be managed"),
-			msg=_(
-				"<b>{0}</b> is a direct message or a thread, and membership rules would "
-				"add people to a private conversation. Pick a regular channel from the list."
-			).format(escape_html(ch.channel_name or raven_channel)),
-		)
-	raven_workspace = frappe.db.get_value("Raven Workspace Mapping", workspace, "raven_workspace")
-	if not raven_workspace or ch.workspace != raven_workspace:
-		frappe.throw(
-			title=_("Channel is in another workspace"),
-			msg=_(
-				"<b>{0}</b> lives in Raven workspace <b>{1}</b>, not in <b>{2}</b>. "
-				"Open that workspace and adopt the channel there."
-			).format(
-				escape_html(ch.channel_name or raven_channel),
-				escape_html(ch.workspace or _("none")),
-				escape_html(raven_workspace or _("none")),
-			),
-		)
+	# The two checks list_unmapped_channels applies to decide what is offered are not
+	# repeated here. They live on the doctype, in validate_channel_is_adoptable, so
+	# that the direct writes a manager's DocPerm allows run them too; the insert below
+	# is what raises for a direct message, a thread, or another workspace's channel.
 
 	doc = frappe.new_doc("Raven Channel Mapping")
 	doc.channel_label = ch.channel_name

@@ -102,7 +102,17 @@ the Raven workspace/channel this mapping pointed at no longer exists (see
 [Stale mappings](#stale-mappings)). `stale` is read-only: it is set and cleared by the app, never by hand.
 
 Creating a mapping **creates a new** Raven workspace/channel behind it (with a uniqueness-safe name);
-it never adopts an existing one. Deleting a workspace mapping cascades to its channel mappings, and
+it never adopts an existing one. Adopting one *is* possible, but only as a separate, deliberate act —
+`link_workspace` and `link_channel` bring a workspace or channel that already exists under a mapping,
+and `list_unmapped_workspaces` / `list_unmapped_channels` say what is on offer. A channel that is a
+direct message, a thread, or a resident of another Raven workspace is refused: rules would otherwise
+insert matched strangers into a two-person conversation, or join members to one workspace while the
+teardown withdraws them from another. Those checks live on the mapping doctype, not in the endpoint,
+so a write that reaches the record another way runs them too — and once a mapping is pointed at a
+Raven record, the link is fixed (`set_only_once`), so it cannot afterwards be walked onto one the
+mapping never adopted.
+
+Deleting a workspace mapping cascades to its channel mappings, and
 withdraws the membership those mappings' rules had granted (`added_by_rule` rows on the channels and
 on the workspace). Deletion stops there: of Raven's own records the app deletes none — the workspace
 and its channels are left intact, unmanaged but whole, with their history and their hand-added
@@ -260,7 +270,11 @@ Two consequences worth knowing:
   JSON permissions for those three doctypes. Edit permissions through Role Permissions Manager from
   that point on, not the doctype JSON.
 - A manager role buys no authority inside Raven. Every write to a Raven document is made with
-  `ignore_permissions=True`, because the app only ever touches records it created itself.
+  `ignore_permissions=True`, so what bounds the damage is *which* records this app will touch, not
+  what the caller could have written by hand. For everything it created that is trivially bounded;
+  for a record it adopted it is not, which is why `link_workspace` / `link_channel` are the one place
+  worth reading closely before widening the gate — a manager can adopt any Raven workspace, and any
+  regular channel of it, without being a member.
 
 ### Trigger caching
 
