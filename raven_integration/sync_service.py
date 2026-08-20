@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import frappe
+from frappe.database import savepoint
 
 from raven_integration.exceptions import RavenAPIError, RavenNotInstalledError
 from raven_integration.utils import raven_installed
@@ -33,8 +34,12 @@ def ensure_raven_user(user_id: str) -> None:
 		return
 	try:
 		frappe.get_doc(
-			{"doctype": "Raven User", "user": user_id,
-			 "full_name": user.full_name or user.first_name or user_id, "type": "User"}
+			{
+				"doctype": "Raven User",
+				"user": user_id,
+				"full_name": user.full_name or user.first_name or user_id,
+				"type": "User",
+			}
 		).insert(ignore_permissions=True)
 	except (frappe.UniqueValidationError, frappe.DuplicateEntryError):
 		# Raven User.user is unique=1; a concurrent sweep (event + nightly
@@ -53,17 +58,182 @@ def _adopt_existing_member(member_doctype: str, filters: dict) -> None:
 
 	Without this, a user who joined manually before a rule started matching them
 	would keep added_by_rule=0 and never be removed when the rule stops matching.
+	Only the channel side claims: there a rule has named the user, which is what
+	makes the row the rule's to withdraw later. See add_workspace_member.
 	"""
 	name = frappe.db.exists(member_doctype, filters)
 	if name and not frappe.db.get_value(member_doctype, name, "added_by_rule"):
 		frappe.db.set_value(member_doctype, name, "added_by_rule", 1)
 
 
-def _remove_rule_managed_member(member_doctype: str, filters: dict) -> None:
-	"""Delete the member row only if this app added it; manual rows are left alone."""
+def _remove_rule_managed_member(member_doctype: str, filters: dict) -> int:
+	"""Delete the member row only if this app added it; manual rows are left alone.
+
+	Returns how many rows went, so a caller counting removals counts writes rather
+	than intentions."""
 	name = frappe.db.exists(member_doctype, {**filters, "added_by_rule": 1})
-	if name:
-		frappe.delete_doc(member_doctype, name, ignore_permissions=True, force=True)
+	return _delete_member_rows(member_doctype, [name]) if name else 0
+
+
+def _would_leave_the_workspace_without_an_admin(name: str) -> bool:
+	"""Mirrors RavenWorkspaceMember.check_last_admin, which throws in this case.
+
+	It counts admins *other than* the row being deleted, so a workspace whose only
+	admin row is this one — or which has no admin at all — refuses the delete. That
+	throw comes out of on_trash and takes the whole transaction with it, including
+	the mapping delete that a user actually asked for.
+	"""
+	row = frappe.db.get_value("Raven Workspace Member", name, ["workspace"], as_dict=True)
+	if not row:
+		return False
+	return not frappe.db.count(
+		"Raven Workspace Member",
+		{"workspace": row.workspace, "is_admin": 1, "name": ("!=", name)},
+	)
+
+
+@contextmanager
+def _keeping_channels_unarchived(channels: "list[str]"):
+	"""Put back the archive flag Raven sets when the last member of a channel goes.
+
+	RavenChannelMember.after_delete archives a Private channel it has just emptied,
+	which reads the last human walking out of a conversation. A withdrawal empties
+	it without anyone leaving, and the channel is the one thing the withdrawal
+	promises to leave standing. A channel somebody had already archived stays that
+	way — un-archiving is not this app's decision either.
+	"""
+	open_before = [c for c in channels if not frappe.db.get_value("Raven Channel", c, "is_archived")]
+	try:
+		yield
+	finally:
+		for channel in open_before:
+			if frappe.db.get_value("Raven Channel", channel, "is_archived"):
+				frappe.db.set_value("Raven Channel", channel, "is_archived", 0)
+
+
+def _delete_member_rows(member_doctype: str, names: "list[str]") -> int:
+	"""Delete the named member rows. Returns how many went.
+
+	Raven's own hooks run, as they must, but two of them are written for a person
+	leaving rather than a withdrawal: a workspace row that would leave no admin
+	behind aborts the delete, and the last channel member archives a private
+	channel. Skip the first, undo the second.
+	"""
+	if member_doctype == "Raven Workspace Member":
+		names = [n for n in names if not _would_leave_the_workspace_without_an_admin(n)]
+		channels = []
+	else:
+		channels = list({frappe.db.get_value(member_doctype, name, "channel_id") for name in names} - {None})
+	with _keeping_channels_unarchived(channels):
+		for name in names:
+			frappe.delete_doc(member_doctype, name, ignore_permissions=True, force=True)
+	return len(names)
+
+
+def _delete_rule_managed_rows(member_doctype: str, link_field: str, links: "list[str]") -> int:
+	"""Delete every rule-managed member row on ``links``. Returns how many went.
+
+	Rows with added_by_rule cleared are left where they are: somebody put them
+	there by hand inside Raven, and this app removing them would be the one thing
+	it promises never to do.
+	"""
+	if not links:
+		return 0
+	return _delete_member_rows(
+		member_doctype,
+		frappe.get_all(
+			member_doctype,
+			filters={link_field: ("in", links), "added_by_rule": 1},
+			pluck="name",
+		),
+	)
+
+
+def _drop_workspace_members_without_a_channel(raven_workspace: str) -> int:
+	"""Withdraw the rule-managed workspace rows of anyone now in no channel of it.
+
+	This is the derived-membership rule of expected_workspace_members applied at a
+	single moment instead of on a sweep: a workspace member is whoever is in at
+	least one channel of the workspace, so someone whose last channel row has just
+	gone has nothing left holding them there. Anyone still in a channel — including
+	a channel this app does not manage, or one a human added them to — keeps their
+	row, and so does anyone whose workspace row is not flagged as this app's.
+	"""
+	from raven_integration.engine import members_of_workspace_channels
+
+	still_in_a_channel = members_of_workspace_channels(raven_workspace)
+	rows = frappe.get_all(
+		"Raven Workspace Member",
+		filters={"workspace": raven_workspace, "added_by_rule": 1},
+		fields=["name", "user"],
+	)
+	return _delete_member_rows(
+		"Raven Workspace Member", [row.name for row in rows if row.user not in still_in_a_channel]
+	)
+
+
+def evict_rule_managed_members(raven_workspace: "str | None", raven_channels: "list[str]") -> dict:
+	"""Take back every membership this app's rules granted under one workspace.
+
+	Called when a workspace mapping is deleted. Up to then the app has kept each
+	channel's membership matching its conditions, so the people in them are there
+	*because* of the mapping — dropping the mapping and leaving them behind would
+	leave a channel populated by a rule that no longer exists, with nothing on the
+	site able to explain or undo it.
+
+	This is not a Raven delete and does not become one: the workspace, the
+	channels and their history are untouched, and so is anyone a human added. Only
+	the rows this app inserted itself are withdrawn. (Raven does write one "X was
+	removed by Y." system message per row on the way — see add_channel_member for
+	why this app cannot ask it not to.)
+
+	Workspace membership is derived from channel membership, so the workspace half
+	follows the channel half rather than repeating it: whoever has just lost their
+	last channel loses their workspace row too. Withdrawing more than that is not
+	only wrong on this app's own rule, it is destructive — Raven answers a deleted
+	workspace row by deleting every channel row that user holds anywhere in the
+	workspace, including the ones a human added.
+	"""
+	if not raven_installed():
+		return {"channel_members": 0, "workspace_members": 0}
+	channels = [c for c in raven_channels if c]
+	return {
+		"channel_members": _delete_rule_managed_rows("Raven Channel Member", "channel_id", channels),
+		"workspace_members": (
+			_drop_workspace_members_without_a_channel(raven_workspace) if raven_workspace else 0
+		),
+	}
+
+
+def evict_channel_rule_managed_members(raven_workspace: "str | None", raven_channel: "str | None") -> dict:
+	"""Take back what one channel's rules granted, when its mapping is deleted.
+
+	The channel half is the workspace-delete withdrawal narrowed to a single
+	channel, and for the same reason: those members are in there on the authority
+	of rules that are going away with the mapping.
+
+	The workspace half is deliberately *not* the same. The workspace mapping
+	survives a channel delete and stays managed, so its membership keeps being
+	derived rather than wiped: only the people this channel was the last thing
+	keeping in the workspace lose their workspace row, which is exactly what the
+	next sync_workspace_members sweep would conclude anyway. Doing it here means a
+	disabled or unswept workspace does not sit on membership it can no longer
+	account for.
+
+	Safe to call twice, and safe to call after a workspace-level eviction has
+	already run — both halves are "delete the rows that are still there", so the
+	cascade from a workspace delete finds nothing left to do.
+	"""
+	if not raven_installed():
+		return {"channel_members": 0, "workspace_members": 0}
+	return {
+		"channel_members": _delete_rule_managed_rows(
+			"Raven Channel Member", "channel_id", [raven_channel] if raven_channel else []
+		),
+		"workspace_members": (
+			_drop_workspace_members_without_a_channel(raven_workspace) if raven_workspace else 0
+		),
+	}
 
 
 def add_channel_member(channel: str, user: str) -> None:
@@ -90,15 +260,24 @@ def add_channel_member(channel: str, user: str) -> None:
 		_adopt_existing_member("Raven Channel Member", {"channel_id": channel, "user_id": user})
 
 
-def remove_channel_member(channel: str, user: str) -> None:
-	"""Remove a rule-managed channel member row; leaves manually-added rows untouched."""
+def remove_channel_member(channel: str, user: str) -> int:
+	"""Remove a rule-managed channel member row; leaves manually-added rows untouched.
+
+	Returns how many rows went."""
 	if not raven_installed():
-		return
-	_remove_rule_managed_member("Raven Channel Member", {"channel_id": channel, "user_id": user})
+		return 0
+	return _remove_rule_managed_member("Raven Channel Member", {"channel_id": channel, "user_id": user})
 
 
 def add_workspace_member(workspace: str, user: str) -> None:
-	"""Add user to a Raven Workspace, flagging the row as rule-managed."""
+	"""Add user to a Raven Workspace, flagging the row as rule-managed.
+
+	A row that is already there is left exactly as it is, unlike the channel one.
+	Nothing here is evidence that this app should own it: workspace membership is
+	derived from channel membership, so the only thing being in a channel says
+	about a workspace row somebody else wrote — a hand-added member, or the admin
+	row Raven writes for whoever created the workspace — is that it should stay.
+	"""
 	if not raven_installed():
 		return
 	ensure_raven_user(user)
@@ -106,17 +285,101 @@ def add_workspace_member(workspace: str, user: str) -> None:
 		frappe.get_doc(
 			{"doctype": "Raven Workspace Member", "workspace": workspace, "user": user, "added_by_rule": 1}
 		).insert(ignore_permissions=True)
-	except (frappe.UniqueValidationError, frappe.ValidationError):
-		# Raven raises a bare ValidationError for its own duplicate-member check,
-		# so this catch is broader than the channel one.
-		_adopt_existing_member("Raven Workspace Member", {"workspace": workspace, "user": user})
-
-
-def remove_workspace_member(workspace: str, user: str) -> None:
-	"""Remove a rule-managed workspace member row; leaves manually-added rows untouched."""
-	if not raven_installed():
+	except (frappe.UniqueValidationError, frappe.DuplicateEntryError):
 		return
-	_remove_rule_managed_member("Raven Workspace Member", {"workspace": workspace, "user": user})
+	except frappe.ValidationError as e:
+		# Raven raises a bare ValidationError for its own duplicate-member check, so
+		# the row itself, not the exception class, is what says this was a duplicate.
+		# Everything else a ValidationError can mean here — a user with no Raven User
+		# for the reqd link to resolve, a missing field — is a member this app failed
+		# to add, and used to be indistinguishable from one it already had.
+		if frappe.db.exists("Raven Workspace Member", {"workspace": workspace, "user": user}):
+			return
+		frappe.log_error(
+			title=f"{type(e).__name__}: Raven workspace member add failed for {user}",
+			message=f"workspace {workspace}: {e}\n\n{frappe.get_traceback()}",
+		)
+
+
+def _still_in_a_channel_of(raven_workspace: str, user: str) -> bool:
+	"""Re-read, under a lock, whether the user holds any channel row in the workspace.
+
+	The expected set a removal is decided from was read at the top of the sweep, and
+	Raven answers a deleted workspace row by wiping every channel row that user holds
+	in the workspace — added_by_rule or not, in channels this app never mapped. So a
+	row a human added in Raven in between is destroyed by a decision taken before it
+	existed. The locking read is what closes that window: it reads the latest
+	committed row rather than this transaction's snapshot, and holds the gap until
+	commit. It runs on the unique (channel_id, user_id) index Raven adds.
+
+	It matches nothing almost every time it runs — `to_remove` is built from people
+	who are in no channel — so what it takes on that index are gap locks rather than
+	row locks. They are the price of reading past the snapshot; what keeps them
+	affordable is that `events.resync_all` commits per mapping, so they live for one
+	mapping instead of for the whole nightly sweep.
+	"""
+	channels = frappe.get_all("Raven Channel", filters={"workspace": raven_workspace}, pluck="name")
+	if not channels:
+		return False
+	return bool(
+		frappe.db.get_value(
+			"Raven Channel Member",
+			{"channel_id": ("in", channels), "user_id": user},
+			"name",
+			for_update=True,
+		)
+	)
+
+
+def remove_workspace_member(workspace: str, user: str) -> int:
+	"""Remove a rule-managed workspace member row; leaves manually-added rows untouched.
+
+	Returns how many rows went — none, if the user turns out to still be in a channel
+	of the workspace, which is the whole of what a workspace row means here."""
+	if not raven_installed():
+		return 0
+	if _still_in_a_channel_of(workspace, user):
+		return 0
+	return _remove_rule_managed_member("Raven Workspace Member", {"workspace": workspace, "user": user})
+
+
+def _apply_one_member(action, raven_record: str, user: str, member_doctype: str, verb: str) -> bool:
+	"""Run one member's add or remove in its own savepoint. True if a row was written.
+
+	One member the site cannot write is not a reason to abandon the rest of a diff.
+	ensure_raven_user leaves a disabled user without a Raven User deliberately, and
+	the member row's user link is reqd, so their insert throws LinkValidationError —
+	which is a ValidationError, not the NameError the duplicate catch covers. It used
+	to escape this loop with every later add and the whole removal pass still
+	pending, on every sweep, silently. The savepoint is what makes carrying on safe:
+	a bare except would leave whatever the failed member had already written (its
+	workspace row, from add_channel_member) sitting in the transaction. The log is
+	written after the rollback, or it would be rolled back with it.
+	"""
+	failure = None
+	# frappe.msgprint appends to frappe.message_log before frappe.throw raises, so
+	# swallowing the exception without dropping what it queued returns HTTP 200
+	# carrying _server_messages, and the settings page pops a red error dialog on a
+	# request that succeeded. Only what this member queued is dropped — the caller's
+	# own messages are not ours to discard. Same reasoning as engine._record_skipped.
+	messages_before = len(frappe.message_log)
+	with savepoint(catch=Exception):
+		try:
+			written = action(raven_record, user)
+		except Exception as e:
+			failure = f"{type(e).__name__}: {e}\n\n{frappe.get_traceback()}"
+			raise
+		# The removers report how many rows went; the adders report nothing.
+		return written is None or bool(written)
+	while len(frappe.message_log) > messages_before:
+		frappe.clear_last_message()
+	frappe.log_error(
+		# Error Log.method is a 140-char Data field and a Raven channel name is a
+		# whole course title; the log itself must not become the thing that throws.
+		title=f"Raven member {verb} skipped: {user} on {member_doctype} {raven_record}"[:140],
+		message=failure,
+	)
+	return False
 
 
 def _sync_rule_managed_members(
@@ -131,48 +394,87 @@ def _sync_rule_managed_members(
 	member_user_field: str,
 	add,
 	remove,
+	rule_gated: bool = True,
+	claims_existing: bool = True,
+	enabled_gated: bool = True,
 	after_synced=None,
 	cache: dict | None = None,
 ) -> dict:
 	"""Diff-apply one mapping's rule-managed membership onto its Raven record.
 
-	The channel/workspace scoping asymmetry (a channel can only narrow its parent
-	workspace's population) is deliberately not a parameter — it lives entirely
-	inside the ``expected_members`` callable the caller supplies.
+	All three switches are off for a workspace, which carries no rules:
+
+	``rule_gated`` — its membership is derived from its channels, so the two rule
+	guards below (skip when nothing is active, freeze whoever a disabled rule put
+	here) have nothing to read and no meaning.
+
+	``claims_existing`` — the expected set is every channel member, which says who
+	is in a channel and nothing about who put them there, so a row already sitting
+	in the workspace is not this app's to claim. Excluding those rows from the diff
+	is also what stops the sweep re-proposing them forever: the insert would fail
+	Raven's duplicate check every time, and the throw lands in the message log of
+	whatever request drove the sweep.
+
+	``enabled_gated`` — a workspace mapping has no ``enabled`` field to read. Only
+	a channel can be switched off, and switching every channel off is what stops a
+	workspace: its derived membership empties out because the channels stop
+	feeding it, not because the workspace itself was ever gated.
 	"""
 	if not raven_installed():
 		return {"skipped": True, "reason": "raven_not_installed"}
-	if not frappe.db.get_value(mapping_doctype, mapping_name, "enabled"):
+	# Imported late: events imports this module. The global kill switch has to be read
+	# here as well as in events.notify_change and scheduler.reconcile_all, because
+	# api._enqueue_member_sync queues sync_channel_members straight — so an admin who
+	# switched the integration off was still getting adds and removals from it.
+	from raven_integration.events import is_active
+
+	if not is_active():
+		return {"skipped": True, "reason": "integration_disabled"}
+	if enabled_gated and not frappe.db.get_value(mapping_doctype, mapping_name, "enabled"):
 		return {"skipped": True, "reason": "disabled"}
 	from raven_integration.engine import disabled_rule_members, has_active_rules
 
 	mapping = frappe.get_doc(mapping_doctype, mapping_name)
 	if mapping.stale:
 		return {"skipped": True, "reason": "raven_record_deleted"}
-	if not has_active_rules(mapping.member_rules):
+	if rule_gated and not has_active_rules(mapping.member_rules_json):
 		return {"skipped": True, "reason": "no_active_rules"}
 	expected = expected_members(mapping_name, cache=cache)
 	raven_record = frappe.db.get_value(mapping_doctype, mapping_name, link_field)
 	if not raven_record:
 		return {"skipped": True, "reason": no_link_reason}
-	current_rule_managed = set(frappe.get_all(
-		member_doctype,
-		filters={member_link_field: raven_record, "added_by_rule": 1},
-		pluck=member_user_field,
-	))
+	current_rule_managed = set(
+		frappe.get_all(
+			member_doctype,
+			filters={member_link_field: raven_record, "added_by_rule": 1},
+			pluck=member_user_field,
+		)
+	)
 	# Members a disabled rule put here stay put; it just stops granting membership.
-	frozen = current_rule_managed & disabled_rule_members(mapping.member_rules)
-	to_add = expected - current_rule_managed
+	frozen = current_rule_managed & disabled_rule_members(mapping.member_rules_json) if rule_gated else set()
+	already_there = (
+		current_rule_managed
+		if claims_existing
+		else set(
+			frappe.get_all(member_doctype, filters={member_link_field: raven_record}, pluck=member_user_field)
+		)
+	)
+	to_add = expected - already_there
 	to_remove = current_rule_managed - expected - frozen
+	added = removed = 0
 	for u in to_add:
-		add(raven_record, u)
+		if not _apply_one_member(add, raven_record, u, member_doctype, "add"):
+			continue
+		added += 1
 		if after_synced:
 			after_synced(raven_record, u, "added", "event")
 	for u in to_remove:
-		remove(raven_record, u)
+		if not _apply_one_member(remove, raven_record, u, member_doctype, "remove"):
+			continue
+		removed += 1
 		if after_synced:
 			after_synced(raven_record, u, "removed", "event")
-	return {"added": len(to_add), "removed": len(to_remove)}
+	return {"added": added, "removed": removed}
 
 
 def sync_channel_members(channel_name: str, *, cache: dict | None = None) -> dict:
@@ -198,7 +500,13 @@ def sync_channel_members(channel_name: str, *, cache: dict | None = None) -> dic
 
 
 def sync_workspace_members(workspace_name: str, *, cache: dict | None = None) -> dict:
-	"""Diff-apply rule-managed workspace membership for the given Raven Workspace Mapping."""
+	"""Reconcile derived workspace membership for the given Raven Workspace Mapping.
+
+	The expected set is whoever is in one of the workspace's channels, so this only
+	ever tidies up after the channel sweep: it drops the rule-managed workspace rows
+	of people who have just lost their last channel, and re-adds anyone a channel
+	holds who somehow has no workspace row.
+	"""
 	from raven_integration.engine import expected_workspace_members
 
 	return _sync_rule_managed_members(
@@ -212,19 +520,40 @@ def sync_workspace_members(workspace_name: str, *, cache: dict | None = None) ->
 		member_user_field="user",
 		add=add_workspace_member,
 		remove=remove_workspace_member,
+		rule_gated=False,
+		claims_existing=False,
+		enabled_gated=False,
 		cache=cache,
 	)
+
+
+def _ensure_creator_is_a_raven_user() -> None:
+	"""Provision the acting user in Raven before creating a workspace or channel.
+
+	Raven makes whoever creates one its first admin — Raven Workspace.after_insert
+	and Raven Channel.after_insert both insert a member row for the session user —
+	and those rows link to Raven User, not User. A manager who is not a Raven user
+	yet (LMS's Moderator role has desk_access = 0, so such a user is a Website User
+	and Raven's auto-add for System Users never fires) would otherwise fail the
+	create with "Could not find User". Provisioning is what this app already does for
+	every member it adds.
+	"""
+	if frappe.session.user in ("Guest", "Administrator"):
+		return
+	ensure_raven_user(frappe.session.user)
 
 
 def create_raven_workspace_for(ws_map) -> None:
 	"""Called from RavenWorkspaceMapping.before_insert to create the backing Raven Workspace."""
 	if not raven_installed():
 		raise RavenNotInstalledError("Raven is not installed on this site")
+	_ensure_creator_is_a_raven_user()
 	try:
 		with pushing_to_raven():
 			rw = _insert_unique_raven_doc(
 				{"doctype": "Raven Workspace", "type": ws_map.workspace_type},
-				"workspace_name", ws_map.workspace_label,
+				"workspace_name",
+				ws_map.workspace_label,
 			)
 	except RavenAPIError:
 		raise
@@ -237,15 +566,20 @@ def create_raven_channel_for(ch_map) -> None:
 	"""Called from RavenChannelMapping.before_insert to create the backing Raven Channel."""
 	if not raven_installed():
 		raise RavenNotInstalledError("Raven is not installed on this site")
+	_ensure_creator_is_a_raven_user()
 	parent = frappe.get_doc("Raven Workspace Mapping", ch_map.workspace)
 	if not parent.raven_workspace:
 		raise RavenAPIError(f"Parent workspace {parent.name} has no Raven workspace link")
 	try:
 		with pushing_to_raven():
 			rc = _insert_unique_raven_doc(
-				{"doctype": "Raven Channel", "workspace": parent.raven_workspace,
-				 "type": ch_map.channel_type},
-				"channel_name", ch_map.channel_label,
+				{
+					"doctype": "Raven Channel",
+					"workspace": parent.raven_workspace,
+					"type": ch_map.channel_type,
+				},
+				"channel_name",
+				ch_map.channel_label,
 			)
 	except RavenAPIError:
 		raise

@@ -29,7 +29,7 @@ def get_provider_with_required_field() -> dict:
 	}
 
 
-class TestRavenMembershipRule(FrappeTestCase):
+class TestMemberRuleValidation(FrappeTestCase):
 	def _insert_under(self, doc, provider_paths: list[str]) -> None:
 		# insert() fires the wildcard after_insert -> on_provider_doc_change ->
 		# _trigger_doctypes(), which under the fake registry caches an empty trigger
@@ -46,18 +46,8 @@ class TestRavenMembershipRule(FrappeTestCase):
 		ws.flags.skip_raven_create = True
 		return ws
 
-	def _save_mapping_with_rule(self, provider_paths: list[str], **rule):
-		"""Insert a workspace mapping carrying one member rule; returns the inserted doc."""
-		ws = self._new_workspace()
-		ws.append("member_rules", rule)
-		self._insert_under(ws, provider_paths)
-		self.addCleanup(
-			lambda: frappe.delete_doc("Raven Workspace Mapping", ws.name, force=True, ignore_missing=True)
-		)
-		return ws
-
-	def _save_channel_with_rule(self, provider_paths: list[str], **rule):
-		"""Insert a channel mapping (under a fresh workspace) carrying one rule; returns the channel."""
+	def _new_channel(self):
+		"""A channel mapping under a fresh workspace, not yet inserted."""
 		ws = self._new_workspace()
 		self._insert_under(ws, _FAKE)
 		self.addCleanup(
@@ -68,15 +58,92 @@ class TestRavenMembershipRule(FrappeTestCase):
 		ch.channel_type = "Private"
 		ch.workspace = ws.name
 		ch.flags.skip_raven_create = True
-		ch.append("member_rules", rule)
+		return ch
+
+	def _save_mapping_with_rule(self, provider_paths: list[str], **rule):
+		"""Insert a channel mapping carrying one member rule; returns the inserted doc.
+
+		A channel is the only mapping that carries rules, so this is also what the
+		channel-specific cases below exercise. The rule goes in as a one-leaf tree —
+		the shape the JSON column holds now that there is no child table to append to."""
+		ch = self._new_channel()
+		ch.member_rules_json = frappe.as_json({"conjunctions": [], "conditions": [rule]})
 		self._insert_under(ch, provider_paths)
 		self.addCleanup(
 			lambda: frappe.delete_doc("Raven Channel Mapping", ch.name, force=True, ignore_missing=True)
 		)
 		return ch
 
+	_save_channel_with_rule = _save_mapping_with_rule
+
+	def _leaf(self, ch, index: int = 0) -> dict:
+		"""One leaf of the mapping's stored tree."""
+		return frappe.parse_json(ch.member_rules_json)["conditions"][index]
+
+	def test_a_sibling_duplicate_is_kept(self):
+		"""Two identical siblings save. The check that refused them only ever saw
+		leaves that were literally equal, so it caught the one restatement a reader
+		can already see and missed every other: two groups evaluating to the same
+		population, or a leaf the group above it already subsumes. A rule that says
+		nothing new is harmless — it adds the people it names, who are added
+		already — so half a check bought nothing but a save the user could not make."""
+		ch = self._new_channel()
+		rule = {"label": "x", "provider": "FAKE", "rule_type": "always-a", "status": "Active", "config": {}}
+		ch.member_rules_json = frappe.as_json({"conjunctions": ["or"], "conditions": [rule, dict(rule)]})
+		self._insert_under(ch, _FAKE)
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Channel Mapping", ch.name, force=True, ignore_missing=True)
+		)
+		self.assertEqual(len(frappe.parse_json(ch.member_rules_json)["conditions"]), 2)
+
+	def test_the_same_rule_in_two_groups_is_allowed(self):
+		# `A and (A or B)` narrows rather than repeats, and the flat model this
+		# replaced could not say it at all.
+		ch = self._new_channel()
+		rule = {"label": "x", "provider": "FAKE", "rule_type": "always-a", "status": "Active", "config": {}}
+		ch.member_rules_json = frappe.as_json(
+			{
+				"conjunctions": ["and"],
+				"conditions": [rule, {"conjunctions": [], "conditions": [dict(rule)]}],
+			}
+		)
+		self._insert_under(ch, _FAKE)
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Channel Mapping", ch.name, force=True, ignore_missing=True)
+		)
+		self.assertEqual(len(frappe.parse_json(ch.member_rules_json)["conditions"]), 2)
+
+	def test_a_paused_rule_under_and_is_rejected(self):
+		# Pausing freezes a contribution; under `and` the rule narrows instead, so
+		# dropping it would add people. The invariant is enforced on every save path.
+		ch = self._new_channel()
+		ch.member_rules_json = frappe.as_json(
+			{
+				"conjunctions": ["and"],
+				"conditions": [
+					{
+						"label": "a",
+						"provider": "FAKE",
+						"rule_type": "always-a",
+						"status": "Active",
+						"config": {},
+					},
+					{
+						"label": "b",
+						"provider": "FAKE",
+						"rule_type": "always-ab",
+						"status": "Paused",
+						"config": {},
+					},
+				],
+			}
+		)
+		with self.assertRaises(frappe.ValidationError) as cm:
+			self._insert_under(ch, _FAKE)
+		self.assertIn("pausing", str(cm.exception).lower())
+
 	def test_stores_provider_type_and_opaque_config(self):
-		ws = self._save_mapping_with_rule(
+		ch = self._save_mapping_with_rule(
 			_FAKE,
 			label="My Rule",
 			provider="FAKE",
@@ -84,22 +151,25 @@ class TestRavenMembershipRule(FrappeTestCase):
 			status="Active",
 			config=json.dumps({"courses": ["C1"]}),
 		)
-		rule = ws.member_rules[0]
-		self.assertEqual(rule.provider, "FAKE")
-		self.assertEqual(json.loads(rule.config), {"courses": ["C1"]})
+		rule = self._leaf(ch)
+		self.assertEqual(rule["provider"], "FAKE")
+		self.assertEqual(json.loads(rule["config"]), {"courses": ["C1"]})
 
-	def test_requires_provider_and_rule_type(self):
-		"""The parent's own mandatory check covers its child rows' reqd fields."""
-		with self.assertRaises(frappe.exceptions.MandatoryError):
+	def test_a_rule_with_no_provider_is_rejected(self):
+		"""There is no child doctype left to declare provider/rule_type mandatory, and
+		the registry returns early on an empty one — so the engine has to refuse it."""
+		with self.assertRaises(frappe.ValidationError) as cm:
 			self._save_mapping_with_rule(_FAKE, label="x", status="Active")
+		self.assertIn("no type chosen", str(cm.exception).lower())
 
-	def test_two_blank_rules_raise_mandatory_not_duplicate(self):
-		"""Two empty rows must surface the mandatory error, not a spurious duplicate."""
-		ws = self._new_workspace()
-		ws.append("member_rules", {"status": "Active"})
-		ws.append("member_rules", {"status": "Active"})
-		with self.assertRaises(frappe.exceptions.MandatoryError):
-			self._insert_under(ws, _FAKE)
+	def test_two_blank_rules_are_rejected_for_their_provider(self):
+		"""Two empty leaves must surface the provider error rather than saving."""
+		ch = self._new_channel()
+		blank = {"status": "Active"}
+		ch.member_rules_json = frappe.as_json({"conjunctions": ["or"], "conditions": [blank, blank]})
+		with self.assertRaises(frappe.ValidationError) as cm:
+			self._insert_under(ch, _FAKE)
+		self.assertIn("no type chosen", str(cm.exception).lower())
 
 	def test_rejects_an_unknown_provider(self):
 		with self.assertRaises(frappe.ValidationError) as cm:
@@ -128,7 +198,7 @@ class TestRavenMembershipRule(FrappeTestCase):
 		self.assertIn("Batch", str(cm.exception))
 
 	def test_accepts_a_config_with_its_required_field(self):
-		ws = self._save_mapping_with_rule(
+		ch = self._save_mapping_with_rule(
 			_REQCFG,
 			label="x",
 			provider="REQCFG",
@@ -136,7 +206,7 @@ class TestRavenMembershipRule(FrappeTestCase):
 			status="Active",
 			config=json.dumps({"batch": "B1"}),
 		)
-		self.assertEqual(json.loads(ws.member_rules[0].config), {"batch": "B1"})
+		self.assertEqual(json.loads(self._leaf(ch)["config"]), {"batch": "B1"})
 
 	def test_channel_rejects_an_unknown_provider(self):
 		with self.assertRaises(frappe.ValidationError) as cm:
@@ -160,5 +230,5 @@ class TestRavenMembershipRule(FrappeTestCase):
 	def test_label_is_not_schema_mandatory(self):
 		# Naming is enforced by the write APIs (see test_rule_labels), not the schema:
 		# a stored rule may sit unnamed, and saving its mapping must still work.
-		ws = self._save_mapping_with_rule(_FAKE, provider="FAKE", rule_type="always-a", status="Active")
-		self.assertFalse(ws.member_rules[0].label)
+		ch = self._save_mapping_with_rule(_FAKE, provider="FAKE", rule_type="always-a", status="Active")
+		self.assertFalse(self._leaf(ch).get("label"))

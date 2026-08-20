@@ -81,9 +81,7 @@ class TestEnableIntegration(FrappeTestCase):
 		with patch("raven_integration.api.frappe.enqueue") as enq:
 			result = enable_integration()
 		self.assertEqual(result, {"enabled": True})
-		self.assertEqual(
-			frappe.db.get_single_value("Raven Membership Settings", "enabled"), 1
-		)
+		self.assertEqual(frappe.db.get_single_value("Raven Membership Settings", "enabled"), 1)
 		enq.assert_called_once()
 		# is_setup now reflects the enabled state.
 		self.assertTrue(is_setup()["enabled"])
@@ -125,13 +123,13 @@ class TestWorkspaceAPI(FrappeTestCase):
 		from raven_integration.api import create_workspace
 
 		with self.assertRaises((frappe.ValidationError, frappe.exceptions.FrappeTypeError)):
-			create_workspace(label=42, type="Private", rules=[])
+			create_workspace(label=42, type="Private")
 
 	def test_create_workspace_rejects_invalid_type(self):
 		from raven_integration.api import create_workspace
 
 		with self.assertRaises(frappe.ValidationError):
-			create_workspace(label="Test", type="weird", rules=[])
+			create_workspace(label="Test", type="weird")
 
 	def test_create_workspace_persists_and_returns_name(self):
 		from raven_integration.api import create_workspace
@@ -139,11 +137,7 @@ class TestWorkspaceAPI(FrappeTestCase):
 		if "raven" not in frappe.get_installed_apps():
 			self.skipTest("Raven not installed")
 		with patch.object(registry, "_provider_paths", return_value=[]):
-			name = create_workspace(
-				label="API Test WS",
-				type="Private",
-				rules=[],
-			)
+			name = create_workspace(label="API Test WS", type="Private")
 		self.assertTrue(name.startswith("RWM-"))
 		self.addCleanup(lambda: frappe.delete_doc("Raven Workspace Mapping", name, force=True))
 
@@ -157,9 +151,7 @@ class TestWorkspaceAPI(FrappeTestCase):
 			b = create_workspace()
 		for n in (a, b):
 			self.addCleanup(
-				lambda n=n: frappe.delete_doc(
-					"Raven Workspace Mapping", n, force=True, ignore_missing=True
-				)
+				lambda n=n: frappe.delete_doc("Raven Workspace Mapping", n, force=True, ignore_missing=True)
 			)
 		label_a = frappe.db.get_value("Raven Workspace Mapping", a, "workspace_label")
 		label_b = frappe.db.get_value("Raven Workspace Mapping", b, "workspace_label")
@@ -167,58 +159,29 @@ class TestWorkspaceAPI(FrappeTestCase):
 		self.assertRegex(label_b, r"^Workspace \d+$")
 		self.assertNotEqual(label_a, label_b, "consecutive auto-creates must differ")
 
-	def test_create_workspace_with_fake_rules_persists(self):
+	def test_create_workspace_takes_no_rules_or_combinator(self):
+		# Rules live on channels; a workspace endpoint that still accepted them would
+		# store something nothing evaluates.
 		from raven_integration.api import create_workspace
 
-		if "raven" not in frappe.get_installed_apps():
-			self.skipTest("Raven not installed")
-		with patch.object(
-			registry,
-			"_provider_paths",
-			return_value=["raven_integration.tests.fake_provider.get_provider"],
-		):
-			name = create_workspace(
-				label="API Test WS Fake",
-				type="Private",
-				rules=[
-					{
-						"label": "Rule 1",
-						"provider": "FAKE",
-						"rule_type": "always-ab",
-						"status": "Active",
-						"config": {},
-					}
-				],
-			)
-		self.assertTrue(name.startswith("RWM-"))
-		self.addCleanup(lambda: frappe.delete_doc("Raven Workspace Mapping", name, force=True))
+		with self.assertRaises(TypeError):
+			create_workspace(label="Bad", type="Private", rules=None)
+		with self.assertRaises(TypeError):
+			create_workspace(label="Bad", type="Private", combinator="All (AND)")
 
-	def test_create_workspace_persists_combinator(self):
+	def test_get_workspace_serves_no_rules(self):
 		from raven_integration.api import create_workspace, get_workspace
 
 		if "raven" not in frappe.get_installed_apps():
 			self.skipTest("Raven not installed")
 		with patch.object(registry, "_provider_paths", return_value=[]):
-			name = create_workspace(
-				label="Combo WS",
-				type="Private",
-				rules=[],
-				combinator="All (AND)",
-			)
+			name = create_workspace(label="No Rules WS", type="Private")
 		self.addCleanup(lambda: frappe.delete_doc("Raven Workspace Mapping", name, force=True))
-		self.assertEqual(
-			frappe.db.get_value("Raven Workspace Mapping", name, "rule_combinator"),
-			"All (AND)",
-		)
-		self.assertEqual(get_workspace(name)["rule_combinator"], "All (AND)")
-
-	def test_invalid_combinator_rejected(self):
-		from raven_integration.api import create_workspace
-
-		with self.assertRaises(frappe.ValidationError):
-			create_workspace(
-				label="Bad", type="Private", rules=[], combinator="XOR"
-			)
+		detail = get_workspace(name)
+		self.assertNotIn("member_rules", detail)
+		self.assertNotIn("member_rules_json", detail)
+		self.assertNotIn("rules", detail)
+		self.assertNotIn("rule_combinator", detail)
 
 	def test_update_workspace_rejects_unknown_name(self):
 		from raven_integration.api import update_workspace
@@ -228,7 +191,6 @@ class TestWorkspaceAPI(FrappeTestCase):
 				name="RWM-does-not-exist",
 				label="New Label",
 				type="Private",
-				rules=[],
 			)
 
 	def test_delete_workspace_rejects_unknown_name(self):
@@ -248,9 +210,7 @@ class TestWorkspaceAPI(FrappeTestCase):
 		ws.flags.skip_raven_create = True
 		ws.insert()
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Workspace Mapping", ws.name, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Workspace Mapping", ws.name, force=True, ignore_missing=True)
 		)
 
 		ch = frappe.new_doc("Raven Channel Mapping")
@@ -260,12 +220,10 @@ class TestWorkspaceAPI(FrappeTestCase):
 		ch.flags.skip_raven_create = True
 		ch.insert()
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Channel Mapping", ch.name, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Channel Mapping", ch.name, force=True, ignore_missing=True)
 		)
 
-		# Runs as Administrator (a System Manager), satisfying _require_system_manager.
+		# Runs as Administrator (a System Manager), satisfying _require_manager.
 		delete_workspace(name=ws.name)
 
 		self.assertFalse(frappe.db.exists("Raven Workspace Mapping", ws.name))
@@ -318,9 +276,7 @@ class TestChannelAPI(FrappeTestCase):
 		ws.flags.skip_raven_create = True
 		ws.insert()
 		self.workspace = ws.name
-		self.addCleanup(
-			lambda: frappe.delete_doc("Raven Workspace Mapping", self.workspace, force=True)
-		)
+		self.addCleanup(lambda: frappe.delete_doc("Raven Workspace Mapping", self.workspace, force=True))
 
 	def test_list_channels_requires_system_manager(self):
 		from raven_integration.api import list_channels
@@ -336,9 +292,7 @@ class TestChannelAPI(FrappeTestCase):
 		from raven_integration.api import create_channel
 
 		with self.assertRaises((frappe.ValidationError, frappe.exceptions.FrappeTypeError)):
-			create_channel(
-				workspace=self.workspace, label=42, type="Private", rules=[]
-			)
+			create_channel(workspace=self.workspace, label=42, type="Private", rules=None)
 
 	def test_create_channel_rejects_invalid_type(self):
 		from raven_integration.api import create_channel
@@ -348,7 +302,7 @@ class TestChannelAPI(FrappeTestCase):
 				workspace=self.workspace,
 				label="Test Ch",
 				type="weird",
-				rules=[],
+				rules=None,
 			)
 
 	def test_create_channel_rejects_unknown_workspace(self):
@@ -359,7 +313,7 @@ class TestChannelAPI(FrappeTestCase):
 				workspace="RWM-does-not-exist",
 				label="Test Ch",
 				type="Private",
-				rules=[],
+				rules=None,
 			)
 
 	def test_create_channel_persists_and_returns_name(self):
@@ -369,18 +323,14 @@ class TestChannelAPI(FrappeTestCase):
 			self.skipTest("Raven not installed")
 		# Create a workspace with a real Raven link so the channel can be created under it.
 		with patch.object(registry, "_provider_paths", return_value=[]):
-			ws_name = create_workspace(
-				label="Ch API Real WS", type="Private", rules=[]
-			)
-		self.addCleanup(
-			lambda: frappe.delete_doc("Raven Workspace Mapping", ws_name, force=True)
-		)
+			ws_name = create_workspace(label="Ch API Real WS", type="Private")
+		self.addCleanup(lambda: frappe.delete_doc("Raven Workspace Mapping", ws_name, force=True))
 		with patch.object(registry, "_provider_paths", return_value=[]):
 			name = create_channel(
 				workspace=ws_name,
 				label="API Test Channel",
 				type="Private",
-				rules=[],
+				rules=None,
 			)
 		self.assertTrue(name.startswith("RCM-"))
 		self.addCleanup(lambda: frappe.delete_doc("Raven Channel Mapping", name, force=True))
@@ -391,16 +341,12 @@ class TestChannelAPI(FrappeTestCase):
 		if "raven" not in frappe.get_installed_apps():
 			self.skipTest("Raven not installed")
 		with patch.object(registry, "_provider_paths", return_value=[]):
-			ws_name = create_workspace(label="Ch AutoName WS", type="Private", rules=[])
-		self.addCleanup(
-			lambda: frappe.delete_doc("Raven Workspace Mapping", ws_name, force=True)
-		)
+			ws_name = create_workspace(label="Ch AutoName WS", type="Private")
+		self.addCleanup(lambda: frappe.delete_doc("Raven Workspace Mapping", ws_name, force=True))
 		with patch.object(registry, "_provider_paths", return_value=[]):
 			name = create_channel(workspace=ws_name)
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Channel Mapping", name, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Channel Mapping", name, force=True, ignore_missing=True)
 		)
 		label = frappe.db.get_value("Raven Channel Mapping", name, "channel_label")
 		self.assertRegex(label, r"^Channel \d+$")
@@ -435,9 +381,7 @@ class TestReconcileNow(FrappeTestCase):
 		ws.workspace_type = "Private"
 		ws.flags.skip_raven_create = True
 		ws.insert()
-		self.addCleanup(
-			lambda: frappe.delete_doc("Raven Workspace Mapping", ws.name, force=True)
-		)
+		self.addCleanup(lambda: frappe.delete_doc("Raven Workspace Mapping", ws.name, force=True))
 
 		with patch("raven_integration.api.frappe.enqueue") as enq:
 			result = reconcile_now(target_doctype="Raven Workspace Mapping", name=ws.name)
@@ -458,9 +402,7 @@ class TestReconcileNow(FrappeTestCase):
 		ws.flags.skip_raven_create = True
 		ws.insert()
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Workspace Mapping", ws.name, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Workspace Mapping", ws.name, force=True, ignore_missing=True)
 		)
 
 		ch = frappe.new_doc("Raven Channel Mapping")
@@ -470,9 +412,7 @@ class TestReconcileNow(FrappeTestCase):
 		ch.flags.skip_raven_create = True
 		ch.insert()
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Channel Mapping", ch.name, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Channel Mapping", ch.name, force=True, ignore_missing=True)
 		)
 
 		with patch("raven_integration.api.frappe.enqueue") as enq:
@@ -489,9 +429,7 @@ class TestReconcileNow(FrappeTestCase):
 		from raven_integration.api import reconcile_now
 
 		with self.assertRaises(frappe.DoesNotExistError):
-			reconcile_now(
-				target_doctype="Raven Workspace Mapping", name="RWM-does-not-exist"
-			)
+			reconcile_now(target_doctype="Raven Workspace Mapping", name="RWM-does-not-exist")
 
 	def test_requires_system_manager(self):
 		from raven_integration.api import reconcile_now
@@ -526,9 +464,7 @@ class TestPreviewRule(FrappeTestCase):
 			"_provider_paths",
 			return_value=["raven_integration.tests.fake_provider.get_provider"],
 		):
-			result = preview_rule(
-				{"provider": "FAKE", "rule_type": "always-ab", "config": {}}
-			)
+			result = preview_rule({"provider": "FAKE", "rule_type": "always-ab", "config": {}})
 		self.assertIn("matched_user_count", result)
 		self.assertIn("sample_users", result)
 		self.assertEqual(result["matched_user_count"], 2)
@@ -577,25 +513,32 @@ class TestComputeRuleDiff(FrappeTestCase):
 			ws = frappe.new_doc("Raven Workspace Mapping")
 			ws.workspace_label = "Rule Diff Test WS"
 			ws.workspace_type = "Private"
-			ws.rule_combinator = "Any (OR)"
 			ws.flags.skip_raven_create = True
-			ws.append(
-				"member_rules",
-				{
-					"label": "Rule 1",
-					"provider": "FAKE",
-					"rule_type": "always-ab",
-					"status": "Active",
-					"config": "{}",
-				},
-			)
 			ws.insert()
-		self.workspace_name = ws.name
-		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Workspace Mapping", self.workspace_name, force=True
+			ch = frappe.new_doc("Raven Channel Mapping")
+			ch.channel_label = "Rule Diff Test CH"
+			ch.workspace = ws.name
+			ch.channel_type = "Private"
+			ch.flags.skip_raven_create = True
+			ch.member_rules_json = frappe.as_json(
+				{
+					"conjunctions": [],
+					"conditions": [
+						{
+							"label": "Rule 1",
+							"provider": "FAKE",
+							"rule_type": "always-ab",
+							"status": "Active",
+							"config": {},
+						}
+					],
+				}
 			)
-		)
+			ch.insert()
+		self.workspace_name = ws.name
+		self.channel_name = ch.name
+		self.addCleanup(lambda: frappe.delete_doc("Raven Workspace Mapping", self.workspace_name, force=True))
+		self.addCleanup(lambda: frappe.delete_doc("Raven Channel Mapping", self.channel_name, force=True))
 
 	def test_no_active_rules_reports_no_change(self):
 		"""Must agree with sync, which skips a rule set with nothing active.
@@ -614,11 +557,11 @@ class TestComputeRuleDiff(FrappeTestCase):
 			return_value=["raven_integration.tests.fake_provider.get_provider"],
 		):
 			result = compute_rule_diff(
-				target_doctype="Raven Workspace Mapping",
-				name=self.workspace_name,
-				new_rules=[],
+				target_doctype="Raven Channel Mapping",
+				name=self.channel_name,
+				new_rules={"conjunctions": [], "conditions": []},
 			)
-		self.assertEqual(result, {"added": 0, "removed": 0, "removed_users": []})
+		self.assertEqual(result, {"added": 0, "removed": 0, "removed_users": [], "unknown": False})
 
 	def test_counts_against_actual_members_not_the_rule_population(self):
 		"""Sync diffs against who is *actually* rule-managed, so the preview does too.
@@ -634,17 +577,20 @@ class TestComputeRuleDiff(FrappeTestCase):
 			return_value=["raven_integration.tests.fake_provider.get_provider"],
 		):
 			result = compute_rule_diff(
-				target_doctype="Raven Workspace Mapping",
-				name=self.workspace_name,
-				new_rules=[
-					{"provider": "FAKE", "rule_type": "always-b", "config": {}, "status": "Active"}
-				],
+				target_doctype="Raven Channel Mapping",
+				name=self.channel_name,
+				new_rules={
+					"conjunctions": [],
+					"conditions": [
+						{"provider": "FAKE", "rule_type": "always-b", "config": {}, "status": "Active"}
+					],
+				},
 			)
 		self.assertEqual(result["removed"], 0)
 		self.assertEqual(result["removed_users"], [])
 
-	def test_defaults_to_saved_rules_so_a_combinator_switch_can_be_previewed(self):
-		"""Omitting new_rules previews a combinator change on its own."""
+	def test_defaults_to_the_saved_tree_when_none_is_proposed(self):
+		"""Omitting new_rules previews the channel exactly as it stands."""
 		from raven_integration.api import compute_rule_diff
 
 		with patch.object(
@@ -653,22 +599,38 @@ class TestComputeRuleDiff(FrappeTestCase):
 			return_value=["raven_integration.tests.fake_provider.get_provider"],
 		):
 			result = compute_rule_diff(
-				target_doctype="Raven Workspace Mapping",
-				name=self.workspace_name,
-				combinator="All (AND)",
+				target_doctype="Raven Channel Mapping",
+				name=self.channel_name,
 			)
 		for key in ("added", "removed", "removed_users"):
 			self.assertIn(key, result)
 
-	def test_rejects_an_invalid_combinator(self):
+	def test_rejects_an_invalid_conjunction(self):
 		from raven_integration.api import compute_rule_diff
 
 		with self.assertRaises(frappe.ValidationError):
 			compute_rule_diff(
-				target_doctype="Raven Workspace Mapping",
-				name=self.workspace_name,
-				combinator="Sometimes (MAYBE)",
+				target_doctype="Raven Channel Mapping",
+				name=self.channel_name,
+				new_rules={"conjunctions": ["maybe"], "conditions": []},
 			)
+
+	def test_rejects_a_group_whose_joiners_do_not_match_its_conditions(self):
+		from raven_integration.api import compute_rule_diff
+
+		with self.assertRaises(frappe.ValidationError) as cm:
+			compute_rule_diff(
+				target_doctype="Raven Channel Mapping",
+				name=self.channel_name,
+				new_rules={
+					"conjunctions": [],
+					"conditions": [
+						{"provider": "FAKE", "rule_type": "always-a", "config": {}, "status": "Active"},
+						{"provider": "FAKE", "rule_type": "always-ab", "config": {}, "status": "Active"},
+					],
+				},
+			)
+		self.assertIn("joiners", str(cm.exception))
 
 	def test_removed_users_capped_at_ten(self):
 		from raven_integration.api import compute_rule_diff
@@ -679,9 +641,9 @@ class TestComputeRuleDiff(FrappeTestCase):
 			return_value=["raven_integration.tests.fake_provider.get_provider"],
 		):
 			result = compute_rule_diff(
-				target_doctype="Raven Workspace Mapping",
-				name=self.workspace_name,
-				new_rules=[],
+				target_doctype="Raven Channel Mapping",
+				name=self.channel_name,
+				new_rules={"conjunctions": [], "conditions": []},
 			)
 		self.assertLessEqual(len(result["removed_users"]), 10)
 
@@ -691,8 +653,8 @@ class TestComputeRuleDiff(FrappeTestCase):
 		with self.assertRaises(frappe.ValidationError):
 			compute_rule_diff(
 				target_doctype="LMS Batch",
-				name=self.workspace_name,
-				new_rules=[],
+				name=self.channel_name,
+				new_rules=None,
 			)
 
 	def test_requires_system_manager(self):
@@ -702,16 +664,20 @@ class TestComputeRuleDiff(FrappeTestCase):
 		try:
 			with self.assertRaises(frappe.PermissionError):
 				compute_rule_diff(
-					target_doctype="Raven Workspace Mapping",
-					name=self.workspace_name,
-					new_rules=[],
+					target_doctype="Raven Channel Mapping",
+					name=self.channel_name,
+					new_rules=None,
 				)
 		finally:
 			frappe.set_user("Administrator")
 
 
 class TestMappingEnabledToggle(FrappeTestCase):
-	"""set_workspace_enabled / set_channel_enabled — per-mapping disabled flag."""
+	"""set_channel_enabled — the per-channel disabled flag.
+
+	A workspace mapping has no counterpart: its membership is derived from its
+	channels, so switching those off is what stops it syncing.
+	"""
 
 	def setUp(self):
 		self.non_admin = frappe.get_doc(
@@ -730,9 +696,7 @@ class TestMappingEnabledToggle(FrappeTestCase):
 		ws.flags.skip_raven_create = True
 		ws.insert()
 		self.workspace = ws.name
-		self.addCleanup(
-			lambda: frappe.delete_doc("Raven Workspace Mapping", self.workspace, force=True)
-		)
+		self.addCleanup(lambda: frappe.delete_doc("Raven Workspace Mapping", self.workspace, force=True))
 
 		ch = frappe.new_doc("Raven Channel Mapping")
 		ch.channel_label = "Toggle Test Channel"
@@ -741,61 +705,39 @@ class TestMappingEnabledToggle(FrappeTestCase):
 		ch.flags.skip_raven_create = True
 		ch.insert()
 		self.channel = ch.name
-		self.addCleanup(
-			lambda: frappe.delete_doc("Raven Channel Mapping", self.channel, force=True)
-		)
+		self.addCleanup(lambda: frappe.delete_doc("Raven Channel Mapping", self.channel, force=True))
 
-	def test_set_workspace_enabled_toggles_enabled_flag(self):
-		from raven_integration.api import set_workspace_enabled
+	def test_workspace_mapping_carries_no_enabled_field(self):
+		# The endpoint is gone and so is the field it wrote. Pinned as a field-level
+		# assertion rather than an import check so it fails if the column comes back
+		# through the doctype JSON without an endpoint attached.
+		from raven_integration import api
 
-		result = set_workspace_enabled(name=self.workspace, enabled=False)
-		self.assertFalse(result["enabled"])
-		self.assertEqual(
-			frappe.db.get_value("Raven Workspace Mapping", self.workspace, "enabled"), 0
-		)
-
-		result = set_workspace_enabled(name=self.workspace, enabled=True)
-		self.assertTrue(result["enabled"])
-		self.assertEqual(
-			frappe.db.get_value("Raven Workspace Mapping", self.workspace, "enabled"), 1
-		)
+		self.assertNotIn("enabled", frappe.get_meta("Raven Workspace Mapping").get_valid_columns())
+		self.assertFalse(hasattr(api, "set_workspace_enabled"))
 
 	def test_set_channel_enabled_toggles_enabled_flag(self):
 		from raven_integration.api import set_channel_enabled
 
 		result = set_channel_enabled(name=self.channel, enabled=False)
 		self.assertFalse(result["enabled"])
-		self.assertEqual(
-			frappe.db.get_value("Raven Channel Mapping", self.channel, "enabled"), 0
-		)
+		self.assertEqual(frappe.db.get_value("Raven Channel Mapping", self.channel, "enabled"), 0)
 
 		result = set_channel_enabled(name=self.channel, enabled=True)
 		self.assertTrue(result["enabled"])
-		self.assertEqual(
-			frappe.db.get_value("Raven Channel Mapping", self.channel, "enabled"), 1
-		)
+		self.assertEqual(frappe.db.get_value("Raven Channel Mapping", self.channel, "enabled"), 1)
 
-	def test_set_workspace_enabled_rejects_non_bool(self):
-		from raven_integration.api import set_workspace_enabled
+	def test_set_channel_enabled_rejects_non_bool(self):
+		from raven_integration.api import set_channel_enabled
 
 		with self.assertRaises((frappe.ValidationError, frappe.exceptions.FrappeTypeError)):
-			set_workspace_enabled(name=self.workspace, enabled="nope")
+			set_channel_enabled(name=self.channel, enabled="nope")
 
 	def test_set_channel_enabled_rejects_non_string_name(self):
 		from raven_integration.api import set_channel_enabled
 
 		with self.assertRaises((frappe.ValidationError, frappe.exceptions.FrappeTypeError)):
 			set_channel_enabled(name=42, enabled=True)
-
-	def test_set_workspace_enabled_requires_system_manager(self):
-		from raven_integration.api import set_workspace_enabled
-
-		frappe.set_user(self.non_admin.name)
-		try:
-			with self.assertRaises(frappe.PermissionError):
-				set_workspace_enabled(name=self.workspace, enabled=True)
-		finally:
-			frappe.set_user("Administrator")
 
 	def test_set_channel_enabled_requires_system_manager(self):
 		from raven_integration.api import set_channel_enabled
@@ -828,9 +770,7 @@ class TestMappingTypeChange(FrappeTestCase):
 		ws.flags.skip_raven_create = True
 		ws.insert()
 		self.workspace = ws.name
-		self.addCleanup(
-			lambda: frappe.delete_doc("Raven Workspace Mapping", self.workspace, force=True)
-		)
+		self.addCleanup(lambda: frappe.delete_doc("Raven Workspace Mapping", self.workspace, force=True))
 
 		ch = frappe.new_doc("Raven Channel Mapping")
 		ch.channel_label = "Type Test Channel"
@@ -839,9 +779,7 @@ class TestMappingTypeChange(FrappeTestCase):
 		ch.flags.skip_raven_create = True
 		ch.insert()
 		self.channel = ch.name
-		self.addCleanup(
-			lambda: frappe.delete_doc("Raven Channel Mapping", self.channel, force=True)
-		)
+		self.addCleanup(lambda: frappe.delete_doc("Raven Channel Mapping", self.channel, force=True))
 
 	def test_set_workspace_type_changes_type(self):
 		from raven_integration.api import set_workspace_type
@@ -862,32 +800,6 @@ class TestMappingTypeChange(FrappeTestCase):
 			frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_type"),
 			"Open",
 		)
-
-	def test_set_workspace_combinator_changes_field(self):
-		from raven_integration.api import set_workspace_combinator
-
-		result = set_workspace_combinator(name=self.workspace, combinator="All (AND)")
-		self.assertEqual(result["combinator"], "All (AND)")
-		self.assertEqual(
-			frappe.db.get_value("Raven Workspace Mapping", self.workspace, "rule_combinator"),
-			"All (AND)",
-		)
-
-	def test_set_channel_combinator_changes_field(self):
-		from raven_integration.api import set_channel_combinator
-
-		result = set_channel_combinator(name=self.channel, combinator="All (AND)")
-		self.assertEqual(result["combinator"], "All (AND)")
-		self.assertEqual(
-			frappe.db.get_value("Raven Channel Mapping", self.channel, "rule_combinator"),
-			"All (AND)",
-		)
-
-	def test_set_workspace_combinator_rejects_invalid(self):
-		from raven_integration.api import set_workspace_combinator
-
-		with self.assertRaises(frappe.ValidationError):
-			set_workspace_combinator(name=self.workspace, combinator="MAYBE")
 
 	def test_set_workspace_type_rejects_invalid_type(self):
 		from raven_integration.api import set_workspace_type
@@ -954,9 +866,7 @@ class TestMappingLabelChange(FrappeTestCase):
 		ws.flags.skip_raven_create = True
 		ws.insert()
 		self.workspace = ws.name
-		self.addCleanup(
-			lambda: frappe.delete_doc("Raven Workspace Mapping", self.workspace, force=True)
-		)
+		self.addCleanup(lambda: frappe.delete_doc("Raven Workspace Mapping", self.workspace, force=True))
 
 		ch = frappe.new_doc("Raven Channel Mapping")
 		ch.channel_label = "Label Test Channel"
@@ -965,9 +875,7 @@ class TestMappingLabelChange(FrappeTestCase):
 		ch.flags.skip_raven_create = True
 		ch.insert()
 		self.channel = ch.name
-		self.addCleanup(
-			lambda: frappe.delete_doc("Raven Channel Mapping", self.channel, force=True)
-		)
+		self.addCleanup(lambda: frappe.delete_doc("Raven Channel Mapping", self.channel, force=True))
 
 	def test_set_workspace_label_changes_label_and_renames_doc(self):
 		from raven_integration.api import set_workspace_label
@@ -1002,9 +910,7 @@ class TestMappingLabelChange(FrappeTestCase):
 		other.flags.skip_raven_create = True
 		other.insert()
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Workspace Mapping", other.name, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Workspace Mapping", other.name, force=True, ignore_missing=True)
 		)
 
 		with self.assertRaises(frappe.ValidationError):
@@ -1067,7 +973,6 @@ class TestMappingLabelChange(FrappeTestCase):
 			frappe.set_user("Administrator")
 
 
-
 class TestDefaultLabelAllocation(FrappeTestCase):
 	"""Regression: the auto-name probe must key off the docname, not the label field.
 
@@ -1084,9 +989,7 @@ class TestDefaultLabelAllocation(FrappeTestCase):
 		ws.flags.skip_raven_create = True
 		ws.insert()
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Workspace Mapping", ws.name, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Workspace Mapping", ws.name, force=True, ignore_missing=True)
 		)
 		self.assertEqual(ws.name, "RWM-Workspace 9001")
 
@@ -1113,9 +1016,7 @@ class TestDefaultLabelAllocation(FrappeTestCase):
 		created = []
 		self.addCleanup(
 			lambda: [
-				frappe.delete_doc(
-					"Raven Workspace Mapping", n, force=True, ignore_missing=True
-				)
+				frappe.delete_doc("Raven Workspace Mapping", n, force=True, ignore_missing=True)
 				for n in created
 			]
 		)
@@ -1154,9 +1055,7 @@ class TestDefaultLabelAllocation(FrappeTestCase):
 		ws.flags.skip_raven_create = True
 		ws.insert()
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Workspace Mapping", ws.name, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Workspace Mapping", ws.name, force=True, ignore_missing=True)
 		)
 
 		first = frappe.new_doc("Raven Channel Mapping")
@@ -1167,13 +1066,9 @@ class TestDefaultLabelAllocation(FrappeTestCase):
 		first.insert()
 		self.assertEqual(first.name, "RCM-Channel 9001")
 
-		renamed = _set_mapping_label(
-			"Raven Channel Mapping", first.name, "Renamed Channel Deadlock"
-		)
+		renamed = _set_mapping_label("Raven Channel Mapping", first.name, "Renamed Channel Deadlock")
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Channel Mapping", renamed, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Channel Mapping", renamed, force=True, ignore_missing=True)
 		)
 		self.assertEqual(renamed, "RCM-Renamed Channel Deadlock")
 		self.assertFalse(
@@ -1190,9 +1085,7 @@ class TestDefaultLabelAllocation(FrappeTestCase):
 		second.flags.skip_raven_create = True
 		second.insert()
 		self.addCleanup(
-			lambda: frappe.delete_doc(
-				"Raven Channel Mapping", second.name, force=True, ignore_missing=True
-			)
+			lambda: frappe.delete_doc("Raven Channel Mapping", second.name, force=True, ignore_missing=True)
 		)
 		self.assertEqual(second.name, "RCM-Channel 9001")
 
@@ -1201,23 +1094,11 @@ class TestMissingMappingFailsLoudly(FrappeTestCase):
 	"""db.set_value on a missing row is a silent no-op — every set_* endpoint must
 	reject an unknown name instead of reporting a change that never landed."""
 
-	def test_set_workspace_enabled_rejects_unknown_name(self):
-		from raven_integration.api import set_workspace_enabled
-
-		with self.assertRaises(frappe.DoesNotExistError):
-			set_workspace_enabled(name="RWM-does-not-exist", enabled=True)
-
 	def test_set_workspace_type_rejects_unknown_name(self):
 		from raven_integration.api import set_workspace_type
 
 		with self.assertRaises(frappe.DoesNotExistError):
 			set_workspace_type(name="RWM-does-not-exist", type="Public")
-
-	def test_set_workspace_combinator_rejects_unknown_name(self):
-		from raven_integration.api import set_workspace_combinator
-
-		with self.assertRaises(frappe.DoesNotExistError):
-			set_workspace_combinator(name="RWM-does-not-exist", combinator="All (AND)")
 
 	def test_set_channel_enabled_rejects_unknown_name(self):
 		from raven_integration.api import set_channel_enabled
@@ -1230,12 +1111,6 @@ class TestMissingMappingFailsLoudly(FrappeTestCase):
 
 		with self.assertRaises(frappe.DoesNotExistError):
 			set_channel_type(name="RCM-does-not-exist", type="Public")
-
-	def test_set_channel_combinator_rejects_unknown_name(self):
-		from raven_integration.api import set_channel_combinator
-
-		with self.assertRaises(frappe.DoesNotExistError):
-			set_channel_combinator(name="RCM-does-not-exist", combinator="All (AND)")
 
 
 class TestPreviewRuleValidatesConfig(FrappeTestCase):
@@ -1271,6 +1146,188 @@ class TestPreviewRuleValidatesConfig(FrappeTestCase):
 				{"provider": "REQCFG", "rule_type": "needs-batch", "config": {"batch": "a@x.com"}}
 			)
 		self.assertEqual(result["matched_user_count"], 1)
+
+
+_FAKE = ["raven_integration.tests.fake_provider.get_provider"]
+
+
+def _leaf(label, rule_type="always-ab", config=None):
+	return {
+		"label": label,
+		"provider": "FAKE",
+		"rule_type": rule_type,
+		"status": "Active",
+		"config": config if config is not None else {},
+	}
+
+
+class TestUpdateChannelRules(FrappeTestCase):
+	"""update_channel carries the whole settings form, so what it does with a
+	`rules` the caller did not send decides whether a rename can delete a channel's
+	conditions."""
+
+	def setUp(self):
+		self.tree = {
+			"conjunctions": ["or"],
+			"conditions": [_leaf("First Rule"), _leaf("Second Rule", config={"tag": "b"})],
+		}
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			ws = frappe.new_doc("Raven Workspace Mapping")
+			ws.workspace_label = f"Upd Rules WS {frappe.generate_hash(length=6)}"
+			ws.workspace_type = "Private"
+			ws.flags.skip_raven_create = True
+			ws.insert()
+			ch = frappe.new_doc("Raven Channel Mapping")
+			ch.channel_label = f"Upd Rules CH {frappe.generate_hash(length=6)}"
+			ch.workspace = ws.name
+			ch.channel_type = "Private"
+			ch.flags.skip_raven_create = True
+			ch.member_rules_json = frappe.as_json(self.tree)
+			ch.insert()
+		self.workspace = ws.name
+		self.channel = ch.name
+		self.addCleanup(
+			lambda: frappe.delete_doc(
+				"Raven Workspace Mapping", self.workspace, force=True, ignore_missing=True
+			)
+		)
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Channel Mapping", self.channel, force=True, ignore_missing=True)
+		)
+
+	def _stored(self):
+		return frappe.parse_json(
+			frappe.db.get_value("Raven Channel Mapping", self.channel, "member_rules_json")
+		)
+
+	def test_a_rename_that_sends_no_rules_keeps_the_conditions(self):
+		"""Omitting `rules` means "I am not editing the conditions". Writing an empty
+		tree for it deletes every condition on the channel and evicts the members they
+		granted, for a caller that only changed the name."""
+		from raven_integration.api import update_channel
+
+		label = frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_label")
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			self.channel = update_channel(name=self.channel, label=f"{label} Renamed", type="Public")
+
+		self.assertEqual(self._stored(), self.tree)
+		self.assertEqual(frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_type"), "Public")
+
+	def test_a_save_that_sends_no_rules_does_not_schedule_a_resync(self):
+		"""No condition changed, so nothing can have moved a member. Resyncing anyway
+		is what turns the silent tree wipe into an eviction."""
+		from raven_integration import api
+
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			with patch.object(api, "_schedule_resync") as scheduled:
+				label = frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_label")
+				api.update_channel(name=self.channel, label=label, type="Public")
+		scheduled.assert_not_called()
+
+	def test_an_explicitly_empty_tree_still_clears_the_conditions(self):
+		"""The other half of the contract: "delete every condition" is a thing the UI
+		must still be able to say, and it says it by sending an empty group."""
+		from raven_integration import api
+
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			with patch.object(api, "_schedule_resync") as scheduled:
+				label = frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_label")
+				api.update_channel(
+					name=self.channel,
+					label=label,
+					type="Private",
+					rules={"conjunctions": [], "conditions": []},
+				)
+		self.assertEqual(self._stored(), {"conjunctions": [], "conditions": []})
+		scheduled.assert_called_once()
+
+	def test_new_conditions_replace_the_stored_ones(self):
+		from raven_integration import api
+
+		replacement = {"conjunctions": [], "conditions": [_leaf("Only Rule")]}
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			with patch.object(api, "_schedule_resync") as scheduled:
+				label = frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_label")
+				api.update_channel(name=self.channel, label=label, type="Private", rules=replacement)
+		self.assertEqual([c["label"] for c in self._stored()["conditions"]], ["Only Rule"])
+		scheduled.assert_called_once()
+
+
+class TestSerializeTreeForUI(FrappeTestCase):
+	"""What the rules panel is handed has to be a tree it can send straight back:
+	one joiner per gap between conditions, which is what the save path enforces."""
+
+	def setUp(self):
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			ws = frappe.new_doc("Raven Workspace Mapping")
+			ws.workspace_label = f"Serialize WS {frappe.generate_hash(length=6)}"
+			ws.workspace_type = "Private"
+			ws.flags.skip_raven_create = True
+			ws.insert()
+			ch = frappe.new_doc("Raven Channel Mapping")
+			ch.channel_label = f"Serialize CH {frappe.generate_hash(length=6)}"
+			ch.workspace = ws.name
+			ch.channel_type = "Private"
+			ch.flags.skip_raven_create = True
+			ch.member_rules_json = frappe.as_json(
+				{
+					"conjunctions": ["or"],
+					"conditions": [_leaf("First Rule"), _leaf("Second", config={"t": 1})],
+				}
+			)
+			ch.insert()
+		self.workspace = ws.name
+		self.channel = ch.name
+		self.addCleanup(
+			lambda: frappe.delete_doc(
+				"Raven Workspace Mapping", self.workspace, force=True, ignore_missing=True
+			)
+		)
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Channel Mapping", self.channel, force=True, ignore_missing=True)
+		)
+
+	def _store(self, tree):
+		# db.set_value, not the doctype: this is a payload validation would reject,
+		# which is the point — it is what a hand-edited JSON field can leave behind.
+		frappe.db.set_value("Raven Channel Mapping", self.channel, "member_rules_json", frappe.as_json(tree))
+
+	def test_a_broken_child_takes_its_joiner_with_it(self):
+		from raven_integration.api import _serialize_tree_for_ui
+
+		self._store(
+			{
+				"conjunctions": ["or", "and"],
+				"conditions": [_leaf("Keep"), None, _leaf("Keep Too", config={"t": 2})],
+			}
+		)
+		served = _serialize_tree_for_ui(
+			frappe.db.get_value("Raven Channel Mapping", self.channel, "member_rules_json")
+		)
+		self.assertEqual([c["label"] for c in served["conditions"]], ["Keep", "Keep Too"])
+		self.assertEqual(len(served["conjunctions"]), len(served["conditions"]) - 1)
+
+	def test_what_the_panel_is_served_can_be_saved_back(self):
+		"""The consequence of a joiner count that does not match: the panel posts the
+		tree back untouched and the save is refused with "Reload the page and try again",
+		which reloading cannot fix."""
+		from raven_integration.api import get_channel, update_channel
+
+		self._store(
+			{
+				"conjunctions": ["or", "and"],
+				"conditions": [_leaf("Keep"), None, _leaf("Keep Too", config={"t": 2})],
+			}
+		)
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			served = get_channel(self.channel)["rules"]
+			label = frappe.db.get_value("Raven Channel Mapping", self.channel, "channel_label")
+			update_channel(name=self.channel, label=label, type="Private", rules=served)
+
+		stored = frappe.parse_json(
+			frappe.db.get_value("Raven Channel Mapping", self.channel, "member_rules_json")
+		)
+		self.assertEqual([c["label"] for c in stored["conditions"]], ["Keep", "Keep Too"])
 
 
 class TestLabelPropagatesToRaven(FrappeTestCase):
@@ -1331,7 +1388,11 @@ class TestLabelPropagatesToRaven(FrappeTestCase):
 			)
 		if frappe.db.exists("Raven Workspace Mapping", self.ws_map):
 			frappe.delete_doc(
-				"Raven Workspace Mapping", self.ws_map, force=True, ignore_permissions=True, ignore_missing=True
+				"Raven Workspace Mapping",
+				self.ws_map,
+				force=True,
+				ignore_permissions=True,
+				ignore_missing=True,
 			)
 		# frappe.db.delete bypasses Raven's on_trash guards during teardown.
 		for n in self._raven_ch_names:
@@ -1377,6 +1438,119 @@ class TestLabelPropagatesToRaven(FrappeTestCase):
 			frappe.db.get_value("Raven Channel Mapping", self.ch_map, "raven_channel"), self.raven_ch
 		)
 
+	def test_update_workspace_rename_propagates_to_raven(self):
+		"""The settings page commits the workspace's name and visibility through
+		update_workspace, so a rename travelling that path must reach Raven exactly as
+		set_workspace_label does. A Raven Workspace's docname IS its display name and
+		nothing reverse-syncs, so a rename that stops at the mapping leaves the two
+		names apart for good."""
+		from raven_integration.api import update_workspace
+
+		new_label = f"RI Upd WS Renamed {self._suffix}"
+		self._raven_ws_names.add(new_label)
+		self.ws_map = update_workspace(name=self.ws_map, label=new_label, type="Public")
+
+		self.assertTrue(frappe.db.exists("Raven Workspace", new_label))
+		self.assertFalse(frappe.db.exists("Raven Workspace", self.raven_ws))
+		# The mapping's raven_workspace Link followed the rename (rename_doc cascade).
+		self.assertEqual(
+			frappe.db.get_value("Raven Workspace Mapping", self.ws_map, "raven_workspace"), new_label
+		)
+		self.raven_ws = new_label
+
+	def test_update_workspace_without_a_rename_leaves_the_raven_name_alone(self):
+		from raven_integration.api import update_workspace
+
+		stored = frappe.db.get_value("Raven Workspace Mapping", self.ws_map, "workspace_label")
+		self.ws_map = update_workspace(name=self.ws_map, label=stored, type="Private")
+		self.assertTrue(frappe.db.exists("Raven Workspace", self.raven_ws))
+
+	def test_update_workspace_failed_rename_rolls_the_raven_write_back(self):
+		"""The Raven rename lands before the mapping's, so a mapping-side failure has
+		to undo it: two mappings cannot share a docname."""
+		from raven_integration.api import update_workspace
+
+		taken = frappe.new_doc("Raven Workspace Mapping")
+		taken.workspace_label = f"RI WS Taken {self._suffix}"
+		taken.workspace_type = "Private"
+		taken.flags.skip_raven_create = True
+		taken.insert()
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Workspace Mapping", taken.name, force=True, ignore_missing=True)
+		)
+		self._raven_ws_names.add(f"RI WS Taken {self._suffix}")
+
+		with self.assertRaises(frappe.ValidationError):
+			update_workspace(name=self.ws_map, label=f"RI WS Taken {self._suffix}", type="Private")
+
+		# Nothing half-renamed: the Raven Workspace still stands under its own name.
+		self.assertTrue(frappe.db.exists("Raven Workspace", self.raven_ws))
+		self.assertEqual(
+			frappe.db.get_value("Raven Workspace Mapping", self.ws_map, "raven_workspace"), self.raven_ws
+		)
+
+	def test_update_channel_rename_propagates_to_raven(self):
+		"""The settings page commits name, visibility and conditions through
+		update_channel, so a rename travelling that path must reach Raven exactly
+		as set_channel_label does. It did not: _update_mapping renamed only the
+		mapping, and the two names diverged with nothing to say so."""
+		from raven_integration.api import update_channel
+
+		new_label = f"RI Upd Ch Renamed {self._suffix}"
+		self.ch_map = update_channel(name=self.ch_map, label=new_label, type="Public", rules=None)
+
+		self.assertEqual(self.ch_map, f"RCM-{new_label}")
+		self.assertEqual(
+			frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name"),
+			new_label.strip().lower().replace(" ", "-"),
+		)
+		# Everything else the one call carries landed too, and the link is intact.
+		self.assertEqual(frappe.db.get_value("Raven Channel Mapping", self.ch_map, "channel_type"), "Public")
+		self.assertEqual(
+			frappe.db.get_value("Raven Channel Mapping", self.ch_map, "raven_channel"), self.raven_ch
+		)
+
+	def test_update_channel_without_a_rename_leaves_the_raven_name_alone(self):
+		"""Only a *changed* label is propagated. Re-saving the same name must leave
+		the Raven channel_name exactly as it was, slug and all."""
+		from raven_integration.api import update_channel
+
+		stored = frappe.db.get_value("Raven Channel Mapping", self.ch_map, "channel_label")
+		before = frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name")
+		self.ch_map = update_channel(name=self.ch_map, label=stored, type="Public", rules=None)
+		self.assertEqual(frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name"), before)
+
+	def test_update_channel_failed_rename_rolls_the_raven_write_back(self):
+		"""The Raven write happens before the mapping rename, so a mapping-side
+		failure has to undo it. Raven itself will not raise here — its duplicate
+		guard only runs on insert — so the collision is forced where it really
+		lives: two mappings cannot share a docname."""
+		from raven_integration.api import update_channel
+
+		taken = frappe.new_doc("Raven Channel Mapping")
+		taken.channel_label = f"RI Taken {self._suffix}"
+		taken.workspace = self.ws_map
+		taken.channel_type = "Private"
+		taken.flags.skip_raven_create = True
+		taken.insert()
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Channel Mapping", taken.name, force=True, ignore_missing=True)
+		)
+
+		before_name = frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name")
+		before_type = frappe.db.get_value("Raven Channel Mapping", self.ch_map, "channel_type")
+
+		with self.assertRaises(frappe.ValidationError):
+			update_channel(name=self.ch_map, label=f"RI Taken {self._suffix}", type="Public", rules=None)
+
+		# Nothing half-applied: the Raven name, the mapping and its visibility all
+		# stand where they were.
+		self.assertEqual(frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name"), before_name)
+		self.assertTrue(frappe.db.exists("Raven Channel Mapping", self.ch_map))
+		self.assertEqual(
+			frappe.db.get_value("Raven Channel Mapping", self.ch_map, "channel_type"), before_type
+		)
+
 	def test_stale_mapping_skips_raven_rename(self):
 		from raven_integration.api import set_workspace_label
 
@@ -1397,7 +1571,11 @@ class TestLabelPropagatesToRaven(FrappeTestCase):
 		from raven_integration.api import set_workspace_label
 
 		occupied = frappe.get_doc(
-			{"doctype": "Raven Workspace", "workspace_name": f"RI Lbl Occupied {self._suffix}", "type": "Private"}
+			{
+				"doctype": "Raven Workspace",
+				"workspace_name": f"RI Lbl Occupied {self._suffix}",
+				"type": "Private",
+			}
 		).insert(ignore_permissions=True)
 		self._raven_ws_names.add(occupied.name)
 
@@ -1464,7 +1642,11 @@ class TestTypePropagatesToRaven(FrappeTestCase):
 			)
 		if frappe.db.exists("Raven Workspace Mapping", self.ws_map):
 			frappe.delete_doc(
-				"Raven Workspace Mapping", self.ws_map, force=True, ignore_permissions=True, ignore_missing=True
+				"Raven Workspace Mapping",
+				self.ws_map,
+				force=True,
+				ignore_permissions=True,
+				ignore_missing=True,
 			)
 		# frappe.db.delete bypasses Raven's on_trash guards during teardown.
 		frappe.db.delete("Raven Channel Member", {"channel_id": self.raven_ch})
@@ -1492,16 +1674,14 @@ class TestTypePropagatesToRaven(FrappeTestCase):
 		result = set_channel_type(name=self.ch_map, type="Public")
 
 		self.assertEqual(result["type"], "Public")
-		self.assertEqual(
-			frappe.db.get_value("Raven Channel Mapping", self.ch_map, "channel_type"), "Public"
-		)
+		self.assertEqual(frappe.db.get_value("Raven Channel Mapping", self.ch_map, "channel_type"), "Public")
 		self.assertEqual(frappe.db.get_value("Raven Channel", self.raven_ch, "type"), "Public")
 
 	def test_update_workspace_propagates_type_to_raven(self):
 		"""The full update path (not just the inline setter) must propagate too."""
 		from raven_integration.api import update_workspace
 
-		update_workspace(name=self.ws_map, label=self.raven_ws, type="Public", rules=[])
+		update_workspace(name=self.ws_map, label=self.raven_ws, type="Public")
 
 		self.assertEqual(frappe.db.get_value("Raven Workspace", self.raven_ws, "type"), "Public")
 
@@ -1690,16 +1870,16 @@ class TestLinkExisting(FrappeTestCase):
 
 		before = frappe.db.count("Raven Workspace")
 		name = self._track("Raven Workspace Mapping", link_workspace(raven_workspace=self.raven_ws))
-		self.assertEqual(frappe.db.count("Raven Workspace"), before, "linking must not create a Raven Workspace")
+		self.assertEqual(
+			frappe.db.count("Raven Workspace"), before, "linking must not create a Raven Workspace"
+		)
 		self.assertEqual(
 			frappe.db.get_value("Raven Workspace Mapping", name, "raven_workspace"), self.raven_ws
 		)
 		self.assertEqual(
 			frappe.db.get_value("Raven Workspace Mapping", name, "workspace_label"), self.raven_ws
 		)
-		self.assertEqual(
-			frappe.db.get_value("Raven Workspace Mapping", name, "workspace_type"), "Public"
-		)
+		self.assertEqual(frappe.db.get_value("Raven Workspace Mapping", name, "workspace_type"), "Public")
 
 	def test_link_workspace_rejects_already_mapped(self):
 		from raven_integration.api import link_workspace
@@ -1759,9 +1939,7 @@ class TestLinkExisting(FrappeTestCase):
 			"Raven Channel Mapping", link_channel(workspace=ws_map, raven_channel=self.raven_ch)
 		)
 		self.assertEqual(frappe.db.count("Raven Channel"), before, "linking must not create a Raven Channel")
-		self.assertEqual(
-			frappe.db.get_value("Raven Channel Mapping", name, "raven_channel"), self.raven_ch
-		)
+		self.assertEqual(frappe.db.get_value("Raven Channel Mapping", name, "raven_channel"), self.raven_ch)
 		self.assertEqual(frappe.db.get_value("Raven Channel Mapping", name, "workspace"), ws_map)
 
 	def test_link_channel_rejects_already_mapped(self):
@@ -1822,8 +2000,8 @@ class TestLinkExisting(FrappeTestCase):
 		# A Raven Workspace autonames from its workspace_name, so name == workspace_name.
 		self.assertEqual(row["workspace_label"], self.raven_ws)
 		self.assertEqual(row["workspace_type"], "Public")
-		self.assertIsNone(row["rule_combinator"])
-		self.assertEqual(row["enabled"], 1)
+		self.assertNotIn("rule_combinator", row)
+		self.assertNotIn("enabled", row)
 		self.assertEqual(row["stale"], 0)
 
 	def test_list_workspaces_managed_row_carries_flag_and_fields(self):
@@ -1838,15 +2016,110 @@ class TestLinkExisting(FrappeTestCase):
 		row = mapped[0]
 		self.assertTrue(row["mapped"])
 		self.assertEqual(row["name"], name)
-		for field in (
-			"workspace_label",
-			"workspace_type",
-			"rule_combinator",
-			"raven_workspace",
-			"enabled",
-			"stale",
-		):
+		for field in ("workspace_label", "workspace_type", "raven_workspace", "stale"):
 			self.assertIn(field, row)
+		self.assertNotIn("rule_combinator", row)
+		self.assertNotIn("enabled", row)
+
+	def test_list_workspaces_counts_the_channels_it_manages(self):
+		"""The Channels column reads a real count, not the length of a list the UI
+		would otherwise have to fetch per row."""
+		from raven_integration.api import list_workspaces
+
+		ws = frappe.new_doc("Raven Workspace Mapping")
+		ws.workspace_label = f"RI Count WS {self._suffix}"
+		ws.workspace_type = "Private"
+		ws.flags.skip_raven_create = True
+		ws.insert()
+		self._track("Raven Workspace Mapping", ws.name)
+		for i in range(2):
+			ch = frappe.new_doc("Raven Channel Mapping")
+			ch.workspace = ws.name
+			ch.channel_label = f"ri-count-{i}-{self._suffix}"
+			ch.channel_type = "Private"
+			ch.flags.skip_raven_create = True
+			ch.insert()
+			self._track("Raven Channel Mapping", ch.name)
+
+		row = next(w for w in list_workspaces() if w["name"] == ws.name)
+		self.assertEqual(row["channel_count"], 2)
+
+	def test_list_workspaces_counts_zero_for_a_workspace_with_no_channels(self):
+		"""An adopted workspace that manages nothing yet reports 0, which is true of it."""
+		from raven_integration.api import list_workspaces
+
+		ws = frappe.new_doc("Raven Workspace Mapping")
+		ws.workspace_label = f"RI Empty WS {self._suffix}"
+		ws.workspace_type = "Private"
+		ws.flags.skip_raven_create = True
+		ws.insert()
+		self._track("Raven Workspace Mapping", ws.name)
+
+		row = next(w for w in list_workspaces() if w["name"] == ws.name)
+		self.assertEqual(row["channel_count"], 0)
+
+	def test_list_workspaces_leaves_the_count_unset_when_unmanaged(self):
+		"""An unadopted Raven workspace manages no channels here, which is not the same
+		as having none. None, so the UI can leave the cell blank instead of saying 0."""
+		from raven_integration.api import list_workspaces
+
+		row = next(w for w in list_workspaces() if w["raven_workspace"] == self.raven_ws)
+		self.assertIsNone(row["channel_count"])
+
+	def test_list_workspaces_order_survives_an_edit(self):
+		"""Row order must not depend on `modified`. The UI reloads this list after every
+		edit, so a row that jumps to the top on being edited drags every row below it
+		up one, and the row under the pointer is no longer the row that was there."""
+		from raven_integration.api import list_workspaces, set_workspace_type
+
+		names = []
+		for i in range(3):
+			ws = frappe.new_doc("Raven Workspace Mapping")
+			ws.workspace_label = f"RI Order WS {i} {self._suffix}"
+			ws.workspace_type = "Private"
+			ws.flags.skip_raven_create = True
+			ws.insert()
+			self._track("Raven Workspace Mapping", ws.name)
+			names.append(ws.name)
+
+		def order():
+			return [row["name"] for row in list_workspaces() if row["name"] in names]
+
+		before = order()
+		# The oldest of the three, so it sits last under any newest-first order and has
+		# the furthest to jump.
+		set_workspace_type(name=names[0], type="Public")
+		self.assertEqual(order(), before, "editing a row must not move it in the list")
+
+	def test_list_channels_order_survives_an_edit(self):
+		"""The channel table reloads on every inline edit too, so it needs the same
+		stable order as the workspace list."""
+		from raven_integration.api import list_channels, set_channel_enabled
+
+		ws = frappe.new_doc("Raven Workspace Mapping")
+		ws.workspace_label = f"RI Order CH WS {self._suffix}"
+		ws.workspace_type = "Private"
+		ws.flags.skip_raven_create = True
+		ws.insert()
+		self._track("Raven Workspace Mapping", ws.name)
+
+		names = []
+		for i in range(3):
+			ch = frappe.new_doc("Raven Channel Mapping")
+			ch.workspace = ws.name
+			ch.channel_label = f"ri-order-{i}-{self._suffix}"
+			ch.channel_type = "Private"
+			ch.flags.skip_raven_create = True
+			ch.insert()
+			self._track("Raven Channel Mapping", ch.name)
+			names.append(ch.name)
+
+		def order():
+			return [row["name"] for row in list_channels(workspace=ws.name) if row["name"] in names]
+
+		before = order()
+		set_channel_enabled(name=names[0], enabled=False)
+		self.assertEqual(order(), before, "editing a row must not move it in the list")
 
 	def test_list_workspaces_managed_rows_come_first(self):
 		"""Managed rows precede every unmanaged row."""
@@ -1885,7 +2158,7 @@ class TestLinkExisting(FrappeTestCase):
 			frappe.db.get_value("Raven Channel", self.raven_ch, "channel_name"),
 		)
 		self.assertEqual(row["channel_type"], "Public")
-		self.assertIsNone(row["rule_combinator"])
+		self.assertNotIn("rule_combinator", row)
 		self.assertEqual(row["enabled"], 1)
 		self.assertEqual(row["stale"], 0)
 
@@ -1935,3 +2208,668 @@ class TestLinkExisting(FrappeTestCase):
 			[c["raven_channel"] for c in rows],
 			"a direct-message channel must not appear as an adoptable row",
 		)
+
+
+def _clear_request_cache() -> None:
+	"""Drop frappe's per-request memo so a global written mid-test is read again.
+
+	get_active_apps / get_disabled_apps are @request_cache'd, and a test process
+	keeps one `frappe.local` for its whole run, so without this the second call
+	answers from the snapshot taken before the global changed.
+	"""
+	cache = getattr(frappe.local, "request_cache", None)
+	if cache is not None:
+		cache.clear()
+
+
+class TestIsSetupHonoursDisabledApps(FrappeTestCase):
+	"""`bench disable-app raven` leaves raven in installed_apps with its tables
+	intact, but frappe stops loading its hooks and running its jobs — so sync
+	cannot work. is_setup drives the Settings gate and must not say it can."""
+
+	def setUp(self):
+		if "raven" not in frappe.get_active_apps():
+			self.skipTest("Raven not installed or already disabled")
+		self._previous_disabled = frappe.db.get_global("disabled_apps")
+		self.addCleanup(self._restore)
+
+	def _restore(self):
+		frappe.db.set_global("disabled_apps", self._previous_disabled or "[]")
+		_clear_request_cache()
+		# The hook registry is keyed off the active apps and may have been rebuilt
+		# without raven's while it was disabled.
+		frappe.clear_cache()
+
+	def test_a_disabled_raven_is_reported_as_absent(self):
+		from raven_integration.api import is_setup
+
+		self.assertTrue(is_setup()["raven"], "raven is installed and enabled on this bench")
+
+		frappe.db.set_global("disabled_apps", frappe.as_json(["raven"]))
+		_clear_request_cache()
+		self.assertFalse(
+			is_setup()["raven"],
+			"a disabled app cannot sync, so the Settings gate must not open on it",
+		)
+
+
+class TestComputeRuleDiffMirrorsSync(FrappeTestCase):
+	"""compute_rule_diff drives a confirmation dialog, so its answer has to be the
+	one _sync_rule_managed_members will actually reach — including every case where
+	the sync moves nobody at all."""
+
+	def setUp(self):
+		if "raven" not in frappe.get_installed_apps():
+			self.skipTest("Raven not installed")
+		self._suffix = frappe.generate_hash(length=6)
+
+		# Someone the FAKE provider does not match, so "removes everyone" and
+		# "removes nobody" are different answers.
+		self.member = frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": f"rv-mirror-{self._suffix}@example.com",
+				"first_name": "MirrorMember",
+				"send_welcome_email": 0,
+			}
+		).insert()
+
+		rw = frappe.get_doc(
+			{
+				"doctype": "Raven Workspace",
+				"workspace_name": f"RI Mirror WS {self._suffix}",
+				"type": "Private",
+			}
+		).insert(ignore_permissions=True)
+		self.raven_ws = rw.name
+		rc = frappe.get_doc(
+			{
+				"doctype": "Raven Channel",
+				"channel_name": f"ri-mirror-ch-{self._suffix}",
+				"workspace": rw.name,
+				"type": "Private",
+			}
+		).insert(ignore_permissions=True)
+		self.raven_ch = rc.name
+
+		ws = frappe.new_doc("Raven Workspace Mapping")
+		ws.workspace_label = f"RI Mirror WS {self._suffix}"
+		ws.workspace_type = "Private"
+		ws.flags.skip_raven_create = True
+		ws.insert()
+		frappe.db.set_value("Raven Workspace Mapping", ws.name, "raven_workspace", self.raven_ws)
+		self.ws_map = ws.name
+
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			ch = frappe.new_doc("Raven Channel Mapping")
+			ch.channel_label = f"RI Mirror CH {self._suffix}"
+			ch.workspace = self.ws_map
+			ch.channel_type = "Private"
+			ch.flags.skip_raven_create = True
+			ch.member_rules_json = frappe.as_json(self._tree())
+			ch.insert()
+		frappe.db.set_value("Raven Channel Mapping", ch.name, "raven_channel", self.raven_ch)
+		self.ch_map = ch.name
+
+		from raven_integration.sync_service import ensure_raven_user
+
+		ensure_raven_user(self.member.name)
+		frappe.get_doc(
+			{
+				"doctype": "Raven Channel Member",
+				"channel_id": self.raven_ch,
+				"user_id": self.member.name,
+				"added_by_rule": 1,
+			}
+		).insert(ignore_permissions=True)
+
+		self.addCleanup(self._cleanup)
+
+	def _cleanup(self):
+		frappe.set_user("Administrator")
+		for doctype, name in (
+			("Raven Channel Mapping", self.ch_map),
+			("Raven Workspace Mapping", self.ws_map),
+		):
+			if frappe.db.exists(doctype, name):
+				frappe.delete_doc(doctype, name, force=True, ignore_permissions=True, ignore_missing=True)
+		# frappe.db.delete bypasses Raven's on_trash guards during teardown.
+		frappe.db.delete("Raven Channel Member", {"channel_id": self.raven_ch})
+		frappe.db.delete("Raven Channel", {"name": self.raven_ch})
+		frappe.db.delete("Raven Workspace Member", {"workspace": self.raven_ws})
+		frappe.db.delete("Raven Workspace", {"name": self.raven_ws})
+		frappe.db.delete("Raven User", {"user": self.member.name})
+		frappe.db.delete("User", {"name": self.member.name})
+
+	def _tree(self):
+		return {"conjunctions": [], "conditions": [_leaf("Mirror Rule", rule_type="always-a")]}
+
+	def _diff(self, provider_paths):
+		from raven_integration.api import compute_rule_diff
+
+		with patch.object(registry, "_provider_paths", return_value=provider_paths):
+			return compute_rule_diff(
+				target_doctype="Raven Channel Mapping",
+				name=self.ch_map,
+				new_rules=self._tree(),
+			)
+
+	def test_a_rule_the_provider_answers_still_reports_its_removals(self):
+		"""The guards below must not blanket-suppress a real removal."""
+		result = self._diff(_FAKE)
+		self.assertEqual(result["removed"], 1)
+		self.assertEqual(result["removed_users"], [self.member.name])
+		self.assertFalse(result["unknown"])
+
+	def test_a_tree_nothing_can_evaluate_is_reported_as_unknown_not_as_a_purge(self):
+		"""No provider registered — the provider's app is gone. evaluate_rules
+		answers set() for that exactly as it does for "matches nobody", so the
+		dialog used to announce every rule-managed member was about to go. The
+		real sync runs strict: it raises and removes nobody."""
+		result = self._diff([])
+		self.assertTrue(result["unknown"], "an unevaluable tree is not a tree that matches nobody")
+		self.assertEqual(result["removed"], 0)
+		self.assertEqual(result["removed_users"], [])
+		self.assertEqual(result["added"], 0)
+
+	def test_a_switched_off_channel_reports_no_change(self):
+		"""_sync_rule_managed_members returns skipped/disabled before reading a
+		rule, so confirming this change would move nobody."""
+		frappe.db.set_value("Raven Channel Mapping", self.ch_map, "enabled", 0)
+		result = self._diff(_FAKE)
+		self.assertEqual(result["removed"], 0)
+		self.assertEqual(result["added"], 0)
+		self.assertFalse(result["unknown"])
+
+	def test_a_stale_mapping_reports_no_change(self):
+		"""The Raven channel is gone; the sync returns skipped/raven_record_deleted."""
+		frappe.db.set_value("Raven Channel Mapping", self.ch_map, "stale", 1)
+		result = self._diff(_FAKE)
+		self.assertEqual(result["removed"], 0)
+		self.assertEqual(result["added"], 0)
+
+
+_EMPTY_TREE = {"conjunctions": [], "conditions": []}
+
+
+class TestGetChannelMemberCount(FrappeTestCase):
+	"""get_channel's member_count had evaluate_rules' defect: a tree no provider
+	could evaluate counted as zero, which reads as "this channel matches nobody"."""
+
+	def setUp(self):
+		self._suffix = frappe.generate_hash(length=6)
+		ws = frappe.new_doc("Raven Workspace Mapping")
+		ws.workspace_label = f"RI Count WS {self._suffix}"
+		ws.workspace_type = "Private"
+		ws.flags.skip_raven_create = True
+		ws.insert()
+		self.ws_map = ws.name
+
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			ch = frappe.new_doc("Raven Channel Mapping")
+			ch.channel_label = f"RI Count CH {self._suffix}"
+			ch.workspace = self.ws_map
+			ch.channel_type = "Private"
+			ch.flags.skip_raven_create = True
+			ch.member_rules_json = frappe.as_json({"conjunctions": [], "conditions": [_leaf("Count Rule")]})
+			ch.insert()
+		self.ch_map = ch.name
+
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Workspace Mapping", self.ws_map, force=True, ignore_missing=True)
+		)
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Channel Mapping", self.ch_map, force=True, ignore_missing=True)
+		)
+
+	def _detail(self, provider_paths):
+		from raven_integration.api import get_channel
+
+		with patch.object(registry, "_provider_paths", return_value=provider_paths):
+			return get_channel(self.ch_map)
+
+	def test_a_count_the_providers_answered_is_not_flagged_unknown(self):
+		detail = self._detail(_FAKE)
+		self.assertEqual(detail["member_count"], 2)
+		self.assertFalse(detail["member_count_unknown"])
+
+	def test_a_count_nothing_could_evaluate_is_flagged_unknown(self):
+		detail = self._detail([])
+		self.assertTrue(
+			detail["member_count_unknown"],
+			"nobody could evaluate this tree, which is not the same as it matching nobody",
+		)
+
+	def test_an_empty_tree_matches_nobody_rather_than_being_unknown(self):
+		# Every channel is empty the moment it is created. The tree yielding no
+		# opinion answers None exactly as an unevaluable one does, so without the
+		# has_active_rules guard a brand new channel opened saying its own
+		# membership could not be worked out.
+		frappe.db.set_value(
+			"Raven Channel Mapping", self.ch_map, "member_rules_json", frappe.as_json(_EMPTY_TREE)
+		)
+		detail = self._detail(_FAKE)
+		self.assertEqual(detail["member_count"], 0)
+		self.assertFalse(detail["member_count_unknown"])
+
+	def test_a_tree_whose_every_rule_is_paused_matches_nobody(self):
+		# Same None, same reason: no rule offered an opinion. Pausing every rule is a
+		# thing the admin did on purpose, not a failure to evaluate.
+		paused = _leaf("Count Rule")
+		paused["status"] = "Paused"
+		frappe.db.set_value(
+			"Raven Channel Mapping",
+			self.ch_map,
+			"member_rules_json",
+			frappe.as_json({"conjunctions": [], "conditions": [paused]}),
+		)
+		detail = self._detail(_FAKE)
+		self.assertEqual(detail["member_count"], 0)
+		self.assertFalse(detail["member_count_unknown"])
+
+
+class TestCreateMappingRollsBackALostRace(FrappeTestCase):
+	"""_create_mapping retries after a docname collision. before_insert has already
+	created the backing Raven record by then, so an attempt that is not rolled back
+	leaves it behind, unmanaged, and list_unmapped_workspaces offers it forever."""
+
+	def setUp(self):
+		if "raven" not in frappe.get_installed_apps():
+			self.skipTest("Raven not installed")
+		self._suffix = frappe.generate_hash(length=6)
+		self.taken_label = f"RI Race Taken {self._suffix}"
+		self.free_label = f"RI Race Free {self._suffix}"
+		self.created = None
+
+		# Stands in for the mapping the winning session inserted a moment earlier.
+		existing = frappe.new_doc("Raven Workspace Mapping")
+		existing.workspace_label = self.taken_label
+		existing.workspace_type = "Private"
+		existing.flags.skip_raven_create = True
+		existing.insert()
+		self.existing = existing.name
+		self.addCleanup(self._cleanup)
+
+	def _cleanup(self):
+		frappe.set_user("Administrator")
+		for name in (self.existing, self.created):
+			if name and frappe.db.exists("Raven Workspace Mapping", name):
+				frappe.delete_doc(
+					"Raven Workspace Mapping",
+					name,
+					force=True,
+					ignore_permissions=True,
+					ignore_missing=True,
+				)
+		for label in (self.taken_label, self.free_label):
+			frappe.db.delete("Raven Workspace Member", {"workspace": label})
+			frappe.db.delete("Raven Workspace", {"name": label})
+
+	def _create_losing_the_first_name(self):
+		from raven_integration.api import create_workspace
+
+		with (
+			patch(
+				"raven_integration.api._next_default_label",
+				side_effect=[self.taken_label, self.free_label],
+			),
+			patch.object(registry, "_provider_paths", return_value=[]),
+		):
+			self.created = create_workspace()
+		return self.created
+
+	def test_a_lost_docname_race_leaves_no_orphan_raven_workspace(self):
+		before = frappe.db.count("Raven Workspace")
+		self._create_losing_the_first_name()
+		self.assertEqual(
+			frappe.db.count("Raven Workspace") - before,
+			1,
+			"only the attempt that inserted a mapping may leave a Raven Workspace behind",
+		)
+		self.assertFalse(
+			frappe.db.exists("Raven Workspace", self.taken_label),
+			"the Raven Workspace of the failed attempt must be rolled back",
+		)
+
+	def test_a_retried_create_does_not_return_a_duplicate_name_dialog(self):
+		"""db_insert msgprints a red "Duplicate Name" before raising, so without
+		clear_last_message a create that then succeeded still popped that dialog —
+		naming a default the user never chose and never saw."""
+		frappe.clear_messages()
+		self._create_losing_the_first_name()
+		titles = [message.get("title") for message in frappe.get_message_log()]
+		self.assertNotIn("Duplicate Name", titles)
+
+
+class TestPreviewRuleValidatesItsInput(FrappeTestCase):
+	"""preview_rule is whitelisted and its three fields reach a dict lookup, a bare
+	json.loads and an attribute access. Unvalidated, each is a 500 with a traceback."""
+
+	def _reqcfg_provider(self):
+		return {
+			"name": "REQCFG2",
+			"label": "Requires Config",
+			"rule_types": [
+				{
+					"type": "needs-batch",
+					"label": "Needs Batch",
+					"fields": [{"fieldname": "batch", "label": "Batch", "reqd": 1}],
+				}
+			],
+			"evaluate": lambda rule_type, config: {config["batch"]},
+			"triggers": [],
+		}
+
+	def test_rejects_a_provider_that_is_not_text(self):
+		"""A list provider reaches dict.get() and raises TypeError: unhashable."""
+		from raven_integration.api import preview_rule
+
+		with self.assertRaises(frappe.ValidationError) as cm:
+			preview_rule({"provider": ["x"], "rule_type": "always-ab", "config": {}})
+		self.assertIn("provider", str(cm.exception))
+
+	def test_rejects_a_rule_type_that_is_not_text(self):
+		"""Reported as a type error naming the field, not as "provider X has no
+		rule type 7" — the request never chose a rule type at all."""
+		from raven_integration.api import preview_rule
+
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			with self.assertRaises(frappe.ValidationError) as cm:
+				preview_rule({"provider": "FAKE", "rule_type": 7, "config": {}})
+		self.assertIn("must be text", str(cm.exception))
+
+	def test_rejects_a_config_that_is_not_an_object(self):
+		"""registry.validate_rule_config json.loads a string config with no guard,
+		so malformed text used to surface as a JSONDecodeError."""
+		from raven_integration.api import preview_rule
+
+		with patch.object(registry, "_provider_paths", return_value=_FAKE):
+			with self.assertRaises(frappe.ValidationError):
+				preview_rule({"provider": "FAKE", "rule_type": "always-ab", "config": "{"})
+
+	def test_rejects_a_config_that_is_a_list(self):
+		"""A list config reaches cfg.get() in the reqd-field loop -> AttributeError."""
+		from raven_integration.api import preview_rule
+
+		with patch.object(registry, "_load_providers", return_value={"REQCFG2": self._reqcfg_provider()}):
+			with self.assertRaises(frappe.ValidationError):
+				preview_rule({"provider": "REQCFG2", "rule_type": "needs-batch", "config": [1]})
+
+
+class TestMutatingEndpointsAreNotReachableByGet(FrappeTestCase):
+	"""Hardening, not a live hole: frappe already rolls back a non-unsafe method
+	and every enqueue here is enqueue_after_commit. But a bare @frappe.whitelist()
+	allows GET, and CSRF is skipped for non-unsafe methods — so the declaration is
+	the only thing saying these change state. frappe.client does the same."""
+
+	_STATE_CHANGING = (
+		"enable_integration",
+		"create_workspace",
+		"update_workspace",
+		"delete_workspace",
+		"recreate_workspace",
+		"set_workspace_type",
+		"set_workspace_label",
+		"create_channel",
+		"update_channel",
+		"delete_channel",
+		"recreate_channel",
+		"set_channel_enabled",
+		"set_channel_type",
+		"set_channel_label",
+		"set_channel_rule_status",
+		"reconcile_now",
+		"link_workspace",
+		"link_channel",
+	)
+
+	_READ_ONLY = (
+		"is_setup",
+		"list_providers",
+		"list_workspaces",
+		"get_workspace",
+		"list_workspace_members",
+		"list_channels",
+		"get_channel",
+		"preview_rule",
+		"compute_rule_diff",
+		"list_unmapped_workspaces",
+		"list_unmapped_channels",
+	)
+
+	def _methods(self, name: str):
+		from raven_integration import api
+
+		return frappe.allowed_http_methods_for_whitelisted_func[getattr(api, name)]
+
+	def test_every_state_changing_endpoint_refuses_get(self):
+		for name in self._STATE_CHANGING:
+			with self.subTest(endpoint=name):
+				self.assertNotIn("GET", self._methods(name))
+				self.assertIn("POST", self._methods(name))
+
+	def test_the_delete_endpoints_also_accept_delete(self):
+		for name in ("delete_workspace", "delete_channel"):
+			with self.subTest(endpoint=name):
+				self.assertIn("DELETE", self._methods(name))
+
+	def test_read_only_endpoints_stay_reachable_by_get(self):
+		for name in self._READ_ONLY:
+			with self.subTest(endpoint=name):
+				self.assertIn("GET", self._methods(name))
+
+
+class TestCaseOnlyNameCollision(FrappeTestCase):
+	"""The docname column collates utf8mb4_unicode_ci, so two mappings whose labels
+	differ only in case cannot both exist. db.exists is case-insensitive for the
+	same reason, and comparing its answer to the *new* name let a different doc's
+	row through — the rename then died on the primary key."""
+
+	def setUp(self):
+		self._suffix = frappe.generate_hash(length=6)
+		ws = frappe.new_doc("Raven Workspace Mapping")
+		ws.workspace_label = f"RI Case WS {self._suffix}"
+		ws.workspace_type = "Private"
+		ws.flags.skip_raven_create = True
+		ws.insert()
+		self.ws_map = ws.name
+		self.general = self._channel(f"General {self._suffix}")
+		self.sales = self._channel(f"Sales {self._suffix}")
+		self.addCleanup(self._cleanup)
+
+	def _channel(self, label: str) -> str:
+		ch = frappe.new_doc("Raven Channel Mapping")
+		ch.channel_label = label
+		ch.workspace = self.ws_map
+		ch.channel_type = "Private"
+		ch.flags.skip_raven_create = True
+		ch.insert()
+		return ch.name
+
+	def _cleanup(self):
+		frappe.set_user("Administrator")
+		for name in frappe.get_all("Raven Channel Mapping", filters={"workspace": self.ws_map}, pluck="name"):
+			frappe.delete_doc(
+				"Raven Channel Mapping", name, force=True, ignore_permissions=True, ignore_missing=True
+			)
+		frappe.delete_doc(
+			"Raven Workspace Mapping",
+			self.ws_map,
+			force=True,
+			ignore_permissions=True,
+			ignore_missing=True,
+		)
+
+	def test_renaming_onto_another_mappings_name_in_another_case_is_refused(self):
+		from raven_integration.api import set_channel_label
+
+		with self.assertRaises(frappe.ValidationError) as cm:
+			set_channel_label(name=self.sales, label=f"general {self._suffix}")
+		self.assertIn("already called", str(cm.exception))
+		self.assertTrue(frappe.db.exists("Raven Channel Mapping", self.sales))
+
+	def test_re_casing_a_mappings_own_name_still_renames_it(self):
+		"""The reason the check is loose in the first place: rename_doc allows a
+		doc to be renamed to a different casing of its own name."""
+		from raven_integration.api import set_channel_label
+
+		result = set_channel_label(name=self.sales, label=f"sales {self._suffix}")
+		self.assertEqual(result["name"], f"RCM-sales {self._suffix}")
+		self.assertEqual(
+			frappe.db.get_value("Raven Channel Mapping", result["name"], "channel_label"),
+			f"sales {self._suffix}",
+		)
+
+
+class TestRavenWorkspaceCaseOnlyCollision(FrappeTestCase):
+	"""_rename_raven_workspace carried the same loose check against Raven Workspace,
+	whose docname *is* its display name."""
+
+	def setUp(self):
+		if "raven" not in frappe.get_installed_apps():
+			self.skipTest("Raven not installed")
+		self._suffix = frappe.generate_hash(length=6)
+		self._raven_ws_names = set()
+
+		self.other_ws = self._raven_workspace(f"RI WsCase Other {self._suffix}")
+		self.mine_ws = self._raven_workspace(f"RI WsCase Mine {self._suffix}")
+
+		ws_map = frappe.new_doc("Raven Workspace Mapping")
+		ws_map.workspace_label = self.mine_ws
+		ws_map.workspace_type = "Private"
+		ws_map.flags.skip_raven_create = True
+		ws_map.insert()
+		frappe.db.set_value("Raven Workspace Mapping", ws_map.name, "raven_workspace", self.mine_ws)
+		self.ws_map = ws_map.name
+		self.addCleanup(self._cleanup)
+
+	def _raven_workspace(self, name: str) -> str:
+		doc = frappe.get_doc(
+			{"doctype": "Raven Workspace", "workspace_name": name, "type": "Private"}
+		).insert(ignore_permissions=True)
+		self._raven_ws_names.add(doc.name)
+		return doc.name
+
+	def _cleanup(self):
+		frappe.set_user("Administrator")
+		if frappe.db.exists("Raven Workspace Mapping", self.ws_map):
+			frappe.delete_doc(
+				"Raven Workspace Mapping",
+				self.ws_map,
+				force=True,
+				ignore_permissions=True,
+				ignore_missing=True,
+			)
+		for name in self._raven_ws_names:
+			frappe.db.delete("Raven Workspace Member", {"workspace": name})
+			frappe.db.delete("Raven Workspace", {"name": name})
+
+	def test_renaming_onto_another_raven_workspace_in_another_case_is_refused(self):
+		from raven_integration.api import set_workspace_label
+
+		clashing = self.other_ws.lower()
+		self._raven_ws_names.add(clashing)
+		with self.assertRaises(frappe.ValidationError) as cm:
+			set_workspace_label(name=self.ws_map, label=clashing)
+		self.assertIn("already exists", str(cm.exception))
+		self.assertTrue(frappe.db.exists("Raven Workspace", self.mine_ws))
+
+
+class TestLinkChannelValidatesTheChannel(FrappeTestCase):
+	"""link_channel adopted any Raven Channel id posted at it — list_unmapped_channels
+	filters DMs, threads and other workspaces, but the endpoint did not."""
+
+	def setUp(self):
+		if "raven" not in frappe.get_installed_apps():
+			self.skipTest("Raven not installed")
+		self._suffix = frappe.generate_hash(length=6)
+		self._raven_ws_names = set()
+		self._raven_ch_names = set()
+		self._mappings: list[tuple[str, str]] = []
+
+		self.raven_ws = self._raven_workspace(f"RI Adopt WS {self._suffix}")
+		self.other_ws = self._raven_workspace(f"RI Adopt Other {self._suffix}")
+		self.own_ch = self._raven_channel(f"ri-adopt-own-{self._suffix}", self.raven_ws)
+		self.foreign_ch = self._raven_channel(f"ri-adopt-foreign-{self._suffix}", self.other_ws)
+		self.dm_ch = self._raven_channel(f"ri-adopt-dm-{self._suffix}", self.raven_ws)
+		# Flipped directly, the way test_list_channels_excludes_dm_and_thread does:
+		# Raven's own DM creation path wants a canonical two-user channel_name.
+		frappe.db.set_value("Raven Channel", self.dm_ch, "is_direct_message", 1)
+
+		from raven_integration.api import link_workspace
+
+		self.ws_map = self._track("Raven Workspace Mapping", link_workspace(raven_workspace=self.raven_ws))
+		self.addCleanup(self._cleanup)
+
+	def _raven_workspace(self, name: str) -> str:
+		doc = frappe.get_doc(
+			{"doctype": "Raven Workspace", "workspace_name": name, "type": "Private"}
+		).insert(ignore_permissions=True)
+		self._raven_ws_names.add(doc.name)
+		return doc.name
+
+	def _raven_channel(self, name: str, workspace: str) -> str:
+		doc = frappe.get_doc(
+			{"doctype": "Raven Channel", "channel_name": name, "workspace": workspace, "type": "Private"}
+		).insert(ignore_permissions=True)
+		self._raven_ch_names.add(doc.name)
+		return doc.name
+
+	def _track(self, doctype: str, name: str) -> str:
+		self._mappings.append((doctype, name))
+		return name
+
+	def _cleanup(self):
+		frappe.set_user("Administrator")
+		for doctype, name in reversed(self._mappings):
+			if frappe.db.exists(doctype, name):
+				frappe.delete_doc(doctype, name, force=True, ignore_permissions=True, ignore_missing=True)
+		for name in self._raven_ch_names:
+			frappe.db.delete("Raven Channel Member", {"channel_id": name})
+			frappe.db.delete("Raven Channel", {"name": name})
+		for name in self._raven_ws_names:
+			frappe.db.delete("Raven Workspace Member", {"workspace": name})
+			frappe.db.delete("Raven Workspace", {"name": name})
+
+	def test_adopts_a_regular_channel_of_the_workspace(self):
+		from raven_integration.api import link_channel
+
+		name = self._track(
+			"Raven Channel Mapping", link_channel(workspace=self.ws_map, raven_channel=self.own_ch)
+		)
+		self.assertEqual(frappe.db.get_value("Raven Channel Mapping", name, "raven_channel"), self.own_ch)
+
+	def test_refuses_a_channel_from_another_raven_workspace(self):
+		"""Its members would be joined to this mapping's Raven workspace while
+		on_trash evicts them against the one the channel actually lives in."""
+		from raven_integration.api import link_channel
+
+		with self.assertRaises(frappe.ValidationError) as cm:
+			link_channel(workspace=self.ws_map, raven_channel=self.foreign_ch)
+		self.assertIn("lives in Raven workspace", str(cm.exception))
+		self.assertFalse(frappe.db.exists("Raven Channel Mapping", {"raven_channel": self.foreign_ch}))
+
+	def test_refuses_a_direct_message(self):
+		"""Rules would insert matched users into a two-person conversation."""
+		from raven_integration.api import link_channel
+
+		with self.assertRaises(frappe.ValidationError):
+			link_channel(workspace=self.ws_map, raven_channel=self.dm_ch)
+		self.assertFalse(frappe.db.exists("Raven Channel Mapping", {"raven_channel": self.dm_ch}))
+
+	def test_refuses_a_thread(self):
+		from raven_integration.api import link_channel
+
+		frappe.db.set_value("Raven Channel", self.own_ch, "is_thread", 1)
+		with self.assertRaises(frappe.ValidationError):
+			link_channel(workspace=self.ws_map, raven_channel=self.own_ch)
+		self.assertFalse(frappe.db.exists("Raven Channel Mapping", {"raven_channel": self.own_ch}))
+
+	def test_refuses_when_the_parent_mapping_has_no_raven_workspace(self):
+		"""Nothing can be adopted into a mapping with no Raven workspace behind it;
+		list_unmapped_channels returns an empty list for exactly this case."""
+		from raven_integration.api import link_channel
+
+		frappe.db.set_value("Raven Workspace Mapping", self.ws_map, "raven_workspace", None)
+		with self.assertRaises(frappe.ValidationError):
+			link_channel(workspace=self.ws_map, raven_channel=self.own_ch)

@@ -44,11 +44,11 @@ This separation is the whole point: the integration is **generic**. Any Frappe a
 |-------|---------------|
 | **Workspace** | A top-level container in Raven (like a Slack workspace). |
 | **Channel** | A chat room inside a workspace. |
-| **Workspace Mapping** | A record in this app that says "manage *this* Raven workspace's members using *these* rules." |
-| **Channel Mapping** | Same, but for a single channel. |
+| **Workspace Mapping** | A record in this app that says "manage *this* Raven workspace." It holds no rules — its membership is derived from its channels. |
+| **Channel Mapping** | "Keep *this* channel's members matching *these* rules." Rules live here and nowhere else. |
 | **Membership Rule** | One condition, e.g. "matches LMS rule: enrolled in Course X". Each rule names a *provider*, a *rule type*, and some *config* (the opaque settings the provider understands). |
 | **Provider** | The external app that answers "who matches this rule?". |
-| **Rule combinator** | How multiple rules on one record combine: **Any (OR)** = match any rule, **All (AND)** = must match every rule. |
+| **Condition tree** | How a channel's rules combine: a group joins its children with **or** (union) or **and** (intersection), and a child may be another group — so `A and (B or C)` is expressible. |
 | **`added_by_rule` flag** | A hidden marker on each membership row. The app **only ever removes members it added itself** — see Safety below. |
 | **Stale mapping** | A mapping whose Raven workspace/channel was deleted inside Raven. It keeps all its rules but stops syncing until an admin recreates the Raven record or deletes the mapping. |
 
@@ -56,32 +56,54 @@ This separation is the whole point: the integration is **generic**. Any Frappe a
 
 ## The data model (what gets stored)
 
-- **Raven Workspace Mapping** — `workspace_label`, `workspace_type` (Public/Private), link to the real `Raven Workspace`, an `enabled` switch, a read-only `stale` flag, a `rule_combinator`, and a child table of **member rules**.
-- **Raven Channel Mapping** — `channel_label`, `channel_type` (Public/Private/Open), link to its parent Workspace Mapping, link to the real `Raven Channel`, `enabled`, a read-only `stale` flag, `rule_combinator`, and its own child table of **member rules**.
+- **Raven Workspace Mapping** — `workspace_label`, `workspace_type` (Public/Private), link to the real `Raven Workspace`, and a read-only `stale` flag. No conditions of its own, and no `enabled` switch: its membership is derived from its channels, so switching those off is what stops it syncing.
+- **Raven Channel Mapping** — `channel_label`, `channel_type` (Public/Private/Open), link to its parent Workspace Mapping, link to the real `Raven Channel`, `enabled`, a read-only `stale` flag, and `member_rules_json` holding the **condition tree**.
 
-A cleared `enabled` and a set `stale` both stop a mapping syncing, but they are not the same thing. `enabled` is the admin's switch — clearing it pauses the mapping on purpose. `stale` is the app recording a fact: the Raven record this mapping managed has been deleted. Admins set `enabled`; only the app sets and clears `stale`.
-- **Raven Membership Rule** (child rows) — `label`, `provider`, `rule_type`, `status` (Active/Paused), `config` (JSON the provider interprets).
+A cleared `enabled` and a set `stale` both stop a mapping syncing, but they are not the same thing. `enabled` is the admin's switch — clearing it pauses the mapping on purpose, and only a channel mapping carries one. `stale` is the app recording a fact: the Raven record this mapping managed has been deleted. Admins set `enabled`; only the app sets and clears `stale`.
 - **Raven Membership Settings** (single record) — one `enabled` switch that turns the whole integration on.
+
+A rule is not a record of its own. It is a leaf of the condition tree inside `member_rules_json` — `label`, `provider`, `rule_type`, `status` (Active/Paused), `config` (JSON the provider interprets) — so it is saved, validated and deleted with the channel mapping that holds it.
 
 ---
 
 ## How membership is decided
 
-For any workspace or channel, the app computes the **expected member list**:
+For a **channel**, the app computes the expected member list:
 
-1. Take all its **Active** rules (Paused rules are ignored).
+1. Walk its condition tree, skipping **Paused** rules (they are absent, not "matches nobody").
 2. Ask each rule's provider "who matches?" → get a set of users per rule.
-3. Combine those sets using the combinator: **OR** = union, **AND** = intersection.
+3. Fold each group by its joiners: **or** = union, **and** = intersection. A group with nothing
+   left in it drops out of its parent rather than emptying it.
 
-**Channels narrow their workspace, never widen it:**
+Each joiner in `conjunctions` sits between the pair of conditions on either side of it, so a group
+always has one fewer joiner than it has conditions. A group is usually wholly `or` or wholly `and`
+— Frappe Learning's settings UI writes one operator per group — but the fold does not assume that:
+a level mixing both operators folds with classic precedence, `and` binding tighter than `or`, so it
+reads the way the expression looks rather than left to right:
 
 ```
-channel members = (the channel's own rules) ∩ (the workspace's members)
+conjunctions: [and, or, and]
+conditions:   [A,   B,  C,  D]
+=> (A and B) or (C and D)
+
+conjunctions: [or, and]
+conditions:   [A,  B,   C]
+=> A or (B and C)        # not (A or B) and C
 ```
 
-So a channel can only contain people who are already in its parent workspace. A channel rule can never sneak someone into the workspace who doesn't belong there.
+A mixed level can only reach this engine through the API — the settings UI never produces one.
 
-Then the app compares expected vs. actual and applies the difference: add the missing people, remove the ones who no longer match (but only ones it added itself).
+For a **workspace**, membership is not computed from rules at all — it is **derived**:
+
+```
+workspace members = everyone who is in at least one channel of that workspace
+```
+
+Channels populate their workspace rather than carving it up. Adding someone to a channel puts them in the workspace; losing their last channel takes them back out. Nothing narrows a channel: a channel's rules are the whole statement of who belongs in it.
+
+The derivation reads the channels' **actual** Raven membership, not their rules, so a channel the app is not syncing — disabled, stale, or never mapped at all — still holds its members in the workspace. This is why every sweep does channels first: by the time a workspace is reconciled, its channels already hold the membership their rules ask for.
+
+Then the app compares expected vs. actual and applies the difference: add the missing people, remove the ones who no longer belong (but only ones it added itself).
 
 ---
 
@@ -103,7 +125,7 @@ Then the app compares expected vs. actual and applies the difference: add the mi
 - The sync re-checks every active mapping and corrects membership.
 
 ### 4. Nightly reconcile — the safety net
-- Once a day, the app does a full sweep of every active mapping to catch anything the real-time path missed.
+- Once a day, the app does a full sweep of every active mapping to catch anything the real-time path missed. Channels first, then workspaces — the second half is derived from the first.
 - Before sweeping, it first marks **stale mappings** (see below), so a mapping whose Raven record has vanished is already excluded from the sweep in the same run.
 
 ### 5. Manual reconcile
@@ -111,19 +133,22 @@ Then the app compares expected vs. actual and applies the difference: add the mi
 
 ### 6. Previewing before saving
 - `preview_rule` — "how many users would this one rule match?" (with a few sample names).
-- `compute_rule_diff` — "if I save these new rules, how many get added/removed, and who gets removed?" So an admin sees the impact before committing.
+- `compute_rule_diff` — "if I save these new rules on this channel, how many get added/removed, and who gets removed?" So an admin sees the impact before committing. Channels only; a workspace has no rules to preview.
 
 ### 7. Deleting a mapping
-- Delete a **Workspace Mapping** → its child Channel Mappings are deleted too.
-- The **real Raven workspace/channel is left intact** — just no longer managed. Its messages, history and members stay exactly as they were.
-- There is no option to do otherwise. **The app never deletes a Raven workspace or channel**, on any code path. "Delete" here only ever means "delete our own mapping record and the rules on it".
-- Members the app had added stay in Raven. Nothing evicts them, because eviction only happens as part of a sync, and a deleted mapping is never swept again.
+- Delete a **Workspace Mapping** → its child Channel Mappings, and with them the rules, are deleted too.
+- **The membership those rules granted is withdrawn**: every `added_by_rule` row on the workspace's channels and on the workspace itself is removed. Those people were in there on the authority of rules that are being deleted, and leaving them behind would leave a channel populated by a rule the site can no longer show, explain or undo.
+- Members a human added inside Raven are **not** touched. They carry no `added_by_rule` flag, and the rule that this app only ever removes what it added holds on the way out exactly as it does during a sync.
+- The **real Raven workspace/channel is left intact** — just no longer managed. Its history stays exactly as it was. The withdrawal itself is visible, though: Raven writes one "X was removed by Y." system message per membership row it deletes, and honours no flag that would suppress it.
+- There is no option to do otherwise. **The app never deletes a Raven workspace or channel**, on any code path. "Delete" here only ever means "delete our own mapping record, the rules on it, and the membership those rules put in place".
+- Deleting a single **Channel Mapping** withdraws the same way, narrowed to that one channel: its `added_by_rule` members go, the other channels are untouched, and the Raven channel itself survives.
+- The workspace mapping survives a channel delete and stays managed, so its own membership stays **derived** rather than wiped: someone who was only in the workspace because of the deleted channel loses their workspace row too, and someone still in another channel keeps it. That is the same conclusion the next `sync_workspace_members` sweep would reach — doing it during the delete just means a paused or unswept workspace never sits on membership it can no longer account for.
 
 ### 8. Stale mappings (someone deleted the Raven side directly)
 - An admin can delete a workspace/channel inside Raven directly. The app **allows** that — it deliberately does not block Raven's own delete.
-- The mapping now points at a record that is gone. The nightly reconcile detects this and **marks the mapping `stale = 1`** and logs it. The mapping itself is *not* deleted and stays `enabled`.
+- The mapping now points at a record that is gone. The nightly reconcile detects this and **marks the mapping `stale = 1`** and logs it. The mapping itself is *not* deleted, and the sweep touches nothing else — a channel mapping keeps whatever `enabled` the admin chose, because recreating the Raven record clears only `stale`.
 - A stale mapping stops syncing: `sync_workspace_members` / `sync_channel_members` return `{"skipped": True, "reason": "raven_record_deleted"}` and do nothing else. No crashes, no orphan syncs.
-- Everything the admin configured — the rules, the combinator, the label, the type — is still sitting there, intact.
+- Everything the admin configured — the conditions, the label, the type — is still sitting there, intact.
 
 ### 9. Recovering a stale mapping
 The UI surfaces a stale mapping with a **"Take action"** control offering exactly two choices:
@@ -165,13 +190,13 @@ This is what makes the app reusable across LMS, CRM, or anything else.
 
 ## Safety guarantees (why it won't wreck your data)
 
-- **Never deletes a Raven workspace or channel.** Not when you delete a mapping, not when you uninstall the app, not through any endpoint. The only records it deletes are its own mappings and rules, plus the individual member rows it added.
+- **Never deletes a Raven workspace or channel.** Not when you delete a mapping, not when you uninstall the app, not through any endpoint. The only records it deletes are its own mappings — the rules ride along on the mapping, so they go with it — plus the individual member rows it added, including on the way out, when a workspace mapping is deleted.
 - **Only removes what it added.** Every member the app adds is tagged `added_by_rule = 1`. Members added manually inside Raven are **never** touched. Removal only ever targets tagged rows.
 - **One-way enable.** No global off-switch that would mass-remove everyone. You disable individual mappings instead.
 - **Idempotent / race-safe.** Concurrent runs (nightly + event at once) can't double-add or crash — database uniqueness constraints catch the loser, and it's treated as already-done.
 - **Fail-safe events.** The "on every save" handler can never break an unrelated document save; errors are logged, not raised.
 - **Per-record error isolation.** If one mapping fails during a sweep, the others still complete; the failure is logged.
-- **Admin-only.** Every management action requires the **System Manager** role, with strict input-type checks.
+- **Admin-only.** Every management action requires a **manager role**, with strict input-type checks. **System Manager** always qualifies; a host app adds its own admin role through the `raven_integration_manager_roles` hook (LMS declares `Moderator`), and this app grants that role the permissions its endpoints need at install/migrate time. Nothing else in Raven is handed out with it — the app writes to Raven with its own authority, not the caller's.
 
 ---
 

@@ -23,7 +23,8 @@ tickets. It asks a *provider* — another installed app that registers itself th
 
 - **No destructive writes against Raven.** The app never deletes a Raven workspace or channel —
   not on mapping delete, not on uninstall, not on any endpoint. The only records it deletes are its
-  own mappings and rules, and the member rows it added itself.
+  own mappings — the rules go with them, as a column on the mapping — and the member rows it added
+  itself.
 - No business logic of its own — that lives in the provider.
 - No messaging, no chat content, no conversation management.
 - No management UI, and no client library. This app is backend + whitelisted API; the screens
@@ -40,16 +41,22 @@ tickets. It asks a *provider* — another installed app that registers itself th
   on every migrate). Removal only ever targets flagged rows, so members a human added inside Raven
   are never touched.
 - **It never deletes a Raven workspace or channel.** Deleting a mapping deletes the mapping and its
-  rules — the Raven workspace/channel it was managing survives, along with its history and everyone
-  in it. No endpoint in this app can destroy a Raven workspace or channel.
+  rules — the Raven workspace/channel it was managing survives, with its history intact. No endpoint
+  in this app can destroy a Raven workspace or channel.
+- **Deleting a mapping withdraws the membership its rules granted.** The `added_by_rule` rows under
+  it go — for a workspace mapping, across every channel it managed and on the workspace itself; for
+  a channel mapping, on that channel — because those people are in there only on the authority of
+  rules that are being deleted. Rows a human added are flagged as such and stay, as everywhere else.
 - **Enabling is one-way.** There is an `enable_integration` endpoint and no global disable, so no
-  single click can mass-evict members. Disable individual mappings instead (clear `enabled`).
+  single click can mass-evict members. Disable individual channel mappings instead (clear
+  `enabled`); a workspace has none, and empties out when its channels are switched off.
 - **A mapping with no active rules is unmanaged, not empty.** Deleting or pausing the last rule
   makes sync skip the mapping (`reason: "no_active_rules"`) rather than evicting everyone.
 - **Errors are isolated.** The wildcard document handler never raises into an unrelated save, and a
   failure on one mapping during a sweep does not abort the rest — both log instead.
-- **Admin-only.** Every management endpoint calls `frappe.only_for(["System Manager"])` and
-  type-checks its inputs.
+- **Admin-only.** Every whitelisted endpoint calls `_require_manager()` and type-checks its inputs.
+  That gate is `frappe.only_for(manager_roles())`: `System Manager` always, plus any role a host app
+  declares through the `raven_integration_manager_roles` hook.
 
 ## Requirements & installation
 
@@ -77,22 +84,33 @@ frappe.call("raven_integration.api.enable_integration")
 
 | Doctype | Kind | Purpose |
 |---|---|---|
-| **Raven Workspace Mapping** | Document | A managed Raven workspace. `workspace_label`, `workspace_type` (Public/Private), `rule_combinator`, `enabled`, `stale` (read-only), `member_rules` (child table), and a read-only `raven_workspace` link to the Raven workspace it created. Named `RWM-{workspace_label}`. |
-| **Raven Channel Mapping** | Document | A managed channel inside a mapped workspace. `channel_label`, `workspace` (link to the workspace mapping), `channel_type` (Public/Private/Open), `rule_combinator`, `enabled`, `stale` (read-only), `member_rules`, and a read-only `raven_channel` link. Named `RCM-{channel_label}`. |
-| **Raven Membership Rule** | Child table | One rule row: `label`, `provider`, `rule_type`, `status` (Active/Paused), and `config` (JSON, opaque to this app — only the provider interprets it). |
+| **Raven Workspace Mapping** | Document | A managed Raven workspace. `workspace_label`, `workspace_type` (Public/Private), `stale` (read-only), and a read-only `raven_workspace` link to the Raven workspace it created. Named `RWM-{workspace_label}`. Carries no `enabled`: its membership is derived from its channels, so switching those off is what stops it syncing. |
+| **Raven Channel Mapping** | Document | A managed channel inside a mapped workspace. `channel_label`, `workspace` (link to the workspace mapping), `channel_type` (Public/Private/Open), `enabled`, `stale` (read-only), `member_rules_json` (the condition tree), and a read-only `raven_channel` link. Named `RCM-{channel_label}`. |
 | **Raven Membership Settings** | Single | One `enabled` switch that gates the whole integration. |
 
-All three non-child doctypes are System Manager-only.
+A rule is not a record. It is a node in the `member_rules_json` condition tree on a channel mapping,
+with `label`, `provider`, `rule_type`, `status` (Active/Paused) and `config` (JSON, opaque to this app
+— only the provider interprets it).
+
+All three doctypes grant permissions to System Manager in their JSON; a role declared through
+`raven_integration_manager_roles` is granted the same permissions as `Custom DocPerm` rows (see
+[Who may manage the integration](#who-may-manage-the-integration)).
 
 Two flags stop a mapping from syncing, and they mean different things. A cleared `enabled` is an admin's
-choice — pause this mapping. `stale` is a fact the app discovered — the Raven workspace/channel this
-mapping pointed at no longer exists (see [Stale mappings](#stale-mappings)). `stale` is read-only:
-it is set and cleared by the app, never by hand.
+choice — pause this channel; only a channel mapping carries it. `stale` is a fact the app discovered —
+the Raven workspace/channel this mapping pointed at no longer exists (see
+[Stale mappings](#stale-mappings)). `stale` is read-only: it is set and cleared by the app, never by hand.
 
 Creating a mapping **creates a new** Raven workspace/channel behind it (with a uniqueness-safe name);
-it never adopts an existing one. Deleting a workspace mapping cascades to its channel mappings.
-Deletion stops there: the app deletes only its own mappings and their rules, and the Raven workspace
-or channel is left intact — unmanaged, but whole.
+it never adopts an existing one. Deleting a workspace mapping cascades to its channel mappings, and
+withdraws the membership those mappings' rules had granted (`added_by_rule` rows on the channels and
+on the workspace). Deletion stops there: of Raven's own records the app deletes none — the workspace
+and its channels are left intact, unmanaged but whole, with their history and their hand-added
+members. Deleting a single channel mapping withdraws that channel's `added_by_rule` members the same
+way; the workspace mapping stays, so its membership stays derived — only someone whose last channel
+in the workspace this was loses their workspace row with it. The withdrawal is not silent: Raven
+writes one "X was removed by Y." system message per membership row it deletes, and honours no flag
+that would suppress it, so a withdrawal shows up in the channels it touches.
 
 ## Stale mappings
 
@@ -112,7 +130,7 @@ Two ways out, both offered as a "Take action" control in the consuming UI:
 
 | Action | Endpoint | Effect |
 |---|---|---|
-| **Recreate** | `recreate_workspace(name)` / `recreate_channel(name)` | Creates a fresh Raven workspace/channel from the mapping's stored label, repoints the `raven_workspace` / `raven_channel` link at it, and clears `stale`. The configured rules survive and resume syncing. Returns the new Raven record's name. |
+| **Recreate** | `recreate_workspace(name)` / `recreate_channel(name)` | Creates a fresh Raven workspace/channel from the mapping's stored label, repoints the `raven_workspace` / `raven_channel` link at it, and clears `stale`. The configured conditions survive and resume syncing. Returns the new Raven record's name. |
 | **Delete the mapping** | `delete_workspace(name)` / `delete_channel(name)` | Removes the mapping and its rules. There is no Raven-side record left to delete. |
 
 Recreating gives you a new, empty Raven workspace/channel — the messages and history that lived in
@@ -198,16 +216,51 @@ def evaluate(rule_type: str, config: dict) -> set[str]:
 - **`label`** is optional; it falls back to `name`.
 - **`rule_types[].type`** is validated on every rule save and on every evaluation. Evaluating a rule
   whose `rule_type` is not declared here throws before `evaluate` is ever called.
-- **`rule_types[].fields`** — the core only reads `fieldname`, `reqd` and `label` from each entry, to
-  enforce required config keys when a rule is saved. Every other key (`fieldtype`, `options`, …) is
-  passed through untouched for the consuming app's form renderer.
-- **`evaluate(rule_type, config)`** returns any iterable of `User` names; the registry wraps it in a
-  `set()`. `config` is whatever the admin saved — the core never looks inside it. Raise
+- **`rule_types[].fields`** — the core reads `fieldname`, `reqd`, `label`, `default` and
+  `depends_on` from each entry, to enforce required config keys when a rule is saved. Every other key
+  (`fieldtype`, `options`, …) is passed through untouched for the consuming app's form renderer.
+- **`rule_types[].fields[].depends_on`** — `{"field": "other_fieldname", "value": "..."}`. The field
+  applies only while `other_fieldname` holds `value`; where it does not, it is not rendered, not
+  checked for `reqd` and not written. The value compared is the one the control *shows*, so a
+  `Select` with nothing stored counts as its `default`. Frappe's `eval:` string form is **not**
+  supported. `field` must name another field of the same rule type — the declaration is rejected at
+  load if it does not, because a field depending on a name nothing declares would be hidden on every
+  rule forever.
+- **`evaluate(rule_type, config)`** returns any iterable of `User` names — a set, list, tuple or
+  generator; the registry drains it into a `set()`. `str` and `bytes` are rejected, being the
+  iterables that would yield one "member" per character. `config` is whatever the admin saved — the
+  core never looks inside it. Raise
   `raven_integration.exceptions.ProviderDataError` (or `frappe.ValidationError`) when the config
   references something that no longer exists; read paths log and skip such a rule, sync paths fail
   loudly.
 - **`triggers`** is a list of doctype names. Dict entries of the form `{"doctype": "..."}` are also
   accepted. A save on any of these doctypes anywhere on the site schedules a resync.
+
+### Who may manage the integration
+
+Every whitelisted endpoint in `api.py` is gated on a **manager role**. `System Manager` always
+qualifies. A host app adds its own admin role with a second hook:
+
+```python
+# my_app/hooks.py
+raven_integration_manager_roles = ["Moderator"]
+```
+
+The gate alone is not the whole story. This app's endpoints create, rename and delete their own
+mapping documents through the framework, which applies DocPerms, so a declared role also needs
+permissions on `Raven Membership Settings`, `Raven Workspace Mapping` and `Raven Channel Mapping`.
+`raven_integration.permissions.sync_manager_docperms` grants them from `after_install`,
+`after_migrate` and `after_app_install` — the last so a host app installed *after* this one is still
+picked up — and `before_uninstall` removes them again. Declaring a role that does not exist yet is
+harmless; it is skipped until it does.
+
+Two consequences worth knowing:
+
+- Granting a role this way creates `Custom DocPerm` rows, and Frappe then ignores the doctypes' own
+  JSON permissions for those three doctypes. Edit permissions through Role Permissions Manager from
+  that point on, not the doctype JSON.
+- A manager role buys no authority inside Raven. Every write to a Raven document is made with
+  `ignore_permissions=True`, because the app only ever touches records it created itself.
 
 ### Trigger caching
 
@@ -263,25 +316,26 @@ handlers after it. Accept `**kwargs` so a future keyword does not break your han
 
 ## API
 
-All endpoints live in `raven_integration.api`. Every one except `is_setup` requires the System
-Manager role.
+All endpoints live in `raven_integration.api`. Every one of them, `is_setup` included, requires a
+manager role (see [Who may manage the integration](#who-may-manage-the-integration)).
 
 | Endpoint | Purpose |
 |---|---|
 | `is_setup` | Whether Raven and this app are installed, and whether sync is enabled. |
 | `enable_integration` | Turn sync on and queue the first full reconcile. |
 | `list_providers` | Registered providers and their rule types, for the rule-builder UI. |
-| `list_workspaces` / `get_workspace` | List and detail (incl. member count, `stale`, and rule rows). |
-| `create_workspace` / `update_workspace` / `delete_workspace` | CRUD. `delete_workspace` removes the mapping and its child channel mappings; the Raven workspace is never deleted. |
+| `list_workspaces` / `get_workspace` | List and detail (incl. member count and `stale`). A workspace holds no conditions. |
+| `create_workspace` / `update_workspace` / `delete_workspace` | CRUD. `delete_workspace` removes the mapping, its child channel mappings and the membership their rules granted; the Raven workspace is never deleted. |
 | `recreate_workspace` | For a stale mapping: create a fresh Raven workspace from the stored label, repoint the link, clear `stale`. Returns the new Raven workspace name. |
-| `set_workspace_enabled` / `set_workspace_type` / `set_workspace_label` / `set_workspace_combinator` | Inline edits. Enabling re-syncs in the background. |
-| `list_channels` / `get_channel` | List and detail, incl. `stale`. |
-| `create_channel` / `update_channel` / `delete_channel` | CRUD. `delete_channel` removes the mapping only; the Raven channel is never deleted. |
+| `set_workspace_type` / `set_workspace_label` | Inline edits. There is no `set_workspace_enabled`: a workspace mapping has no on/off, because its membership is derived from its channels. |
+| `list_channels` / `get_channel` | List and detail, incl. `stale`. `get_channel` serves the condition tree as `rules`, each leaf annotated with the `matches` label its provider declares. |
+| `create_channel` / `update_channel` / `delete_channel` | CRUD; `rules` is the condition tree. `delete_channel` removes the mapping and the membership its rules granted; the Raven channel is never deleted. |
 | `recreate_channel` | For a stale mapping: create a fresh Raven channel from the stored label, repoint the link, clear `stale`. Returns the new Raven channel name. |
-| `set_channel_enabled` / `set_channel_type` / `set_channel_label` / `set_channel_combinator` | Inline edits. |
+| `set_channel_enabled` / `set_channel_type` / `set_channel_label` | Inline edits. |
+| `set_channel_rule_status` | Pause/resume one condition, addressed by its `path` (child indices from the root). Refuses to pause a condition with an `and` anywhere above it. |
 | `reconcile_now` | Force one mapping to re-sync now. |
 | `preview_rule` | How many users a single (unsaved) rule matches, plus 5 sample names. |
-| `compute_rule_diff` | How many members a proposed rule set would add/remove, plus up to 10 sample names of those removed. |
+| `compute_rule_diff` | How many members a proposed condition tree would add/remove, plus up to 10 sample names of those removed. Omit `new_rules` to preview the tree as saved. |
 
 `create_workspace` and `create_channel` auto-name (`Workspace N` / `Channel N`) when no label is
 given, so a UI can add a row in one click.

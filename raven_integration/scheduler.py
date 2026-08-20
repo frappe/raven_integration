@@ -7,7 +7,12 @@ from raven_integration.utils import raven_installed
 
 
 def reconcile_all() -> dict:
-	"""Nightly reconcile: detect dangling links, then run the shared resync sweep."""
+	"""Nightly reconcile: detect dangling links, then run the shared resync sweep.
+
+	Sweeps every mapping on the site, so it is scheduled as `daily_long` and enqueued
+	from api.py with queue="long" — the 300s default queue timeout rolls the whole run
+	back, stale flags included.
+	"""
 	if not events.is_active():
 		return {"skipped": True, "reason": "inactive"}
 
@@ -23,9 +28,9 @@ def detect_dangling_links() -> dict:
 
 	The on_trash hook is the primary signal, but it is fail-safe and is bypassed
 	entirely by frappe.db.delete, bulk deletes and app uninstalls, so this sweep is
-	the backstop. It sets `stale`, never clears `enabled`: `enabled` is the user's own
-	choice to stop syncing, and recreating a Raven record clears only `stale` — so
-	disabling here would leave a recreated mapping silently unsynced.
+	the backstop. It sets `stale`, never clears a channel's `enabled`: that flag is
+	the user's own choice to stop syncing, and recreating a Raven record clears only
+	`stale` — so disabling here would leave a recreated mapping silently unsynced.
 	"""
 	if not raven_installed():
 		return {"skipped": True}
@@ -36,9 +41,7 @@ def detect_dangling_links() -> dict:
 	# never drift from the primary signal.
 	for raven_doctype, (mapping_doctype, link_field) in events._RAVEN_BACKED_MAPPINGS.items():
 		noun = raven_doctype.removeprefix("Raven ").lower()
-		for mapping in frappe.get_all(
-			mapping_doctype, filters={"stale": 0}, fields=["name", link_field]
-		):
+		for mapping in frappe.get_all(mapping_doctype, filters={"stale": 0}, fields=["name", link_field]):
 			link = mapping.get(link_field)
 			if not link or frappe.db.exists(raven_doctype, link):
 				continue

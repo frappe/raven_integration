@@ -12,17 +12,9 @@
   "enabled",
   "stale",
   "section_rules",
-  "rule_combinator",
-  "member_rules"
+  "member_rules_json"
  ],
  "fields": [
-  {
-   "default": "Any (OR)",
-   "fieldname": "rule_combinator",
-   "fieldtype": "Select",
-   "label": "Combine rules with",
-   "options": "Any (OR)\nAll (AND)"
-  },
   {
    "fieldname": "channel_label",
    "fieldtype": "Data",
@@ -72,10 +64,10 @@
    "label": "Member Rules"
   },
   {
-   "fieldname": "member_rules",
-   "fieldtype": "Table",
-   "label": "Member Rules",
-   "options": "Raven Membership Rule"
+   "description": "Nested condition tree: {conjunctions: [and|or], conditions: [leaf|group]}. Edited through Settings > Raven, never by hand.",
+   "fieldname": "member_rules_json",
+   "fieldtype": "JSON",
+   "label": "Member Rules"
   }
  ],
  "links": [],

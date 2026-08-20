@@ -18,10 +18,22 @@ after_migrate = [
 	"raven_integration.install.after_migrate",
 	"raven_integration.events.clear_trigger_doctypes_cache",
 ]
+# Deliberately NOT revoking here. The revoke cannot tell a grant this app made from
+# one a human added in Role Permission Manager — nothing marks ours — so running it
+# on every migrate would delete a hand-added permission with no uninstall to explain
+# where it went. Uninstall is the moment the grant provably has no declarer left.
+# The cost is a host app that was `disable-app`'d rather than uninstalled: that fires
+# no hook of ours, so its grants survive until it is uninstalled for real.
 before_uninstall = "raven_integration.install.before_uninstall"
 
+# daily_long, not daily: the hook key becomes the Scheduled Job Type frequency, and
+# get_queue_name() sends anything without "Long"/"Maintenance" in it to the `default`
+# queue, whose timeout is 300s against the long queue's 1500s. A reconcile is a
+# whole-site sweep — the same job api.py enqueues with queue="long" — and a timeout
+# rolls it back, discarding the night's adds, removes and the stale flags
+# detect_dangling_links just set, with no retry until tomorrow.
 scheduler_events = {
-	"daily": [
+	"daily_long": [
 		"raven_integration.scheduler.reconcile_all",
 	],
 }
@@ -120,7 +132,13 @@ scheduler_events = {
 # Providers are declared in other apps' hooks.py, so the memoized trigger-doctype
 # set goes stale the moment one of those apps arrives or leaves. Both hooks are
 # called with the name of the app being installed/uninstalled.
-after_app_install = ["raven_integration.events.clear_trigger_doctypes_cache"]
+#
+# Manager roles come from other apps' hooks.py too, so a host app installed after
+# this one needs its DocPerms granted at that point rather than at our own install.
+after_app_install = [
+	"raven_integration.events.clear_trigger_doctypes_cache",
+	"raven_integration.permissions.sync_manager_docperms",
+]
 
 # Integration Cleanup
 # -------------------
@@ -128,7 +146,15 @@ after_app_install = ["raven_integration.events.clear_trigger_doctypes_cache"]
 # Name of the app being uninstalled is passed as an argument
 
 # before_app_uninstall = "raven_integration.utils.before_app_uninstall"
-after_app_uninstall = ["raven_integration.events.clear_trigger_doctypes_cache"]
+#
+# The departing app may be the one that declared a manager role. Its DocPerms are ours
+# to drop: manager_roles() stops naming the role the moment the app goes, so every
+# endpoint rejects it while the Custom DocPerm rows keep the desk form and
+# /api/resource open — where a delete evicts rule-managed members from a live channel.
+after_app_uninstall = [
+	"raven_integration.events.clear_trigger_doctypes_cache",
+	"raven_integration.permissions.revoke_undeclared_manager_docperms",
+]
 
 # Build
 # ------------------
@@ -310,4 +336,3 @@ raven_membership_providers = []
 # installed_apps order and every failure is logged and swallowed, so a handler
 # can never abort a sweep. Contract and example: see README.md.
 after_raven_member_synced = []
-

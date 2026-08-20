@@ -43,6 +43,10 @@ def _rule(provider: str, rule_type: str, status: str = "Active") -> dict:
 	}
 
 
+def _tree(*conditions, joiner="or"):
+	return {"conjunctions": [joiner] * max(len(conditions) - 1, 0), "conditions": list(conditions)}
+
+
 def _both_providers():
 	return patch.object(registry, "_provider_paths", return_value=[_FAKE_PATH, _FAKE2_PATH])
 
@@ -92,28 +96,38 @@ class TestMixedProviderMapping(FrappeTestCase):
 	def setUp(self):
 		self.rules = [_rule("FAKE", "always-ab"), _rule("FAKE2", "b-and-c")]
 
-	def test_any_or_unions_both_providers(self):
+	def test_or_unions_both_providers(self):
 		with _both_providers():
-			members = engine.evaluate_rules(self.rules, combinator="Any (OR)")
+			members = engine.evaluate_rules(_tree(*self.rules, joiner="or"))
 		self.assertEqual(members, {"a@example.com", "b@example.com", "c@example.com"})
 
-	def test_all_and_intersects_both_providers(self):
+	def test_and_intersects_both_providers(self):
 		with _both_providers():
-			members = engine.evaluate_rules(self.rules, combinator="All (AND)")
+			members = engine.evaluate_rules(_tree(*self.rules, joiner="and"))
 		self.assertEqual(members, {"b@example.com"})
 
 	def test_a_paused_rule_of_either_provider_drops_out(self):
 		rules = [_rule("FAKE", "always-ab"), _rule("FAKE2", "b-and-c", status="Paused")]
 		with _both_providers():
-			members = engine.evaluate_rules(rules, combinator="Any (OR)")
+			members = engine.evaluate_rules(_tree(*rules, joiner="or"))
 		self.assertEqual(members, {"a@example.com", "b@example.com"})
+
+	def test_a_nested_group_mixes_the_two_providers(self):
+		# always-ab and (b-and-c or always-ab) — one provider narrowing another.
+		with _both_providers():
+			members = engine.evaluate_rules(
+				_tree(
+					_rule("FAKE", "always-ab"),
+					_tree(_rule("FAKE2", "b-and-c"), joiner="or"),
+					joiner="and",
+				)
+			)
+		self.assertEqual(members, {"b@example.com"})
 
 
 class TestProviderDeclarationIsValidated(FrappeTestCase):
 	def test_duplicate_provider_name_is_refused(self):
-		with patch.object(
-			registry, "_provider_paths", return_value=[_FAKE_PATH, _COLLIDING_PATH]
-		):
+		with patch.object(registry, "_provider_paths", return_value=[_FAKE_PATH, _COLLIDING_PATH]):
 			with self.assertRaises(frappe.ValidationError) as cm:
 				registry.list_providers()
 		message = str(cm.exception)
@@ -145,10 +159,7 @@ class TestApiPathsForANonLmsProvider(FrappeTestCase):
 			ws = frappe.new_doc("Raven Workspace Mapping")
 			ws.workspace_label = f"Multi Provider WS {frappe.generate_hash(length=6)}"
 			ws.workspace_type = "Private"
-			ws.rule_combinator = "Any (OR)"
 			ws.flags.skip_raven_create = True
-			ws.append("member_rules", _rule("FAKE", "always-ab"))
-			ws.append("member_rules", _rule("FAKE2", "b-and-c"))
 			ws.insert()
 		self.workspace = ws.name
 		self.addCleanup(
@@ -157,9 +168,24 @@ class TestApiPathsForANonLmsProvider(FrappeTestCase):
 			)
 		)
 
+		with _both_providers():
+			ch = frappe.new_doc("Raven Channel Mapping")
+			ch.channel_label = f"Multi Provider CH {frappe.generate_hash(length=6)}"
+			ch.workspace = self.workspace
+			ch.channel_type = "Private"
+			ch.flags.skip_raven_create = True
+			ch.member_rules_json = frappe.as_json(
+				_tree(_rule("FAKE", "always-ab"), _rule("FAKE2", "b-and-c"), joiner="or")
+			)
+			ch.insert()
+		self.channel = ch.name
+		self.addCleanup(
+			lambda: frappe.delete_doc("Raven Channel Mapping", self.channel, force=True, ignore_missing=True)
+		)
+
 	def test_a_mapping_can_store_rules_from_both_providers(self):
-		rules = frappe.get_doc("Raven Workspace Mapping", self.workspace).member_rules
-		self.assertEqual(sorted(r.provider for r in rules), ["FAKE", "FAKE2"])
+		tree = frappe.parse_json(frappe.get_doc("Raven Channel Mapping", self.channel).member_rules_json)
+		self.assertEqual(sorted(leaf["provider"] for leaf in tree["conditions"]), ["FAKE", "FAKE2"])
 
 	def test_preview_rule_works_for_the_second_provider(self):
 		from raven_integration.api import preview_rule
@@ -182,27 +208,39 @@ class TestApiPathsForANonLmsProvider(FrappeTestCase):
 
 		with _both_providers():
 			result = compute_rule_diff(
-				target_doctype="Raven Workspace Mapping",
-				name=self.workspace,
-				new_rules=[_rule("FAKE2", "b-and-c")],
+				target_doctype="Raven Channel Mapping",
+				name=self.channel,
+				new_rules=_tree(_rule("FAKE2", "b-and-c")),
 			)
 		self.assertEqual(result["added"], 2)
 		self.assertEqual(result["removed"], 0)
 
-	def test_compute_rule_diff_honours_the_combinator_across_providers(self):
-		"""Saved rules span both providers: OR adds three users, AND only the shared one."""
+	def test_compute_rule_diff_honours_the_conjunction_across_providers(self):
+		"""Rules spanning both providers: `or` adds three users, `and` only the shared one.
+
+		The conjunction now rides on the proposed tree rather than on a separate
+		argument, so a preview of an unsaved change previews the joiner too."""
 		from raven_integration.api import compute_rule_diff
 
+		rules = (_rule("FAKE", "always-ab"), _rule("FAKE2", "b-and-c"))
 		with _both_providers():
 			any_or = compute_rule_diff(
-				target_doctype="Raven Workspace Mapping",
-				name=self.workspace,
-				combinator="Any (OR)",
+				target_doctype="Raven Channel Mapping",
+				name=self.channel,
+				new_rules=_tree(*rules, joiner="or"),
 			)
 			all_and = compute_rule_diff(
-				target_doctype="Raven Workspace Mapping",
-				name=self.workspace,
-				combinator="All (AND)",
+				target_doctype="Raven Channel Mapping",
+				name=self.channel,
+				new_rules=_tree(*rules, joiner="and"),
 			)
 		self.assertEqual(any_or["added"], 3)
 		self.assertEqual(all_and["added"], 1)
+
+	def test_compute_rule_diff_reads_the_stored_tree_when_none_is_proposed(self):
+		"""The saved tree joins both providers with `or`, so all three are adds."""
+		from raven_integration.api import compute_rule_diff
+
+		with _both_providers():
+			result = compute_rule_diff(target_doctype="Raven Channel Mapping", name=self.channel)
+		self.assertEqual(result["added"], 3)

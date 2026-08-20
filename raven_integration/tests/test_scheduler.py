@@ -5,7 +5,44 @@ from unittest.mock import MagicMock, patch
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
+from raven_integration import hooks
 from raven_integration.scheduler import detect_dangling_links, reconcile_all
+from raven_integration.tests import hold_one_transaction
+
+
+class TestReconcileSchedule(FrappeTestCase):
+	"""The nightly reconcile has to be queued somewhere it can finish.
+
+	A timeout rolls the job back, throwing away every add and remove of the sweep AND
+	the stale flags detect_dangling_links set, with no retry until the next night. The
+	scheduler picks the queue from the frequency alone, and the frequency comes from
+	the scheduler_events key.
+	"""
+
+	METHOD = "raven_integration.scheduler.reconcile_all"
+
+	def frequency(self) -> str:
+		keys = [
+			key
+			for key, methods in hooks.scheduler_events.items()
+			if not isinstance(methods, dict) and self.METHOD in methods
+		]
+		self.assertEqual(len(keys), 1, f"{self.METHOD} must be scheduled exactly once")
+		# What insert_event_jobs() makes of the hook key.
+		return keys[0].replace("_", " ").title()
+
+	def test_the_hook_key_names_a_frequency_this_frappe_version_has(self):
+		options = frappe.get_meta("Scheduled Job Type").get_field("frequency").options.split("\n")
+		self.assertIn(self.frequency(), options)
+
+	def test_reconcile_is_queued_where_it_has_time_to_finish(self):
+		from frappe.utils.background_jobs import get_queues_timeout
+
+		job = frappe.new_doc("Scheduled Job Type", method=self.METHOD, frequency=self.frequency())
+		queue = job.get_queue_name()
+		self.assertEqual(queue, "long", "a whole-site sweep does not fit the default queue")
+		timeouts = get_queues_timeout()
+		self.assertGreater(timeouts[queue], timeouts["default"])
 
 
 class TestReconcile(FrappeTestCase):
@@ -14,6 +51,9 @@ class TestReconcile(FrappeTestCase):
 	def setUp(self):
 		if "raven" not in frappe.get_installed_apps():
 			self.skipTest("Raven not installed")
+		# The sweep commits per mapping; inside a test that would strand this case's
+		# fixtures on the site and its rollback would destroy them.
+		hold_one_transaction(self)
 		# reconcile_all() now requires the integration to be enabled (is_active).
 		# Enable it for the sweep, snapshotting the shared single to restore after.
 		self._prev_enabled = frappe.db.get_single_value("Raven Membership Settings", "enabled")
@@ -77,9 +117,10 @@ class TestReconcile(FrappeTestCase):
 class TestDanglingLinks(FrappeTestCase):
 	"""Tests for detect_dangling_links(): stale-on-missing-Raven-doc behaviour.
 
-	It must set `stale`, never clear `enabled` — `enabled` is the user's own choice
-	to keep syncing, and recreate only clears `stale`, so disabling here would
-	leave a recreated mapping silently unsynced."""
+	It must set `stale` and nothing else. A workspace mapping has no `enabled` to
+	clear; a channel's is the user's own choice to keep syncing, and recreate only
+	clears `stale`, so disabling here would leave a recreated mapping silently
+	unsynced."""
 
 	def setUp(self):
 		if "raven" not in frappe.get_installed_apps():
@@ -106,19 +147,12 @@ class TestDanglingLinks(FrappeTestCase):
 				1,
 				"detect_dangling_links must flag at least one record",
 			)
-			stale, enabled = frappe.db.get_value(
-				"Raven Workspace Mapping", ws_map.name, ["stale", "enabled"]
-			)
-			self.assertEqual(
-				stale, 1, "mapping with a missing Raven Workspace must be marked stale=1"
-			)
-			self.assertEqual(
-				enabled, 1, "the sweep must not disable the mapping — recreate only clears stale"
-			)
+			stale = frappe.db.get_value("Raven Workspace Mapping", ws_map.name, "stale")
+			self.assertEqual(stale, 1, "mapping with a missing Raven Workspace must be marked stale=1")
 		finally:
 			frappe.db.delete("Raven Workspace Mapping", {"name": ws_map.name})
 
-	def test_active_workspace_with_valid_link_not_disabled(self):
+	def test_workspace_with_valid_link_is_not_marked_stale(self):
 		"""A Raven Workspace Mapping whose raven_workspace exists is left untouched."""
 		suffix = frappe.generate_hash(length=6)
 
@@ -141,11 +175,11 @@ class TestDanglingLinks(FrappeTestCase):
 
 		try:
 			detect_dangling_links()
-			enabled = frappe.db.get_value("Raven Workspace Mapping", ws_map.name, "enabled")
+			stale = frappe.db.get_value("Raven Workspace Mapping", ws_map.name, "stale")
 			self.assertNotEqual(
-				enabled,
-				0,
-				"Raven Workspace Mapping with a valid Raven Workspace link must NOT be disabled",
+				stale,
+				1,
+				"Raven Workspace Mapping with a valid Raven Workspace link must NOT be marked stale",
 			)
 		finally:
 			frappe.db.delete("Raven Workspace Mapping", {"name": ws_map.name})

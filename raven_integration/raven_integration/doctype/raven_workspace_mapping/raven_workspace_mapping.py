@@ -4,12 +4,10 @@ from frappe.model.document import Document
 
 class RavenWorkspaceMapping(Document):
 	def validate(self) -> None:
-		from raven_integration.engine import validate_member_rules
-
-		# Surface the friendly "field is required" error before the custom rule
-		# checks, which would otherwise flag two blank rows as duplicates.
+		# Membership rules live on Raven Channel Mapping only, so a workspace has
+		# nothing rule-shaped to validate: its membership is derived from whoever is
+		# in at least one of its channels.
 		self._validate_mandatory()
-		validate_member_rules(self.member_rules)
 
 	def before_insert(self) -> None:
 		if self.flags.get("skip_raven_create"):
@@ -29,10 +27,23 @@ class RavenWorkspaceMapping(Document):
 		push_workspace_type_to_raven(self)
 
 	def on_trash(self) -> None:
+		from raven_integration.sync_service import evict_rule_managed_members
+
 		# A Raven Channel Mapping links back to its workspace, so the framework
 		# blocks the workspace delete while channels exist. Cascade-delete the
 		# child channel mappings first to clear the link.
-		for channel in frappe.get_all(
-			"Raven Channel Mapping", filters={"workspace": self.name}, pluck="name"
-		):
-			frappe.delete_doc("Raven Channel Mapping", channel)
+		channels = frappe.get_all(
+			"Raven Channel Mapping", filters={"workspace": self.name}, fields=["name", "raven_channel"]
+		)
+		# Before the cascade, not after: the Raven ids these rows are addressed by
+		# live on the channel mappings, and a deleted mapping cannot say which
+		# Raven channel it managed. Inside the delete's own transaction too, so a
+		# workspace that fails to delete does not lose its members on the way.
+		evict_rule_managed_members(self.raven_workspace, [c.raven_channel for c in channels])
+		# Each cascaded delete evicts its own channel too. By now there is nothing
+		# left for it to find, so it is a no-op rather than a second withdrawal —
+		# but doing the whole workspace in one pass first is what lets the workspace
+		# rows be decided once, against every channel at its final state, instead of
+		# once per channel as the cascade empties them one at a time.
+		for channel in channels:
+			frappe.delete_doc("Raven Channel Mapping", channel.name)

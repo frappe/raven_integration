@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from contextlib import suppress
+
 import frappe
+import redis
 
 from raven_integration.exceptions import ProviderDataError, RavenAPIError
 from raven_integration.sync_service import sync_channel_members, sync_workspace_members
@@ -8,6 +11,8 @@ from raven_integration.utils import raven_installed
 
 _DEBOUNCE_KEY = "raven_integration:pending_resync"
 _DEBOUNCE_SECONDS = 30
+_GENERATION_KEY = "raven_integration:change_generation"
+_GENERATION_TTL = 24 * 60 * 60
 _TRIGGER_DOCTYPES_KEY = "raven_integration:trigger_doctypes"
 _TRIGGER_DOCTYPES_TTL = 60 * 60
 
@@ -21,38 +26,58 @@ _RAVEN_BACKED_MAPPINGS = {
 def is_active() -> bool:
 	"""True when membership sync should run: the integration must be enabled
 	(one-way `enabled` flag on Raven Membership Settings) AND Raven installed."""
-	return bool(
-		frappe.db.get_single_value("Raven Membership Settings", "enabled")
-	) and raven_installed()
+	return bool(frappe.db.get_single_value("Raven Membership Settings", "enabled")) and raven_installed()
 
 
-def _sweepable_channels(active_workspaces: list[str]) -> tuple[list[str], int]:
-	"""Active channel mappings whose parent workspace mapping is also active.
+def _sweepable_channels(swept_workspaces: list[str]) -> tuple[list[str], int]:
+	"""Enabled channel mappings whose parent workspace mapping still exists.
 
-	Syncing a channel joins its members to the parent Raven workspace too, but a
-	workspace mapping that is not enabled is never swept — so a channel under one
-	strands rule-managed workspace rows that nothing will ever reconcile.
+	Syncing a channel joins its members to the parent Raven workspace too, so a
+	channel whose workspace mapping is gone strands rule-managed workspace rows
+	that nothing will ever reconcile. Deleting a workspace cascades its channels,
+	so this should find nothing; it is the guard for the case where that cascade
+	did not complete, not a state the UI can produce.
 	"""
-	channels = frappe.get_all(
-		"Raven Channel Mapping", filters={"enabled": 1}, fields=["name", "workspace"]
-	)
-	active = set(active_workspaces)
-	names = [c.name for c in channels if c.workspace in active]
+	channels = frappe.get_all("Raven Channel Mapping", filters={"enabled": 1}, fields=["name", "workspace"])
+	swept = set(swept_workspaces)
+	names = [c.name for c in channels if c.workspace in swept]
 	return names, len(channels) - len(names)
 
 
 def resync_all() -> dict:
-	"""Diff-apply membership for every active channel and workspace mapping.
+	"""Diff-apply membership for every enabled channel and every workspace mapping.
 
-	Channels are swept before workspaces so the pair is always torn down leaf-first:
-	add_channel_member joins the parent workspace before the channel, so removals
-	must run in the mirror order or a failed workspace pass would leave a channel
-	member who is not a member of the channel's own workspace.
+	Channels are swept first, and that order is load-bearing twice over. A workspace's
+	membership is *derived* from who is in its channels, so it can only be computed
+	once the channels are correct. And the pair is torn down leaf-first: adding a
+	channel member joins the parent workspace before the channel, so removals must
+	run in the mirror order or a failed workspace pass would leave a channel member
+	who is not a member of the channel's own workspace.
+
+	One transaction per mapping, not one for the sweep. This runs only from background
+	jobs, and a whole-site sweep in a single transaction holds every lock it takes
+	until the end of the night — `remove_workspace_member`'s locking read matches
+	nothing by construction, so what it takes are gap locks on Raven Channel Member,
+	one per removal, which block Raven's own joins and can deadlock against this
+	sweep's inserts. It also meant the `daily_long` timeout the queue choice above
+	guards against would roll back the entire night's work, stale flags included.
+	Applying a diff is idempotent, so a sweep that stops half way leaves the mappings
+	it finished correct and the next pass finishes the rest.
 	"""
-	workspaces = frappe.get_all("Raven Workspace Mapping", filters={"enabled": 1}, pluck="name")
+	# Every workspace mapping, unfiltered: a workspace has no on/off of its own.
+	# What can be switched off is a channel, and a workspace with every channel
+	# disabled sweeps to an empty expected set on its own.
+	workspaces = frappe.get_all("Raven Workspace Mapping", pluck="name")
 	channels, channels_skipped = _sweepable_channels(workspaces)
 	added = removed = errors = 0
 	cache: dict = {}
+
+	# Before the first mapping takes a lock, so the caller's own writes are durable
+	# rather than riding on a _rollback_step below. scheduler.reconcile_all marks
+	# dangling links stale immediately before calling this, and those flags are the
+	# run's most valuable output — they are what stops a mapping syncing against a
+	# Raven record that no longer exists.
+	_commit_step()
 
 	for kind, names, sync in (
 		("channel", channels, sync_channel_members),
@@ -65,20 +90,27 @@ def resync_all() -> dict:
 				removed += r.get("removed", 0)
 			except (RavenAPIError, ProviderDataError) as e:
 				errors += 1
+				# Before the log, or the log is rolled back with it — and before the
+				# next mapping, or that mapping's commit would adopt this one's
+				# half-applied diff. Drops only this mapping's work: everything
+				# earlier is already committed.
+				_rollback_step()
 				frappe.log_error(
 					title=f"Resync {type(e).__name__}: {kind} {name}",
 					message=f"{e}\n\n{frappe.get_traceback()}",
 				)
 			except Exception:
 				errors += 1
+				_rollback_step()
 				frappe.log_error(
 					title=f"Resync unexpected error: {kind} {name}",
 					message=frappe.get_traceback(),
 				)
+			_commit_step()
 
 	return {
 		"channels_processed": len(channels),
-		"channels_skipped_disabled_workspace": channels_skipped,
+		"channels_skipped_orphaned": channels_skipped,
 		"workspaces_processed": len(workspaces),
 		"added": added,
 		"removed": removed,
@@ -86,11 +118,55 @@ def resync_all() -> dict:
 	}
 
 
+def _commit_step() -> None:
+	"""End one mapping's transaction, keeping its work. See resync_all.
+
+	A named seam rather than a bare frappe.db.commit() so the sweep's own tests can
+	run the loop inside the one transaction their isolation depends on: a real commit
+	in a test would strand its fixtures on the site, and the matching _rollback_step
+	would destroy them. The tests patch both and assert where they were called, which
+	is the part that is worth pinning — the boundaries, not the SQL.
+	"""
+	frappe.db.commit()  # nosemgrep: frappe-manual-commit — see resync_all
+
+
+def _rollback_step() -> None:
+	"""Drop the current mapping's half-applied diff. See resync_all and _commit_step."""
+	frappe.db.rollback()
+
+
+def _bump_change_generation() -> None:
+	"""Move the change counter one on.
+
+	Raw INCR against the made key: it is atomic, so two workers cannot lose each
+	other's bump, and it stays out of the process-local dict get_value/set_value keep
+	in front of redis — a worker has to see a bump another process made. Swallows a
+	cache outage the way set_value and delete_value do; this runs on commit and must
+	not turn a saved document into a 500.
+	"""
+	cache = frappe.cache()
+	key = cache.make_key(_GENERATION_KEY)
+	with suppress(redis.exceptions.ConnectionError):
+		cache.incr(key)
+		cache.expire(key, _GENERATION_TTL)
+
+
+def _change_generation() -> bytes | None:
+	cache = frappe.cache()
+	with suppress(redis.exceptions.ConnectionError):
+		return cache.get(cache.make_key(_GENERATION_KEY))
+
+
 def notify_change() -> None:
 	"""Provider event entrypoint: a membership-relevant record changed somewhere."""
 	if not is_active():
 		return
 	cache = frappe.cache()
+	# Bumped on commit rather than here, so the counter moves only once this change is
+	# visible to a reader and a sweep that snapshotted before the commit can tell it
+	# read stale rows. Registered before the enqueue below, which is an after_commit
+	# callback too, so the bump is always in place before the job can start.
+	frappe.db.after_commit.add(_bump_change_generation)
 	if cache.get_value(_DEBOUNCE_KEY):
 		return
 	cache.set_value(_DEBOUNCE_KEY, "1", expires_in_sec=_DEBOUNCE_SECONDS)
@@ -107,8 +183,16 @@ def notify_change() -> None:
 
 def run_resync() -> None:
 	"""Background job target for the debounced event path."""
+	generation = _change_generation()
 	frappe.cache().delete_value(_DEBOUNCE_KEY)
 	resync_all()
+	# A change that arrived while the key above was still set queued nothing of its
+	# own, and this job is one transaction under REPEATABLE READ — its commit can land
+	# after the sweep read its rows and be missed by both. The counter having moved is
+	# the proof, and notify_change() coalesces the second pass with anything already
+	# scheduled.
+	if _change_generation() != generation:
+		notify_change()
 
 
 def _trigger_doctypes() -> set[str]:
@@ -130,6 +214,13 @@ def _trigger_doctypes() -> set[str]:
 			cache.set_value(_TRIGGER_DOCTYPES_KEY, doctypes, expires_in_sec=_TRIGGER_DOCTYPES_TTL)
 		return set(doctypes)
 	except Exception:
+		# Fail closed, but never quietly: an app whose hooks.py raises on import, or a
+		# cache that is down, otherwise turns the change handler into a site-wide no-op
+		# and membership stops reacting to anything until the nightly reconcile.
+		frappe.log_error(
+			title="raven_integration trigger doctypes",
+			message=frappe.get_traceback(),
+		)
 		return set()
 
 
@@ -158,9 +249,7 @@ def mark_mappings_stale(doc, method=None) -> None:
 		mapping_doctype, link_field = _RAVEN_BACKED_MAPPINGS.get(doc.doctype, (None, None))
 		if not mapping_doctype:
 			return
-		for name in frappe.get_all(
-			mapping_doctype, filters={link_field: doc.name, "stale": 0}, pluck="name"
-		):
+		for name in frappe.get_all(mapping_doctype, filters={link_field: doc.name, "stale": 0}, pluck="name"):
 			frappe.db.set_value(mapping_doctype, name, "stale", 1, update_modified=False)
 	except Exception:
 		frappe.log_error(
@@ -214,9 +303,7 @@ def sync_workspace_rename_from_raven(doc, method=None, old_name=None, new_name=N
 	try:
 		from raven_integration.api import _set_mapping_label
 
-		mapping = frappe.db.get_value(
-			"Raven Workspace Mapping", {"raven_workspace": new_name}, "name"
-		)
+		mapping = frappe.db.get_value("Raven Workspace Mapping", {"raven_workspace": new_name}, "name")
 		if not mapping:
 			return
 		_set_mapping_label("Raven Workspace Mapping", mapping, new_name)
