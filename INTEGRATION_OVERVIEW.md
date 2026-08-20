@@ -116,7 +116,8 @@ Then the app compares expected vs. actual and applies the difference: add the mi
 ### 2. Creating a managed workspace or channel
 - Admin creates a **Workspace Mapping** → the app **creates a brand-new Raven Workspace** behind it (with a guaranteed-unique name).
 - Admin creates a **Channel Mapping** under it → the app **creates a brand-new Raven Channel** in that workspace.
-- The app never adopts an existing Raven workspace/channel on create — it makes its own. That is also why it never deletes one: it only ever touches records it brought into existence, and even those it leaves standing.
+- The app never adopts an existing Raven workspace/channel on create — it makes its own. Adoption is a separate, explicit action (`link_workspace` / `link_channel`), and it refuses a direct message, a thread, and a channel that lives in another Raven workspace. The refusal is enforced on the mapping doctype rather than in the endpoint, so a direct write to the record is checked the same way, and the link is `set_only_once` so an adopted mapping cannot later be pointed somewhere else.
+- Either way the app deletes no Raven record. It withdraws the membership its own rules granted and leaves the workspace and its channels standing.
 
 ### 3. Real-time sync (event-driven) — the fast path
 - Every time *any* document is saved anywhere on the site, a lightweight handler checks: "is this a doctype a provider cares about?"

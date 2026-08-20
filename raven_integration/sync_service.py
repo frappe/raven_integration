@@ -357,11 +357,19 @@ def _apply_one_member(action, raven_record: str, user: str, member_doctype: str,
 	written after the rollback, or it would be rolled back with it.
 	"""
 	failure = None
+	written = None
 	# frappe.msgprint appends to frappe.message_log before frappe.throw raises, so
 	# swallowing the exception without dropping what it queued returns HTTP 200
 	# carrying _server_messages, and the settings page pops a red error dialog on a
 	# request that succeeded. Only what this member queued is dropped — the caller's
 	# own messages are not ours to discard. Same reasoning as engine._record_skipped.
+	#
+	# Dropped whether or not the member wrote, because the writes swallow their own
+	# duplicates: add_workspace_member returns normally on Raven's "already a member"
+	# throw, and add_channel_member on the unique-index one, both of which msgprint on
+	# the way. add_channel_member joins the parent workspace on every add, so that is
+	# every member reaching their second channel of a workspace — the common case, and
+	# the one a cleanup on the raising path alone never sees.
 	messages_before = len(frappe.message_log)
 	with savepoint(catch=Exception):
 		try:
@@ -369,10 +377,11 @@ def _apply_one_member(action, raven_record: str, user: str, member_doctype: str,
 		except Exception as e:
 			failure = f"{type(e).__name__}: {e}\n\n{frappe.get_traceback()}"
 			raise
-		# The removers report how many rows went; the adders report nothing.
-		return written is None or bool(written)
 	while len(frappe.message_log) > messages_before:
 		frappe.clear_last_message()
+	if failure is None:
+		# The removers report how many rows went; the adders report nothing.
+		return written is None or bool(written)
 	frappe.log_error(
 		# Error Log.method is a 140-char Data field and a Raven channel name is a
 		# whole course title; the log itself must not become the thing that throws.

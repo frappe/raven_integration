@@ -2777,7 +2777,12 @@ class TestRavenWorkspaceCaseOnlyCollision(FrappeTestCase):
 
 class TestLinkChannelValidatesTheChannel(FrappeTestCase):
 	"""link_channel adopted any Raven Channel id posted at it — list_unmapped_channels
-	filters DMs, threads and other workspaces, but the endpoint did not."""
+	filters DMs, threads and other workspaces, but the endpoint did not.
+
+	The checks live on the mapping doctype rather than in the endpoint, because the
+	endpoint is not the only way in: a manager role holds write DocPerm on these
+	doctypes (permissions.MANAGED_DOCTYPES), which opens /api/resource and
+	frappe.client.set_value, and neither goes anywhere near link_channel."""
 
 	def setUp(self):
 		if "raven" not in frappe.get_installed_apps():
@@ -2790,6 +2795,7 @@ class TestLinkChannelValidatesTheChannel(FrappeTestCase):
 		self.raven_ws = self._raven_workspace(f"RI Adopt WS {self._suffix}")
 		self.other_ws = self._raven_workspace(f"RI Adopt Other {self._suffix}")
 		self.own_ch = self._raven_channel(f"ri-adopt-own-{self._suffix}", self.raven_ws)
+		self.second_ch = self._raven_channel(f"ri-adopt-second-{self._suffix}", self.raven_ws)
 		self.foreign_ch = self._raven_channel(f"ri-adopt-foreign-{self._suffix}", self.other_ws)
 		self.dm_ch = self._raven_channel(f"ri-adopt-dm-{self._suffix}", self.raven_ws)
 		# Flipped directly, the way test_list_channels_excludes_dm_and_thread does:
@@ -2873,3 +2879,76 @@ class TestLinkChannelValidatesTheChannel(FrappeTestCase):
 		frappe.db.set_value("Raven Workspace Mapping", self.ws_map, "raven_workspace", None)
 		with self.assertRaises(frappe.ValidationError):
 			link_channel(workspace=self.ws_map, raven_channel=self.own_ch)
+
+	def test_the_channel_link_cannot_be_repointed_after_insert(self):
+		"""read_only on the field is a client-side hint the framework does not enforce
+		on save, so a manager who can write the doctype could move a mapping onto a
+		Raven channel it never adopted. set_only_once is what refuses that."""
+		from raven_integration.api import link_channel
+
+		name = self._track(
+			"Raven Channel Mapping", link_channel(workspace=self.ws_map, raven_channel=self.own_ch)
+		)
+		doc = frappe.get_doc("Raven Channel Mapping", name)
+		# A regular channel of the same workspace: the adoption checks have nothing to
+		# say about it, so only the immutable link can be what stops this.
+		doc.raven_channel = self.second_ch
+		with self.assertRaises(frappe.CannotChangeConstantError):
+			doc.save()
+		self.assertEqual(frappe.db.get_value("Raven Channel Mapping", name, "raven_channel"), self.own_ch)
+
+	def test_repointing_at_a_direct_message_is_refused(self):
+		"""The endpoint's own refusal is not enough: the same id reaches the record
+		through a plain save, and the next sync would insert rule-matched strangers
+		into a two-person conversation."""
+		from raven_integration.api import link_channel
+
+		name = self._track(
+			"Raven Channel Mapping", link_channel(workspace=self.ws_map, raven_channel=self.own_ch)
+		)
+		doc = frappe.get_doc("Raven Channel Mapping", name)
+		doc.raven_channel = self.dm_ch
+		with self.assertRaises(frappe.ValidationError):
+			doc.save()
+		self.assertEqual(frappe.db.get_value("Raven Channel Mapping", name, "raven_channel"), self.own_ch)
+
+	def test_a_direct_message_is_refused_on_insert_without_the_endpoint(self):
+		ch = frappe.new_doc("Raven Channel Mapping")
+		ch.channel_label = f"RI Adopt Direct {self._suffix}"
+		ch.workspace = self.ws_map
+		ch.raven_channel = self.dm_ch
+		ch.flags.skip_raven_create = True
+		with self.assertRaises(frappe.ValidationError) as cm:
+			ch.insert()
+		self.assertIn("direct message", str(cm.exception))
+		self.assertFalse(frappe.db.exists("Raven Channel Mapping", {"raven_channel": self.dm_ch}))
+
+	def test_reparenting_onto_another_raven_workspace_is_refused(self):
+		"""The parent link is the other half of the pair, and it is not immutable —
+		a mapping re-parented after adoption joins its members to one Raven workspace
+		while on_trash evicts them against another."""
+		from raven_integration.api import link_channel, link_workspace
+
+		name = self._track(
+			"Raven Channel Mapping", link_channel(workspace=self.ws_map, raven_channel=self.own_ch)
+		)
+		other_map = self._track("Raven Workspace Mapping", link_workspace(raven_workspace=self.other_ws))
+		doc = frappe.get_doc("Raven Channel Mapping", name)
+		doc.workspace = other_map
+		with self.assertRaises(frappe.ValidationError) as cm:
+			doc.save()
+		self.assertIn("lives in Raven workspace", str(cm.exception))
+		self.assertEqual(frappe.db.get_value("Raven Channel Mapping", name, "workspace"), self.ws_map)
+
+	def test_the_workspace_link_cannot_be_repointed_after_insert(self):
+		"""The same hole on the parent doctype, and a quieter one: nothing on the
+		channel side saves when it moves, and on_trash reads raven_workspace live, so
+		a repointed mapping evicts rule-managed members from a Raven workspace it
+		never adopted."""
+		doc = frappe.get_doc("Raven Workspace Mapping", self.ws_map)
+		doc.raven_workspace = self.other_ws
+		with self.assertRaises(frappe.CannotChangeConstantError):
+			doc.save()
+		self.assertEqual(
+			frappe.db.get_value("Raven Workspace Mapping", self.ws_map, "raven_workspace"), self.raven_ws
+		)

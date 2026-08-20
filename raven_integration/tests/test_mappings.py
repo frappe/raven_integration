@@ -17,6 +17,10 @@ class TestRavenWorkspaceMapping(FrappeTestCase):
 		self.assertNotIn("member_rules_json", f)
 		self.assertNotIn("rule_combinator", f)
 
+	def test_the_raven_link_is_immutable(self):
+		# read_only is a client-side hint; the framework enforces set_only_once.
+		self.assertTrue(frappe.get_meta("Raven Workspace Mapping").get_field("raven_workspace").set_only_once)
+
 
 class TestRavenChannelMapping(FrappeTestCase):
 	def test_channel_mapping_links_to_workspace_mapping(self):
@@ -28,6 +32,10 @@ class TestRavenChannelMapping(FrappeTestCase):
 		self.assertEqual(f["member_rules_json"].fieldtype, "JSON")
 		self.assertNotIn("member_rules", f)
 		self.assertNotIn("rule_combinator", f)
+
+	def test_the_raven_link_is_immutable(self):
+		# read_only is a client-side hint; the framework enforces set_only_once.
+		self.assertTrue(frappe.get_meta("Raven Channel Mapping").get_field("raven_channel").set_only_once)
 
 
 class TestWorkspaceDeleteCascade(FrappeTestCase):

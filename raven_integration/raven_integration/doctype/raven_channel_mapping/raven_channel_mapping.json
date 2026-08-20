@@ -41,6 +41,7 @@
    "label": "Raven Channel",
    "options": "Raven Channel",
    "read_only": 1,
+   "set_only_once": 1,
    "unique": 1
   },
   {
